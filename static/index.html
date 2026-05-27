@@ -122,7 +122,11 @@ tr.selected td { background: #e8f0fe; }
     <button class="btn" onclick="openSearchModal()">检索</button>
     <button class="btn btn-warn" onclick="runConsolidation()">巩固</button>
     <button class="btn" onclick="runHealthCheck()">健康</button>
+    <button class="btn btn-primary" onclick="openModal('ingestModal')">摄入</button>
+    <button class="btn" onclick="openModal('contextModal')">上下文</button>
   </div>
+
+  <div class="stats-bar" id="pipelineBar" style="margin-top:4px;"></div>
 
   <div class="tabs" id="tabs">
     <button class="tab active" data-layer="" onclick="switchTab('')">全部</button>
@@ -683,8 +687,85 @@ function escHtml(s) {
   return d.innerHTML;
 }
 
+// ── Ingest ──
+async function submitIngest() {
+  const text = document.getElementById('ingestText').value.trim();
+  if (!text) { alert('请输入文本'); return; }
+  const res = await api('POST', '/api/v1/ingest', {
+    text, source: document.getElementById('ingestSource').value || 'dashboard',
+    explicit_mark: document.getElementById('ingestMark').checked,
+    force: document.getElementById('ingestForce').checked,
+  });
+  const d = document.getElementById('ingestResult');
+  if (res.accepted) {
+    d.innerHTML = `<div style="color:#27ae60;"> 已摄入: ${escHtml(res.memory_id)} | 类型: ${typeName(res.inferred_type)} | 重要性: ${res.importance}</div>`;
+    refreshAll();
+  } else {
+    const reason = res.skip_reason === 'duplicate'
+      ? `重复记忆 (dup_of: ${res.duplicate_of})`
+      : `门控拒绝: ${res.gate_reason}`;
+    d.innerHTML = `<div style="color:#e74c3c;"> 未摄入: ${reason}</div>`;
+  }
+}
+
+// ── Context Load ──
+async function submitContext() {
+  const query = document.getElementById('ctxQuery').value.trim();
+  if (!query) { alert('请输入查询'); return; }
+  const res = await api('POST', '/api/v1/context', {
+    query,
+    current_goal: document.getElementById('ctxGoal').value || null,
+    top_k: parseInt(document.getElementById('ctxTopK').value) || 5,
+  });
+  const d = document.getElementById('ctxResult');
+  let html = `<div style="color:#888; margin-bottom:8px;">${escHtml(res.query_summary)} | should_inject: <b>${res.should_inject}</b></div>`;
+  if (res.context_block) {
+    html += `<pre style="background:#f9f9f9; padding:8px; border-radius:4px; white-space:pre-wrap; max-height:300px; overflow-y:auto;">${escHtml(res.context_block)}</pre>`;
+  }
+  if (res.memories && res.memories.length > 0) {
+    html += '<div style="margin-top:8px;">';
+    res.memories.forEach(m => {
+      html += `<div class="result-item" style="cursor:default;">
+        <span class="score">${m.score.toFixed(3)}</span>
+        [${typeName(m.type)}] ${escHtml(m.title)}</div>`;
+    });
+    html += '</div>';
+  } else {
+    html += '<div class="empty">无相关记忆</div>';
+  }
+  d.innerHTML = html;
+}
+
+// ── Pipeline Status ──
+async function loadPipelineStatus() {
+  try {
+    const h = await api('GET', '/api/health');
+    const mems = await api('GET', '/api/memories?limit=1&sort_by=created&order=desc');
+    const bar = document.getElementById('pipelineBar');
+    if (!bar) return;
+    bar.innerHTML = `
+      <div class="stat-card" style="border-left:3px solid #4a90d9;">
+        <div class="value" style="font-size:13px; font-weight:600;">摄入管道</div>
+        <div class="label">POST /api/v1/ingest</div>
+      </div>
+      <div class="stat-card" style="border-left:3px solid #27ae60;">
+        <div class="value" style="font-size:13px; font-weight:600;">上下文加载</div>
+        <div class="label">POST /api/v1/context</div>
+      </div>
+      <div class="stat-card" style="border-left:3px solid #8e44ad;">
+        <div class="value" style="font-size:13px; font-weight:600;">Observer</div>
+        <div class="label">cron 每2分钟</div>
+      </div>
+      <div class="stat-card" style="border-left:3px solid #e67e22;">
+        <div class="value" style="font-size:13px; font-weight:600;">MCP</div>
+        <div class="label">6 tools</div>
+      </div>
+    `;
+  } catch(e) { /* silent */ }
+}
+
 // ── Init ──
-document.addEventListener('DOMContentLoaded', refreshAll);
+document.addEventListener('DOMContentLoaded', () => { refreshAll(); loadPipelineStatus(); });
 </script>
 </body>
 </html>

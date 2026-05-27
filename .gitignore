@@ -18,6 +18,10 @@ brain_memory.db
 *.db-wal
 *.db-shm
 
+# Runtime state
+.observer_cursor
+ingest_feed.jsonl
+
 # IDE
 .vscode/
 .idea/
