@@ -111,7 +111,7 @@ tr.selected td { background: #e8f0fe; }
 <body>
 <div class="container">
   <div class="header">
-    <span id="versionDisplay" style="font-size:11px;opacity:0.6;margin-left:8px;">v2.0.0</span>
+    <span id="versionDisplay" style="font-size:11px;opacity:0.6;margin-left:8px;">v3.0.0</span>
     <h1>脑记忆系统</h1>
     <button class="btn" onclick="refreshAll()">刷新</button>
   </div>
@@ -289,7 +289,7 @@ async function refreshAll() {
     await loadEndangered();
     await loadDecayCurve();
     await loadTimeline();
-    // v2.1: load aggregation/feedback stats
+    // v3.0: load aggregation/feedback stats
     try {
       const dashStats = await api('GET', '/api/dashboard/stats');
       if (dashStats.aggregated !== undefined) {
@@ -314,7 +314,7 @@ function renderStats(s) {
   html += `<div class="stat-card"><div class="value">${s.avg_strength}</div><div class="label">平均强度</div></div>`;
   html += `<div class="stat-card warn"><div class="value">${s.endangered}</div><div class="label">濒危</div></div>`;
   html += `<div class="stat-card warn"><div class="value">${s.conflicts}</div><div class="label">冲突</div></div>`;
-  // v2.1 new stats
+  // v3.0 new stats
   if (s.aggregated !== undefined) {
     html += `<div class="stat-card agg"><div class="value">${s.aggregated}</div><div class="label">聚合摘要</div></div>`;
   }
@@ -322,7 +322,7 @@ function renderStats(s) {
   document.getElementById('statsBar').innerHTML = html;
   // version display
   const verEl = document.getElementById('versionDisplay');
-  if (verEl) verEl.textContent = 'v' + (s.version || '2.0.0');
+  if (verEl) verEl.textContent = 'v' + (s.version || '3.0.0');
 }
 
 async function loadMemories() {
