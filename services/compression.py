@@ -8,7 +8,6 @@
 import json
 from datetime import datetime, timezone, timedelta
 from config import COMPRESSION_CLUSTER_MIN, COMPRESSION_MAX_DAYS
-from models.database import get_db
 
 
 async def compress_episodic_clusters(db, min_cluster_size: int = None) -> dict:

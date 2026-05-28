@@ -10,7 +10,8 @@ router = APIRouter(prefix="/api/retrieval", tags=["retrieval"])
 
 @router.post("/search", response_model=list[RetrievalResult])
 async def search(query: RetrievalQuery):
-    return await ret_svc.cognitive_search(query)
+    result = await ret_svc.cognitive_search(query)
+    return result["results"]
 
 
 @router.get("/recent")

@@ -72,7 +72,7 @@ async def dashboard_stats():
             "aggregated": aggregated,
             "aggregation_runs": aggregation_runs,
             "feedback_count": feedback_count,
-            "version": "2.1.0",
+            "version": "3.0.0",
         }
     finally:
         await db.close()

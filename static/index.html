@@ -106,12 +106,36 @@ tr.selected td { background: #e8f0fe; }
 .conso-phase .name { font-weight: 600; color: #4a90d9; }
 
 .empty { text-align: center; padding: 40px 20px; color: #aaa; font-size: 14px; }
+
+/* v3.1 Output Feed Panels */
+.output-panels { display: flex; gap: 12px; margin-bottom: 12px; }
+.output-panel { flex: 1; background: #fff; border: 1px solid #e0e0e0; border-radius: 4px; overflow: hidden; }
+.output-panel .panel-header { padding: 8px 12px; font-size: 13px; font-weight: 600; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+.output-panel .panel-body { padding: 8px 12px; max-height: 200px; overflow-y: auto; }
+.output-panel.alert-panel { border-left: 3px solid #e74c3c; }
+.output-panel.alert-panel .panel-header { background: #fff5f5; color: #c0392b; }
+.output-panel.narrative-panel { border-left: 3px solid #8e44ad; }
+.output-panel.narrative-panel .panel-header { background: #faf5ff; color: #7d3c98; }
+.alert-item { padding: 6px 0; border-bottom: 1px solid #f5f5f5; font-size: 12px; }
+.alert-item:last-child { border-bottom: none; }
+.alert-item .sev { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 700; margin-right: 6px; }
+.alert-item .sev.high { background: #fde8e8; color: #c0392b; }
+.alert-item .sev.medium { background: #fef5e7; color: #e67e22; }
+.alert-item .sev.low { background: #e8f4fd; color: #2980b9; }
+.alert-item .ts { font-size: 10px; color: #aaa; margin-left: 6px; }
+.narrative-item { padding: 6px 0; border-bottom: 1px solid #f5f5f5; font-size: 12px; }
+.narrative-item:last-child { border-bottom: none; }
+.narrative-item .n-title { font-weight: 600; color: #7d3c98; }
+.narrative-item .n-summary { color: #666; margin-top: 2px; }
+.narrative-item .n-ts { font-size: 10px; color: #aaa; }
+.output-empty { text-align: center; padding: 20px; color: #ccc; font-size: 13px; }
+
 </style>
 </head>
 <body>
 <div class="container">
   <div class="header">
-    <span id="versionDisplay" style="font-size:11px;opacity:0.6;margin-left:8px;">v3.0.0</span>
+    <span id="versionDisplay" style="font-size:11px;opacity:0.6;margin-left:8px;">v3.1.0</span>
     <h1>脑记忆系统</h1>
     <button class="btn" onclick="refreshAll()">刷新</button>
   </div>
@@ -128,6 +152,28 @@ tr.selected td { background: #e8f0fe; }
   </div>
 
   <div class="stats-bar" id="pipelineBar" style="margin-top:4px;"></div>
+
+  
+  <div class="output-panels" id="outputPanels">
+    <div class="output-panel alert-panel">
+      <div class="panel-header">
+        <span> 系统告警</span>
+        <span style="font-size:11px;font-weight:400;" id="alertCount">-</span>
+      </div>
+      <div class="panel-body" id="alertBody">
+        <div class="output-empty">加载中...</div>
+      </div>
+    </div>
+    <div class="output-panel narrative-panel">
+      <div class="panel-header">
+        <span> 最近叙事</span>
+        <span style="font-size:11px;font-weight:400;" id="narrativeCount">-</span>
+      </div>
+      <div class="panel-body" id="narrativeBody">
+        <div class="output-empty">加载中...</div>
+      </div>
+    </div>
+  </div>
 
   <div class="tabs" id="tabs">
     <button class="tab active" data-layer="" onclick="switchTab('')">全部</button>
@@ -772,12 +818,12 @@ async function loadPipelineStatus() {
         <div class="label">POST /api/v1/context</div>
       </div>
       <div class="stat-card" style="border-left:3px solid #8e44ad;">
-        <div class="value" style="font-size:13px; font-weight:600;">Observer</div>
-        <div class="label">cron 每2分钟</div>
+        <div class="value" style="font-size:13px; font-weight:600;">调度器</div>
+        <div class="label">30s/30m/1h/2h/6h</div>
       </div>
       <div class="stat-card" style="border-left:3px solid #e67e22;">
         <div class="value" style="font-size:13px; font-weight:600;">MCP</div>
-        <div class="label">6 tools</div>
+        <div class="label">8 tools</div>
       </div>
     `;
   } catch(e) { /* silent */ }
@@ -827,8 +873,62 @@ async function testBrainPipeline() {
   }
 }
 
+
+// ── Output Feed Panels (v3.1) ──
+async function loadOutputFeed() {
+  try {
+    const res = await api('GET', '/api/health/output-feed');
+    const alerts = res.alerts || [];
+    const narratives = res.narratives || [];
+
+    // Alert panel
+    const alertBody = document.getElementById('alertBody');
+    const alertCount = document.getElementById('alertCount');
+    if (alerts.length === 0) {
+      alertBody.innerHTML = '<div class="output-empty"> 暂无告警，系统健康</div>';
+      alertCount.textContent = '0';
+    } else {
+      alertCount.textContent = alerts.length;
+      alertBody.innerHTML = alerts.reverse().map(a => {
+        const d = a.data || {};
+        const sev = d.severity || 'low';
+        const ts = (a.timestamp || '').substring(11, 19);
+        return `<div class="alert-item">
+          <span class="sev ${sev}">${sev.toUpperCase()}</span>
+          <span>${escHtml(d.title || '')}</span>
+          <span class="ts">${ts}</span>
+          ${d.detail ? '<div style="color:#888;margin-top:2px;">' + escHtml(d.detail.substring(0, 100)) + '</div>' : ''}
+        </div>`;
+      }).join('');
+    }
+
+    // Narrative panel
+    const narrativeBody = document.getElementById('narrativeBody');
+    const narrativeCount = document.getElementById('narrativeCount');
+    if (narratives.length === 0) {
+      narrativeBody.innerHTML = '<div class="output-empty"> 暂无叙事</div>';
+      narrativeCount.textContent = '0';
+    } else {
+      narrativeCount.textContent = narratives.length;
+      narrativeBody.innerHTML = narratives.reverse().map(n => {
+        const d = n.data || {};
+        const ts = (n.timestamp || '').substring(0, 16);
+        return `<div class="narrative-item">
+          <div class="n-title">${escHtml(d.title || '')} ${d.narrative_id ? '<span style="font-size:10px;color:#aaa;">[' + escHtml(d.narrative_id) + ']</span>' : ''}</div>
+          <div class="n-summary">${escHtml((d.summary || '').substring(0, 120))}</div>
+          <div class="n-ts">${ts}</div>
+        </div>`;
+      }).join('');
+    }
+  } catch(e) {
+    document.getElementById('alertBody').innerHTML = '<div class="output-empty">加载失败</div>';
+    document.getElementById('narrativeBody').innerHTML = '<div class="output-empty">加载失败</div>';
+  }
+}
+
+
 // ── Init ──
-document.addEventListener('DOMContentLoaded', () => { refreshAll(); loadPipelineStatus(); });
+document.addEventListener('DOMContentLoaded', () => { refreshAll(); loadPipelineStatus(); loadOutputFeed(); });
 </script>
 </body>
 </html>

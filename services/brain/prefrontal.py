@@ -7,7 +7,7 @@
   3. 输出通过门控的 MemoryCreate + 调整后的维度
   4. 不通过门控的返回 None（丢弃）
 """
-from services.attention_gating import check_gate, GateResult
+from services.attention_gating import check_gate
 from services.auto_ingest import (
     estimate_importance,
     estimate_novelty,

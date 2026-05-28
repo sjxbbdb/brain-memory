@@ -29,7 +29,10 @@ async def list_memories(
     offset: int = Query(0, ge=0),
     include_archived: bool = Query(False),
 ):
-    return await svc.list_memories(layer, type_, sort_by, order, limit, offset, include_archived)
+    return await svc.list_memories(
+        layer=layer, type_=type_, sort_by=sort_by, order=order,
+        limit=limit, offset=offset, include_archived=include_archived,
+    )
 
 
 @router.get("/{memory_id}", response_model=MemoryResponse)

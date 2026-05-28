@@ -106,6 +106,7 @@ async def get_db():
 async def init_db():
     """启动时执行，创建所有表 + 迁移旧数据。"""
     db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
     # 逐条执行，避免 executescript 在大 schema 上阻塞
     for stmt in SCHEMA.split(";"):
         stmt = stmt.strip()

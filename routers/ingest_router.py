@@ -23,9 +23,9 @@ POST /api/v1/ingest
       ...
     }
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel, Field
-from services.auto_ingest import auto_ingest, detect_emotion, infer_type, check_duplicate
+from services.auto_ingest import auto_ingest, detect_emotion, check_duplicate
 from services.attention_gating import check_gate
 from services import memory_service as svc
 

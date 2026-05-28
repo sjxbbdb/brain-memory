@@ -16,7 +16,7 @@ from config import (
     MAX_REVISIONS,
 )
 from models.database import get_db
-from models.schemas import ConsolidationReport, PhaseResult, row_to_response
+from models.schemas import ConsolidationReport, PhaseResult
 from services.emotion_weight import compute_emotion_weight
 from services.decay import compute_staleness
 

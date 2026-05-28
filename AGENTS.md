@@ -1,9 +1,27 @@
-# Brain Memory System v3.0 — AI Agent 全自动接入指南
+# Brain Memory System v3.1 — AI Agent 全自动接入指南
 
 你是 AI 智能体，正在接入 Brain Memory 五层认知记忆系统。读完本文后，你应该能够：
 1. 一条命令接入，零配置
 2. 自动摄入会被系统全自动处理（无需手动跑 observer）
 3. 系统自我感知后会把告警/叙事推送给你
+
+---
+
+
+## 零、一键自安装（推荐）
+
+Agent 克隆项目后运行：
+
+```bash
+python hooks/install.py
+```
+
+安装器自动完成：
+1. 更新 Hermes 技能 → v3.1 + auto-ingest 指令
+2. 创建 `sessions/` 目录（文件投递通道）
+3. 配置 Codex MCP（如适用）
+
+安装后 Agent 自然就会调 `session_start` 和 `session_append`，无需手写任何代码。
 
 ---
 
@@ -43,7 +61,7 @@ Brain Memory v3.0 是一个**全自动闭环记忆系统**，为 AI Agent 提供
   "mcpServers": {
     "brain-memory": {
       "command": "python",
-      "args": ["mcp_server.py"]
+      "args": ["/path/to/brain-memory/mcp_server.py"]
     }
   }
 }

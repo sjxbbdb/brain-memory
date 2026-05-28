@@ -109,6 +109,31 @@ async def list_tools() -> list[types.Tool]:
             description="记忆系统健康总览——总数、各层分布、平均强度、濒危记忆、冲突等。",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
+        types.Tool(
+            name="session_start",
+            description="会话开始时调用，自动检索相关记忆并返回上下文摘要。Agent 接入后首个调用的工具，无需手动指定查询即可获得当前最相关的记忆上下文。请每轮对话结束后调用 session_append 写入对话。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "当前会话目标（可选，增强检索精度）"},
+                    "top_k": {"type": "integer", "default": 5},
+                },
+                "required": [],
+            },
+        ),
+        types.Tool(
+            name="session_append",
+            description="每轮对话结束后调用，将对话内容写入记忆系统的 ingest feed。内容会自动经过门控和脑区管线处理。调用后无需等待，系统后台异步处理。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "speaker": {"type": "string", "description": "说话方: user / agent / system"},
+                    "text": {"type": "string", "description": "对话内容"},
+                    "goal": {"type": "string", "description": "当前会话目标（可选）"},
+                },
+                "required": ["speaker", "text"],
+            },
+        )
     ]
 
 
@@ -124,6 +149,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             "memory_get": _get,
             "consolidation_run": _consolidate,
             "health_overview": _health,
+            "session_start": _session_start,
+            "session_append": _session_append,
         }
         h = handlers.get(name)
         if h:
@@ -132,6 +159,166 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     except Exception as e:
         return [types.TextContent(type="text", text=f"错误 {type(e).__name__}: {e}")]
 
+
+
+def _consume_output_feed():
+    """Read new entries from output_feed.jsonl since last session_start.
+    Returns (alerts, narratives) with dedup via cursor file.
+    """
+    import json as _json
+    from pathlib import Path
+
+    feed = Path(__file__).parent / "output_feed.jsonl"
+    cursor_file = Path(__file__).parent / ".output_cursor"
+
+    if not feed.exists():
+        return [], []
+
+    # Read cursor
+    cursor = 0
+    if cursor_file.exists():
+        try:
+            cursor = int(cursor_file.read_text().strip())
+        except (ValueError, OSError):
+            cursor = 0
+
+    # Read new lines
+    try:
+        with open(feed, "r", encoding="utf-8") as f:
+            f.seek(cursor)
+            new_content = f.read()
+    except Exception:
+        return [], []
+
+    # Update cursor immediately
+    new_size = feed.stat().st_size
+    cursor_file.write_text(str(new_size))
+
+    if not new_content.strip():
+        return [], []
+
+    alerts = []
+    narratives = []
+    for line in new_content.strip().split(chr(10)):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = _json.loads(line)
+        except _json.JSONDecodeError:
+            continue
+        etype = entry.get("type", "")
+        edata = entry.get("data", {})
+        if etype == "alert":
+            alerts.append({
+                "severity": edata.get("severity", "medium"),
+                "title": edata.get("title", ""),
+                "detail": edata.get("detail", ""),
+                "timestamp": entry.get("timestamp", ""),
+            })
+        elif etype == "narrative":
+            narratives.append({
+                "narrative_id": edata.get("narrative_id", ""),
+                "title": edata.get("title", ""),
+                "summary": edata.get("summary", ""),
+                "timestamp": entry.get("timestamp", ""),
+            })
+
+    return alerts, narratives
+
+
+async def _session_start(a: dict) -> list[types.TextContent]:
+    """会话开始：检索记忆 + 消费未读告警 + 返回最新叙事。"""
+    from services.context_load import context_load
+
+    goal = a.get("goal")
+    query = goal or "当前任务 最近活动 系统状态"
+    top_k = a.get("top_k", 5)
+
+    ctx = await context_load(query=query, current_goal=goal, top_k=top_k)
+    mems = ctx.get("high_relevance", [])
+
+    # Consume unread output feed
+    alerts, narratives = _consume_output_feed()
+
+    lines = []
+
+    # ── 告警置顶 ──
+    if alerts:
+        lines.append("=== 系统告警 ===")
+        for a_item in alerts:
+            sev_icon = {"high": "[HIGH]", "medium": "[MED]", "low": "[LOW]"}.get(a_item["severity"], "")
+            lines.append(f"  {sev_icon} {a_item['title']}")
+            if a_item.get("detail"):
+                lines.append(f"       {a_item['detail'][:120]}")
+        lines.append("")
+
+    # ── 记忆检索 ──
+    if mems:
+        lines.append(f"[记忆检索] 基于 '{query[:40]}' 检索到 {len(mems)} 条相关记忆：")
+        for i, m in enumerate(mems):
+            lines.append(
+                f"  #{i+1} [{m['type']}] {m['title']} "
+                f"(相关度={m['score']:.2f}, 情绪权重={m['emotion_weight']:.2f})"
+            )
+    else:
+        lines.append("[记忆检索] 暂无高相关记忆。")
+
+    if ctx.get("context_block"):
+        lines.append("")
+        lines.append("--- 上下文摘要 ---")
+        lines.append(ctx["context_block"])
+
+    # ── 最近叙事 ──
+    if narratives:
+        lines.append("")
+        lines.append("=== 最近叙事 ===")
+        for n_item in narratives:
+            lines.append(f"  [{n_item['narrative_id']}] {n_item['title']}")
+            lines.append(f"  {n_item['summary'][:150]}")
+
+    if not lines:
+        lines.append("[会话启动] 系统健康，等待新任务。")
+
+    return [types.TextContent(type="text", text=chr(10).join(lines))]
+
+async def _session_append(a: dict) -> list[types.TextContent]:
+    """会话追加：将对话内容写入 ingest feed。"""
+    import json as _json
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    feed_path = Path(__file__).parent / "ingest_feed.jsonl"
+    speaker = a["speaker"]
+    text = a["text"]
+    goal = a.get("goal")
+
+    emotional = [
+        "bug", "error", "fail", "crash",
+        "fixed", "solved",
+        "conflict", "contradict",
+    ]
+    has_emotional = any(kw in text.lower() for kw in emotional)
+
+    entry = {
+        "text": f"[{speaker}]: {text}",
+        "source": f"session:{speaker}",
+        "explicit_mark": has_emotional,
+        "metadata": {"goal": goal} if goal else {},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        with open(feed_path, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(entry, ensure_ascii=False) + chr(10))
+        return [types.TextContent(
+            type="text",
+            text=f"[会话已记录] {speaker}: {text[:60]}..."
+            if len(text) > 60
+            else f"[会话已记录] {speaker}: {text}"
+        )]
+    except Exception as e:
+        return [types.TextContent(type="text", text=f"[会话记录失败] {e}")]
 
 async def _record(a: dict) -> list[types.TextContent]:
     data = MemoryCreate(

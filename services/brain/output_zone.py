@@ -10,7 +10,6 @@
 """
 from models.schemas import RetrievalQuery
 from services import retrieval as ret_svc
-from services import memory_service as svc
 
 
 async def retrieve_and_format(

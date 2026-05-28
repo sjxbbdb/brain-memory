@@ -99,6 +99,8 @@ async def _poll_feed():
                 "feed_poll: %d processed, %d accepted",
                 processed, accepted,
             )
+            if accepted > 0:
+                await _push_proactive_context()
     except Exception:
         logger.exception("scheduler: feed_poll failed")
 
@@ -154,6 +156,147 @@ async def _analyze_knowledge_gaps():
     except Exception:
         logger.exception("gaps: analysis failed")
 
+async def _poll_sessions_dir():
+    """Watch sessions/ directory for dropped conversation files.
+
+    Any .jsonl file in sessions/ is treated as agent conversation log.
+    Each line parsed as {"speaker": "...", "text": "...", "goal": "..."}.
+    Processed files moved to sessions/processed/.
+    """
+    import json as _json
+    import shutil
+    from pathlib import Path
+
+    sessions_dir = Path(__file__).parent.parent / "sessions"
+    processed_dir = sessions_dir / "processed"
+
+    if not sessions_dir.exists():
+        return
+
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    for fpath in sessions_dir.glob("*.jsonl"):
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f.readlines() if l.strip()]
+        except Exception:
+            continue
+
+        if not lines:
+            _safe_move(fpath, processed_dir)
+            continue
+
+        from services.pipeline import pipeline_ingest
+
+        ingested = 0
+        for line in lines:
+            try:
+                entry = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+            speaker = entry.get("speaker", "unknown")
+            text = entry.get("text", "")
+            if not text:
+                continue
+            goal = entry.get("goal")
+            try:
+                result = await pipeline_ingest(
+                    text=f"[{speaker}]: {text}",
+                    source=f"session-file:{speaker}",
+                    bypass_gate=True,
+                    metadata={"goal": goal} if goal else None,
+                )
+                if result.get("accepted"):
+                    ingested += 1
+            except Exception:
+                logger.exception("scheduler: session file ingest failed")
+
+        _safe_move(fpath, processed_dir)
+        if ingested > 0:
+            logger.info("sessions: %s -> %d ingested", fpath.name, ingested)
+
+    # Clean processed dir: keep last 50 files
+    processed_files = sorted(processed_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    for old in processed_files[:-50]:
+        try:
+            old.unlink()
+        except Exception:
+            pass
+
+
+def _safe_move(src, dst_dir):
+    """Move file to dst_dir, dedup by name."""
+    import shutil
+    dst = dst_dir / src.name
+    if dst.exists():
+        dst = dst_dir / f"{src.stem}_{src.stat().st_mtime:.0f}{src.suffix}"
+    try:
+        shutil.move(str(src), str(dst))
+    except Exception:
+        pass
+
+
+
+async def _run_narrative():
+    """叙事生成：将近期情景记忆编织为自我叙事，推送至 output_feed。"""
+    try:
+        from models.database import get_db
+        from services.narrative import generate_narratives
+        from services.output_feed import push_narrative
+
+        db = await get_db()
+        try:
+            result = await generate_narratives(db)
+            if result.get("narratives_generated", 0) > 0:
+                logger.info(
+                    "narrative: %d scanned, %d clusters, %d narratives generated",
+                    result["scanned"], result["clusters"],
+                    result["narratives_generated"],
+                )
+                cursor = await db.execute(
+                    "SELECT id, title, content FROM memories "
+                    "WHERE type = 'narrative' ORDER BY created DESC LIMIT ?",
+                    (result["narratives_generated"],),
+                )
+                narratives = await cursor.fetchall()
+                for n in narratives:
+                    push_narrative(n[0], n[1], n[2] or "")
+        finally:
+            await db.close()
+    except Exception:
+        logger.exception("narrative: generation failed")
+
+
+async def _push_proactive_context():
+    """主动上下文快照：每次 feed 轮询后自动生成当前状态摘要，
+    推送至 output_feed，使外部 Agent 无需显式请求即可获取上下文。"""
+    try:
+        from models.database import get_db
+        from services.output_feed import push_context
+        from datetime import datetime, timezone, timedelta
+
+        db = await get_db()
+        try:
+            recent_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+            cursor = await db.execute(
+                "SELECT id, title, type, emotion_weight, created FROM memories "
+                "WHERE archived = 0 AND created >= ? "
+                "ORDER BY emotion_weight DESC LIMIT 8",
+                (recent_cutoff,),
+            )
+            recent = await cursor.fetchall()
+
+            titles = [r[1][:60] for r in recent]
+            if titles:
+                push_context(
+                    "auto-snapshot", "proactive_context",
+                    len(titles), titles,
+                )
+        finally:
+            await db.close()
+    except Exception:
+        logger.exception("proactive_context: push failed")
+
 
 async def _run_self_awareness():
     """自我感知：扫描系统状态，自动摄入元认知记忆。"""
@@ -187,6 +330,7 @@ async def run_scheduler(stop_event: asyncio.Event):
         if now_ts - last_feed >= INTERVAL_FEED:
             last_feed = now_ts
             await _poll_feed()
+            await _poll_sessions_dir()
 
         # Layer 1: 评分刷新 + 自我感知（每 30 分钟）
         if now_ts - last_mid >= INTERVAL_MID:

@@ -1,7 +1,7 @@
 """记忆 CRUD 服务 — v3.0 脑区管线集成。
 
 create_memory 走完整脑区管线：海马体(编码决策) → 存储区(持久化)
-其他 CRUD (list/get/update/archive/delete/search) 直接操作 DB。
+其他 CRUD (list/get/update/archive/delete/search/versions) 直接操作 DB。
 """
 import json
 from datetime import datetime, timezone
@@ -19,33 +19,19 @@ def _json_compact(obj) -> str:
 
 
 async def create_memory(data: MemoryCreate) -> MemoryResponse:
-    """创建记忆 — 走完整脑区管线：海马体(模式分离+编码决策) → 存储区(持久化)。
-
-    入库前海马体自动检测实体重叠的已有记忆，按覆写决策矩阵处理：
-    - new: 全新创建
-    - full_overwrite: 全量覆写，旧版进 memory_versions
-    - weighted_merge: 加权合并
-    - append_only: 追加补充
-    - conflict: 标记矛盾
-    """
+    """创建记忆 — 走完整脑区管线：海马体(模式分离+编码决策) → 存储区(持久化)。"""
     now = datetime.now(timezone.utc).isoformat()
     emotion = compute_emotion_weight(
         data.importance, data.failure_cost,
         data.novelty, data.goal_relevance, data.surprise_score,
     )
-
-    # Stage 1: 海马体 — 模式分离 + 编码决策
     encode_result = await encode_or_merge(data, emotion, now)
-
-    # Stage 2: 存储区 — 持久化
     store_data = {
         "tags": _json_compact(data.tags),
         "entities": _json_compact(data.entities),
         "relations": _json_compact(data.relations),
     }
     store_result = await commit_to_storage(encode_result, data, emotion, store_data)
-
-    # Stage 3: 读回完整记忆
     mem_id = store_result["memory_id"]
     db = await get_db()
     try:
@@ -77,14 +63,30 @@ async def get_memory(memory_id: str) -> MemoryResponse | None:
         await db.close()
 
 
+async def get_memory_versions(memory_id: str) -> list[dict]:
+    """获取记忆的覆写版本链（冷归档）。"""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT * FROM memory_versions WHERE memory_id = ? ORDER BY version DESC",
+            (memory_id,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        await db.close()
+
+
 async def list_memories(
     layer: str | None = None,
     type_: str | None = None,
+    sort_by: str = "created",
+    order: str = "desc",
     include_archived: bool = False,
     limit: int = 50,
     offset: int = 0,
 ) -> list[MemoryResponse]:
-    """列出记忆，支持层级和类型筛选。"""
+    """列出记忆，支持层级、类型筛选和排序。"""
     db = await get_db()
     try:
         where = []
@@ -98,8 +100,13 @@ async def list_memories(
         if not include_archived:
             where.append("archived = 0")
         where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+
+        allowed_sort = {"created", "emotion_weight", "importance", "access_count", "confidence"}
+        sort_col = sort_by if sort_by in allowed_sort else "created"
+        sort_dir = "DESC" if order.upper() == "DESC" else "ASC"
+
         cursor = await db.execute(
-            f"SELECT * FROM memories {where_clause} ORDER BY created DESC LIMIT ? OFFSET ?",
+            f"SELECT * FROM memories {where_clause} ORDER BY {sort_col} {sort_dir} LIMIT ? OFFSET ?",
             params + [limit, offset],
         )
         rows = await cursor.fetchall()
@@ -142,27 +149,23 @@ async def count_memories(
 
 
 async def update_memory(memory_id: str, data: MemoryUpdate) -> MemoryResponse | None:
-    """部分更新记忆字段。若维度字段变更则重算 emotion_weight + overwrite_weight。"""
+    """部分更新记忆字段。"""
     db = await get_db()
     try:
         cursor = await db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,))
         row = await cursor.fetchone()
         if row is None:
             return None
-
         existing = dict(row)
         updates = {}
-
         for field in ("title", "content", "source"):
             val = getattr(data, field, None)
             if val is not None:
                 updates[field] = val
-
         for field in ("tags", "entities", "relations"):
             val = getattr(data, field, None)
             if val is not None:
                 updates[field] = _json_compact(val)
-
         dim_changed = False
         for field in ("importance", "novelty", "failure_cost", "goal_relevance", "surprise_score", "confidence"):
             val = getattr(data, field, None)
@@ -170,45 +173,34 @@ async def update_memory(memory_id: str, data: MemoryUpdate) -> MemoryResponse | 
                 updates[field] = val
                 if field != "confidence":
                     dim_changed = True
-
         if data.type is not None:
             updates["type"] = data.type
             updates["layer"] = data.type
-
         if not updates:
             resp = row_to_response(existing)
             resp.current_strength = compute_strength(
                 resp.emotion_weight, resp.decay_rate, resp.last_accessed, resp.created,
             )
             return resp
-
         if dim_changed:
             merged = {**existing, **updates}
             updates["emotion_weight"] = compute_emotion_weight(
-                merged.get("importance", 0.5),
-                merged.get("failure_cost", 0.5),
-                merged.get("novelty", 0.5),
-                merged.get("goal_relevance", 0.5),
+                merged.get("importance", 0.5), merged.get("failure_cost", 0.5),
+                merged.get("novelty", 0.5), merged.get("goal_relevance", 0.5),
                 merged.get("surprise_score", 0.3),
             )
-
-        # v3.0: 更新时同步重算覆写权值
         if "content" in updates or dim_changed:
             from services.overwrite import compute_overwrite_weight
             merged = {**existing, **updates}
             updates["overwrite_weight"] = compute_overwrite_weight(
-                merged.get("importance", 0.5),
-                merged.get("corroboration_count", 0),
-                merged.get("created", ""),
-                merged.get("access_count", 0),
+                merged.get("importance", 0.5), merged.get("corroboration_count", 0),
+                merged.get("created", ""), merged.get("access_count", 0),
                 merged.get("content", ""),
             )
-
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         values = list(updates.values()) + [memory_id]
         await db.execute(f"UPDATE memories SET {set_clause} WHERE id = ?", values)
         await db.commit()
-
         cursor = await db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,))
         row = await cursor.fetchone()
         resp = row_to_response(dict(row))
@@ -232,7 +224,7 @@ async def archive_memory(memory_id: str) -> bool:
 
 
 async def delete_memory(memory_id: str) -> bool:
-    """硬删除（仅限已归档的记忆）。"""
+    """硬删除（仅限已归档）。"""
     db = await get_db()
     try:
         cursor = await db.execute("DELETE FROM memories WHERE id = ? AND archived = 1", (memory_id,))

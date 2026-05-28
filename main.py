@@ -69,6 +69,7 @@ from routers.dashboard_router import router as dashboard_router
 from routers.ingest_router import router as ingest_router
 from routers.context_router import router as context_router
 from routers.pipeline_router import router as pipeline_router
+from routers.session_router import router as session_router
 
 app.include_router(memory_router)
 app.include_router(retrieval_router)
@@ -78,6 +79,7 @@ app.include_router(dashboard_router)
 app.include_router(ingest_router)
 app.include_router(context_router)
 app.include_router(pipeline_router)
+app.include_router(session_router)
 
 # 静态文件挂载必须放在最后
 import os as _os

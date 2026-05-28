@@ -10,8 +10,6 @@
 import json
 from datetime import datetime, timezone
 from models.database import get_db
-from models.schemas import row_to_response
-from services.decay import compute_strength
 from config import COMPRESSION_CLUSTER_MIN
 
 

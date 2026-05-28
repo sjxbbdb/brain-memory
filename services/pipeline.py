@@ -12,7 +12,7 @@
 import json
 from datetime import datetime, timezone
 from models.database import get_db
-from models.schemas import MemoryResponse, row_to_response
+from models.schemas import row_to_response
 from services.decay import compute_strength
 from services.emotion_weight import compute_emotion_weight
 from services.brain.input_zone import process_input
@@ -59,7 +59,7 @@ async def pipeline_ingest(
         )
         combined = f"{memory.title} {memory.content}"
         memory.type = infer_type(combined)
-        memory.importance = max(estimate_importance(combined), 0.85)
+        memory.importance = estimate_importance(combined)
         memory.novelty = estimate_novelty(combined)
         memory.failure_cost = estimate_failure_cost(combined)
         memory.goal_relevance = estimate_goal_relevance(combined)

@@ -117,3 +117,38 @@ async def conflict_memories():
         return results
     finally:
         await db.close()
+
+
+@router.get("/output-feed")
+async def output_feed(limit: int = 20):
+    """Read recent entries from output_feed.jsonl."""
+    import json as _json
+    from pathlib import Path
+    feed_path = Path(__file__).parent.parent / "output_feed.jsonl"
+    if not feed_path.exists():
+        return {"alerts": [], "narratives": [], "total": 0}
+    try:
+        with open(feed_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        alerts = []
+        narratives = []
+        for line in lines[-limit:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+            entry["_raw"] = line
+            if entry.get("type") == "alert":
+                alerts.append(entry)
+            elif entry.get("type") == "narrative":
+                narratives.append(entry)
+        return {
+            "alerts": alerts[-10:],
+            "narratives": narratives[-5:],
+            "total": len(alerts) + len(narratives),
+        }
+    except Exception as e:
+        return {"alerts": [], "narratives": [], "total": 0, "error": str(e)}
