@@ -1,0 +1,834 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>脑记忆系统</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, "Microsoft YaHei", sans-serif; background: #f5f5f5; color: #333; line-height: 1.5; }
+.container { max-width: 1400px; margin: 0 auto; padding: 16px; }
+
+/* Header */
+.header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.header h1 { font-size: 22px; font-weight: 600; color: #1a1a2e; }
+.btn { padding: 6px 14px; border: 1px solid #ccc; border-radius: 4px; background: #fff; cursor: pointer; font-size: 13px; }
+.btn:hover { background: #eee; }
+.btn-primary { background: #4a90d9; color: #fff; border-color: #3a7bc8; }
+.btn-primary:hover { background: #3a7bc8; }
+.btn-warn { background: #e74c3c; color: #fff; border-color: #c0392b; }
+.btn-warn:hover { background: #c0392b; }
+.btn-sm { padding: 3px 8px; font-size: 12px; }
+
+/* Stats Bar */
+.stats-bar { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.stat-card { padding: 8px 14px; background: #fff; border: 1px solid #e0e0e0; border-radius: 4px; min-width: 70px; text-align: center; }
+.stat-card .value { font-size: 20px; font-weight: 700; }
+.stat-card .label { font-size: 11px; color: #888; }
+.stat-card.episodic { border-left: 3px solid #3498db; }
+.stat-card.semantic { border-left: 3px solid #27ae60; }
+.stat-card.procedural { border-left: 3px solid #8e44ad; }
+.stat-card.narrative { border-left: 3px solid #e67e22; }
+.stat-card.global { border-left: 3px solid #95a5a6; }
+.stat-card.warn { border-left: 3px solid #e74c3c; }
+
+/* Actions */
+.actions { display: flex; gap: 8px; margin-bottom: 12px; }
+
+/* Tabs */
+.tabs { display: flex; gap: 2px; margin-bottom: 12px; border-bottom: 2px solid #e0e0e0; }
+.tab { padding: 6px 16px; cursor: pointer; border: none; background: none; font-size: 13px; color: #888; }
+.tab:hover { color: #333; }
+.tab.active { color: #4a90d9; border-bottom: 2px solid #4a90d9; margin-bottom: -2px; font-weight: 600; }
+
+/* Main Content */
+.main-content { display: flex; gap: 12px; margin-bottom: 12px; }
+.memory-list { flex: 1; min-width: 0; background: #fff; border: 1px solid #e0e0e0; border-radius: 4px; overflow: hidden; }
+.detail-panel { width: 380px; background: #fff; border: 1px solid #e0e0e0; border-radius: 4px; padding: 16px; overflow-y: auto; max-height: 500px; }
+.detail-panel h3 { font-size: 16px; margin-bottom: 8px; word-break: break-all; }
+.detail-panel .meta { font-size: 12px; color: #666; margin-bottom: 12px; }
+.detail-panel .content { font-size: 13px; white-space: pre-wrap; margin-bottom: 12px; padding: 8px; background: #f9f9f9; border-radius: 4px; max-height: 200px; overflow-y: auto; }
+.detail-panel .field-row { display: flex; justify-content: space-between; padding: 3px 0; font-size: 12px; border-bottom: 1px solid #f5f5f5; }
+.detail-panel .field-row .key { color: #888; }
+.detail-panel .field-row .val { font-weight: 500; }
+.strength-bar { height: 6px; background: #eee; border-radius: 3px; margin: 6px 0; }
+.strength-bar .fill { height: 100%; border-radius: 3px; }
+.strength-bar .fill.strong { background: #27ae60; }
+.strength-bar .fill.medium { background: #f39c12; }
+.strength-bar .fill.weak { background: #e74c3c; }
+.badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; background: #e8f4fd; color: #2980b9; }
+.badge.entity { background: #fef3e2; color: #e67e22; }
+
+/* Table */
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; padding: 8px 10px; background: #fafafa; border-bottom: 1px solid #e0e0e0; font-weight: 600; color: #666; font-size: 12px; }
+td { padding: 7px 10px; border-bottom: 1px solid #f0f0f0; cursor: pointer; }
+tr:hover td { background: #f8fbff; }
+tr.selected td { background: #e8f0fe; }
+.id-cell { font-family: "Consolas", monospace; font-size: 11px; color: #888; }
+.weight-cell { width: 80px; }
+.weight-bar { height: 4px; background: #eee; border-radius: 2px; margin-top: 2px; }
+.weight-bar .fill { height: 100%; border-radius: 2px; background: #4a90d9; }
+.pagination { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; font-size: 12px; color: #888; }
+
+/* Sections */
+.section { background: #fff; border: 1px solid #e0e0e0; border-radius: 4px; padding: 12px 16px; margin-bottom: 12px; }
+.section h3 { font-size: 14px; margin-bottom: 8px; }
+.endangered-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.endangered-item { padding: 6px 10px; border: 1px solid #f5c6cb; border-radius: 4px; background: #fff5f5; font-size: 12px; cursor: pointer; }
+.endangered-item:hover { background: #fde8e8; }
+.timeline { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 8px; }
+.timeline-card { min-width: 150px; padding: 8px; border: 1px solid #e0e0e0; border-radius: 4px; font-size: 12px; cursor: pointer; }
+.timeline-card:hover { background: #f8fbff; }
+.timeline-card .date { color: #888; font-size: 11px; }
+
+/* Modal */
+.modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.3); z-index: 100; justify-content: center; align-items: flex-start; padding-top: 60px; }
+.modal-overlay.open { display: flex; }
+.modal { background: #fff; border-radius: 6px; width: 560px; max-height: 80vh; overflow-y: auto; box-shadow: 0 4px 20px rgba(0,0,0,0.15); }
+.modal-header { padding: 12px 16px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+.modal-header h3 { font-size: 15px; }
+.modal-body { padding: 16px; }
+.modal-body label { display: block; font-size: 12px; color: #666; margin-bottom: 3px; margin-top: 10px; }
+.modal-body input, .modal-body textarea, .modal-body select { width: 100%; padding: 6px 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; font-family: inherit; }
+.modal-body textarea { min-height: 80px; resize: vertical; }
+.modal-body .row { display: flex; gap: 8px; }
+.modal-body .row > div { flex: 1; }
+
+.result-item { padding: 8px 10px; border: 1px solid #eee; border-radius: 4px; margin-bottom: 6px; cursor: pointer; font-size: 12px; }
+.result-item:hover { background: #f8fbff; }
+.result-item .score { font-weight: 700; color: #4a90d9; }
+.result-item .breakdown { font-size: 11px; color: #888; margin-top: 2px; }
+
+/* Consolidation report */
+.conso-phase { padding: 4px 0; font-size: 12px; border-bottom: 1px solid #f5f5f5; }
+.conso-phase .name { font-weight: 600; color: #4a90d9; }
+
+.empty { text-align: center; padding: 40px 20px; color: #aaa; font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <span id="versionDisplay" style="font-size:11px;opacity:0.6;margin-left:8px;">v2.0.0</span>
+    <h1>脑记忆系统</h1>
+    <button class="btn" onclick="refreshAll()">刷新</button>
+  </div>
+
+  <div class="stats-bar" id="statsBar"></div>
+
+  <div class="actions">
+    <button class="btn btn-primary" onclick="openRecordModal()">+ 记录</button>
+    <button class="btn" onclick="openSearchModal()">检索</button>
+    <button class="btn btn-warn" onclick="runConsolidation()">巩固</button>
+    <button class="btn" onclick="runHealthCheck()">健康</button>
+    <button class="btn btn-primary" onclick="openModal('ingestModal')">摄入</button>
+    <button class="btn" onclick="openModal('contextModal')">上下文</button>
+  </div>
+
+  <div class="stats-bar" id="pipelineBar" style="margin-top:4px;"></div>
+
+  <div class="tabs" id="tabs">
+    <button class="tab active" data-layer="" onclick="switchTab('')">全部</button>
+    <button class="tab" data-layer="episodic" onclick="switchTab('episodic')">情景</button>
+    <button class="tab" data-layer="semantic" onclick="switchTab('semantic')">语义</button>
+    <button class="tab" data-layer="procedural" onclick="switchTab('procedural')">程序</button>
+    <button class="tab" data-layer="narrative" onclick="switchTab('narrative')">叙事</button>
+    <button class="tab" data-layer="global" onclick="switchTab('global')">全局</button>
+  </div>
+
+  <div class="main-content">
+    <div class="memory-list">
+      <table>
+        <thead><tr>
+          <th>ID</th><th>标题</th><th>类型</th><th>权重</th><th>创建时间</th>
+        </tr></thead>
+        <tbody id="memoryTableBody"></tbody>
+      </table>
+      <div class="pagination" id="pagination"></div>
+    </div>
+    <div class="detail-panel" id="detailPanel">
+      <div class="empty">点击左侧记忆查看详情</div>
+    </div>
+  </div>
+
+  <details class="section" id="endangeredSection">
+    <summary>濒危记忆 (<span id="endangeredCount">0</span>)</summary>
+    <div class="endangered-list" id="endangeredList"></div>
+  </details>
+
+  <div class="section">
+    <h3>衰减曲线（90天预测）</h3>
+    <canvas id="decayCanvas" width="1200" height="280" style="width:100%; max-height:280px;"></canvas>
+  </div>
+
+  <div class="section">
+    <h3>最近时间线</h3>
+    <div class="timeline" id="timeline"></div>
+  </div>
+</div>
+
+<!-- Record Modal -->
+<div class="modal-overlay" id="recordModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>记录记忆</h3>
+      <button class="btn btn-sm" onclick="closeModal('recordModal')">x</button>
+    </div>
+    <div class="modal-body">
+      <label>类型</label>
+      <select id="recType">
+        <option value="episodic">情景</option>
+        <option value="semantic">语义</option>
+        <option value="procedural">程序</option>
+        <option value="narrative">叙事</option>
+        <option value="global">全局</option>
+      </select>
+      <label>标题 *</label>
+      <input id="recTitle" placeholder="输入记忆标题...">
+      <label>内容</label>
+      <textarea id="recContent" placeholder="输入记忆内容..."></textarea>
+      <div class="row">
+        <div><label>重要性</label><input id="recImportance" type="number" value="0.5" min="0" max="1" step="0.05"></div>
+        <div><label>失败代价</label><input id="recFailureCost" type="number" value="0.5" min="0" max="1" step="0.05"></div>
+      </div>
+      <div class="row">
+        <div><label>新颖度</label><input id="recNovelty" type="number" value="0.5" min="0" max="1" step="0.05"></div>
+        <div><label>目标相关度</label><input id="recGoalRelevance" type="number" value="0.5" min="0" max="1" step="0.05"></div>
+      </div>
+      <label>标签（逗号分隔）</label>
+      <input id="recTags" placeholder="例: stm32, gpio, rcc">
+      <label>实体（逗号分隔）</label>
+      <input id="recEntities" placeholder="例: stm32f103, GPIOA">
+      <label><input type="checkbox" id="recExplicit"> 显式标记（绕过门控）</label>
+      <div style="margin-top:14px; display:flex; gap:8px;">
+        <button class="btn btn-primary" onclick="submitRecord()">保存</button>
+        <button class="btn" onclick="closeModal('recordModal')">取消</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Search Modal -->
+<div class="modal-overlay" id="searchModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>认知检索</h3>
+      <button class="btn btn-sm" onclick="closeModal('searchModal')">x</button>
+    </div>
+    <div class="modal-body">
+      <label>查询</label>
+      <input id="searchQuery" placeholder="输入检索关键词...">
+      <label>当前目标（可选）</label>
+      <input id="searchGoal" placeholder="例: STM32外设开发">
+      <label>当前风险（可选）</label>
+      <input id="searchRisk" placeholder="例: 时钟配置错误">
+      <div style="margin-top:10px;">
+        <button class="btn btn-primary" onclick="submitSearch()">检索</button>
+      </div>
+      <div id="searchResults" style="margin-top:12px;"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Consolidation Modal -->
+<div class="modal-overlay" id="consoModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>巩固报告</h3>
+      <button class="btn btn-sm" onclick="closeModal('consoModal')">x</button>
+    </div>
+    <div class="modal-body" id="consoBody">
+      <p>正在执行巩固...</p>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ──
+let currentLayer = '';
+let currentPage = 1;
+let pageSize = 20;
+let selectedId = null;
+
+// ── API ──
+async function api(method, path, body) {
+  const opts = { method, headers: {} };
+  if (body) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    throw new Error(err.detail || r.statusText);
+  }
+  return r.json();
+}
+
+// ── Layer Colors ──
+const layerColors = {
+  episodic: { bg: '#e8f4fd', text: '#2980b9', border: '#3498db' },
+  semantic: { bg: '#e8f8e8', text: '#27ae60', border: '#27ae60' },
+  procedural: { bg: '#f3e8f8', text: '#8e44ad', border: '#8e44ad' },
+  narrative: { bg: '#fef5e7', text: '#e67e22', border: '#e67e22' },
+  global: { bg: '#f0f0f0', text: '#7f8c8d', border: '#95a5a6' },
+};
+
+function layerColor(layer) {
+  return layerColors[layer] || layerColors.episodic;
+}
+
+// ── Render ──
+async function refreshAll() {
+  try {
+    const stats = await api('GET', '/api/dashboard/stats');
+    renderStats(stats);
+    await loadMemories();
+    await loadEndangered();
+    await loadDecayCurve();
+    await loadTimeline();
+    // v2.1: load aggregation/feedback stats
+    try {
+      const dashStats = await api('GET', '/api/dashboard/stats');
+      if (dashStats.aggregated !== undefined) {
+        document.getElementById('pipelineBar').innerHTML = 
+          `<div class="stat-card agg"><div class="value">${dashStats.aggregated}</div><div class="label">聚合摘要</div></div>
+           <div class="stat-card"><div class="value">${dashStats.aggregation_runs || 0}</div><div class="label">聚合执行</div></div>
+           <div class="stat-card"><div class="value">${dashStats.feedback_count || 0}</div><div class="label">反馈</div></div>`;
+      }
+    } catch(e) { console.log('pipeline stats:', e.message); }
+  } catch (e) {
+    console.error('刷新错误:', e);
+  }
+}
+
+function renderStats(s) {
+  const layers = s.layers || {};
+  const layerNames = { episodic: '情景', semantic: '语义', procedural: '程序', narrative: '叙事', global: '全局' };
+  let html = `<div class="stat-card"><div class="value">${s.total}</div><div class="label">总计</div></div>`;
+  for (const [layer, count] of Object.entries(layers)) {
+    html += `<div class="stat-card ${layer}"><div class="value">${count}</div><div class="label">${layerNames[layer] || layer}</div></div>`;
+  }
+  html += `<div class="stat-card"><div class="value">${s.avg_strength}</div><div class="label">平均强度</div></div>`;
+  html += `<div class="stat-card warn"><div class="value">${s.endangered}</div><div class="label">濒危</div></div>`;
+  html += `<div class="stat-card warn"><div class="value">${s.conflicts}</div><div class="label">冲突</div></div>`;
+  // v2.1 new stats
+  if (s.aggregated !== undefined) {
+    html += `<div class="stat-card agg"><div class="value">${s.aggregated}</div><div class="label">聚合摘要</div></div>`;
+  }
+  html += `<div class="stat-card"><div class="value">${s.feedback_count || 0}</div><div class="label">检索反馈</div></div>`;
+  document.getElementById('statsBar').innerHTML = html;
+  // version display
+  const verEl = document.getElementById('versionDisplay');
+  if (verEl) verEl.textContent = 'v' + (s.version || '2.0.0');
+}
+
+async function loadMemories() {
+  let url = `/api/memories?sort_by=created&order=desc&limit=${pageSize}&offset=${(currentPage - 1) * pageSize}`;
+  if (currentLayer) url += `&layer=${currentLayer}`;
+  try {
+    const mems = await api('GET', url);
+    renderTable(mems);
+  } catch (e) {
+    document.getElementById('memoryTableBody').innerHTML = `<tr><td colspan="5" class="empty">${e.message}</td></tr>`;
+  }
+}
+
+function renderTable(mems) {
+  const tbody = document.getElementById('memoryTableBody');
+  if (mems.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">暂无记忆</td></tr>';
+    return;
+  }
+  tbody.innerHTML = mems.map(m => {
+    const lc = layerColor(m.layer);
+    const idShort = m.id.length > 28 ? m.id.slice(-28) : m.id;
+    const strength = m.current_strength != null ? m.current_strength : m.emotion_weight;
+    const barColor = strength > 0.5 ? '#27ae60' : strength > 0.2 ? '#f39c12' : '#e74c3c';
+    const cls = m.id === selectedId ? 'selected' : '';
+    return `<tr class="${cls}" onclick="selectMemory('${m.id}')">
+      <td class="id-cell" title="${m.id}">${idShort}</td>
+      <td>${escHtml(m.title).substring(0, 50)}</td>
+      <td><span style="font-size:11px;padding:1px 6px;border-radius:8px;background:${lc.bg};color:${lc.text}">${typeName(m.type)}</span></td>
+      <td class="weight-cell">
+        <span style="font-size:12px">${strength.toFixed(2)}</span>
+        <div class="weight-bar"><div class="fill" style="width:${(strength*100).toFixed(0)}%;background:${barColor}"></div></div>
+      </td>
+      <td style="font-size:12px">${m.created ? m.created.slice(0,10) : ''}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function selectMemory(id) {
+  selectedId = id;
+  try {
+    const m = await api('GET', `/api/memories/${id}`);
+    renderDetail(m);
+    loadMemories(); // refresh selection highlight
+  } catch (e) {
+    document.getElementById('detailPanel').innerHTML = `<div class="empty">错误：${e.message}</div>`;
+  }
+}
+
+function renderDetail(m) {
+  const lc = layerColor(m.layer);
+  const strength = m.current_strength != null ? m.current_strength : m.emotion_weight;
+  const barColor = strength > 0.5 ? 'strong' : strength > 0.2 ? 'medium' : 'weak';
+  const tags = (m.tags || []).map(t => `<span class="badge">${escHtml(t)}</span>`).join('');
+  const entities = (m.entities || []).map(e => `<span class="badge entity">${escHtml(e)}</span>`).join('');
+
+  document.getElementById('detailPanel').innerHTML = `
+    <h3>${escHtml(m.title)}</h3>
+    <div class="meta">${m.id} | ${typeName(m.type)} | ${m.created ? m.created.slice(0,16) : ''}</div>
+    <div class="content">${escHtml(m.content || '（无内容）')}</div>
+    <div style="font-size:12px;margin-bottom:4px;">强度：${strength.toFixed(3)}</div>
+    <div class="strength-bar"><div class="fill ${barColor}" style="width:${(strength*100).toFixed(0)}%"></div></div>
+    <div style="margin-top:8px;">
+      <div class="field-row"><span class="key">重要性</span><span class="val">${m.importance.toFixed(2)}</span></div>
+      <div class="field-row"><span class="key">新颖度</span><span class="val">${m.novelty.toFixed(2)}</span></div>
+      <div class="field-row"><span class="key">失败代价</span><span class="val">${m.failure_cost.toFixed(2)}</span></div>
+      <div class="field-row"><span class="key">目标相关度</span><span class="val">${m.goal_relevance.toFixed(2)}</span></div>
+      <div class="field-row"><span class="key">情绪权重</span><span class="val">${m.emotion_weight.toFixed(4)}</span></div>
+      <div class="field-row"><span class="key">置信度</span><span class="val">${m.confidence.toFixed(2)}</span></div>
+      <div class="field-row"><span class="key">衰减率</span><span class="val">${m.decay_rate}</span></div>
+      <div class="field-row"><span class="key">访问次数</span><span class="val">${m.access_count}</span></div>
+      <div class="field-row"><span class="key">来源</span><span class="val">${sourceName(m.source)}</span></div>
+    </div>
+    ${tags ? `<div class="badges">${tags}</div>` : ''}
+    ${entities ? `<div class="badges" style="margin-top:4px;">${entities}</div>` : ''}
+    ${m.archived ? '<div style="margin-top:8px;color:#e74c3c;font-size:12px;">[已归档]</div>' : ''}
+  `;
+}
+
+async function loadEndangered() {
+  try {
+    const list = await api('GET', '/api/health/endangered?limit=20');
+    document.getElementById('endangeredCount').textContent = list.length;
+    const container = document.getElementById('endangeredList');
+    if (list.length === 0) {
+      container.innerHTML = '<span style="font-size:12px;color:#888;">暂无濒危记忆</span>';
+      return;
+    }
+    container.innerHTML = list.map(m => {
+      const s = (m.current_strength || 0).toFixed(4);
+      return `<div class="endangered-item" onclick="selectMemory('${m.id}')" title="${escHtml(m.title)}">
+        <strong>${s}</strong> ${escHtml(m.title).substring(0, 40)}
+      </div>`;
+    }).join('');
+  } catch (e) {
+    console.error('Endangered error:', e);
+  }
+}
+
+async function loadDecayCurve() {
+  try {
+    const data = await api('GET', '/api/dashboard/decay-curve?days=90');
+    const canvas = document.getElementById('decayCanvas');
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width;
+    const H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    const pad = { top: 20, right: 30, bottom: 35, left: 50 };
+    const pw = W - pad.left - pad.right;
+    const ph = H - pad.top - pad.bottom;
+
+    // Axes
+    ctx.strokeStyle = '#ddd';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(pad.left, pad.top);
+    ctx.lineTo(pad.left, pad.top + ph);
+    ctx.lineTo(pad.left + pw, pad.top + ph);
+    ctx.stroke();
+
+    // Y labels
+    ctx.fillStyle = '#888';
+    ctx.font = '10px sans-serif';
+    ctx.textAlign = 'right';
+    for (let v = 0; v <= 1; v += 0.25) {
+      const y = pad.top + ph - v * ph;
+      ctx.fillText(v.toFixed(2), pad.left - 6, y + 4);
+      ctx.strokeStyle = '#f0f0f0';
+      ctx.beginPath();
+      ctx.moveTo(pad.left, y);
+      ctx.lineTo(pad.left + pw, y);
+      ctx.stroke();
+    }
+
+    // Threshold line
+    ctx.strokeStyle = '#e74c3c';
+    ctx.setLineDash([5, 5]);
+    const thY = pad.top + ph - 0.15 * ph;
+    ctx.beginPath();
+    ctx.moveTo(pad.left, thY);
+    ctx.lineTo(pad.left + pw, thY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#e74c3c';
+    ctx.fillText('0.15', pad.left - 6, thY + 4);
+
+    // Layer lines
+    const points = data.points || [];
+    const layers = data.layers || [];
+    const layerColorsArr = ['#3498db', '#27ae60', '#8e44ad', '#e67e22', '#95a5a6'];
+
+    layers.forEach((layer, li) => {
+      if (points.length < 2) return;
+      ctx.strokeStyle = layerColorsArr[li % layerColorsArr.length];
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      points.forEach((pt, i) => {
+        const x = pad.left + (pt.day / data.days) * pw;
+        const y = pad.top + ph - (pt.layers[layer] || 0) * ph;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    });
+
+    // Overall line (thicker)
+    if (points.length >= 2) {
+      ctx.strokeStyle = '#333';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      points.forEach((pt, i) => {
+        const x = pad.left + (pt.day / data.days) * pw;
+        const y = pad.top + ph - pt.overall * ph;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+
+    // X labels
+    ctx.fillStyle = '#888';
+    ctx.textAlign = 'center';
+    const xSteps = 6;
+    for (let i = 0; i <= xSteps; i++) {
+      const day = Math.round((i / xSteps) * data.days);
+      const x = pad.left + (i / xSteps) * pw;
+      ctx.fillText(`${day}天`, x, pad.top + ph + 15);
+    }
+
+    // Legend
+    ctx.textAlign = 'left';
+    let lx = pad.left;
+    layers.forEach((layer, li) => {
+      ctx.fillStyle = layerColorsArr[li % layerColorsArr.length];
+      ctx.fillRect(lx, pad.top - 14, 10, 10);
+      ctx.fillStyle = '#555';
+      const lname = typeNames[layer] || layer;
+      ctx.fillText(lname, lx + 13, pad.top - 4);
+      lx += ctx.measureText(lname).width + 30;
+    });
+    ctx.fillStyle = '#333';
+    ctx.fillRect(lx, pad.top - 14, 10, 10);
+    ctx.fillText('整体', lx + 13, pad.top - 4);
+  } catch (e) {
+    console.error('Decay curve error:', e);
+  }
+}
+
+async function loadTimeline() {
+  try {
+    const items = await api('GET', '/api/dashboard/timeline?days=7&limit=20');
+    const container = document.getElementById('timeline');
+    if (items.length === 0) {
+      container.innerHTML = '<span style="font-size:12px;color:#888;">暂无最近记忆</span>';
+      return;
+    }
+    container.innerHTML = items.map(m => {
+      const lc = layerColor(m.layer);
+      const s = m.current_strength != null ? m.current_strength.toFixed(2) : '?';
+      return `<div class="timeline-card" onclick="selectMemory('${m.id}')" style="border-left:3px solid ${lc.border}">
+        <div class="date">${m.created ? m.created.slice(0,10) : ''}</div>
+        <div style="font-weight:600;margin:2px 0;">${escHtml(m.title).substring(0,30)}</div>
+        <span style="font-size:11px;color:${lc.text}">${typeName(m.type)}</span>
+        <span style="font-size:11px;color:#888;margin-left:6px;">${s}</span>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    console.error('Timeline error:', e);
+  }
+}
+
+// ── Tab ──
+function switchTab(layer) {
+  currentLayer = layer;
+  currentPage = 1;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  const tab = document.querySelector(`.tab[data-layer="${layer}"]`);
+  if (tab) tab.classList.add('active');
+  loadMemories();
+}
+
+// ── Modal ──
+function openModal(id) { document.getElementById(id).classList.add('open'); }
+function closeModal(id) { document.getElementById(id).classList.remove('open'); }
+
+function openRecordModal() {
+  document.getElementById('recTitle').value = '';
+  document.getElementById('recContent').value = '';
+  document.getElementById('recImportance').value = '0.5';
+  document.getElementById('recFailureCost').value = '0.5';
+  document.getElementById('recNovelty').value = '0.5';
+  document.getElementById('recGoalRelevance').value = '0.5';
+  document.getElementById('recTags').value = '';
+  document.getElementById('recEntities').value = '';
+  document.getElementById('recExplicit').checked = false;
+  openModal('recordModal');
+}
+
+async function submitRecord() {
+  const title = document.getElementById('recTitle').value.trim();
+  if (!title) return alert('请输入标题');
+  const data = {
+    title,
+    content: document.getElementById('recContent').value.trim(),
+    type: document.getElementById('recType').value,
+    importance: parseFloat(document.getElementById('recImportance').value) || 0.5,
+    failure_cost: parseFloat(document.getElementById('recFailureCost').value) || 0.5,
+    novelty: parseFloat(document.getElementById('recNovelty').value) || 0.5,
+    goal_relevance: parseFloat(document.getElementById('recGoalRelevance').value) || 0.5,
+    tags: document.getElementById('recTags').value.split(',').map(s => s.trim()).filter(Boolean),
+    entities: document.getElementById('recEntities').value.split(',').map(s => s.trim()).filter(Boolean),
+    explicit_mark: document.getElementById('recExplicit').checked,
+  };
+  try {
+    const m = await api('POST', '/api/memories', data);
+    closeModal('recordModal');
+    await refreshAll();
+    selectMemory(m.id);
+  } catch (e) {
+    alert('错误：' + e.message);
+  }
+}
+
+function openSearchModal() {
+  document.getElementById('searchQuery').value = '';
+  document.getElementById('searchGoal').value = '';
+  document.getElementById('searchRisk').value = '';
+  document.getElementById('searchResults').innerHTML = '';
+  openModal('searchModal');
+}
+
+async function submitSearch() {
+  const query = document.getElementById('searchQuery').value.trim();
+  if (!query) return;
+  const data = {
+    query,
+    current_goal: document.getElementById('searchGoal').value.trim() || null,
+    current_risk: document.getElementById('searchRisk').value.trim() || null,
+    top_k: 10,
+  };
+  try {
+    const results = await api('POST', '/api/retrieval/search', data);
+    const container = document.getElementById('searchResults');
+    if (results.length === 0) {
+      container.innerHTML = '<p style="color:#888;font-size:13px;">无匹配结果</p>';
+      return;
+    }
+    container.innerHTML = results.map((r, i) => {
+      const m = r.memory;
+      const bd = r.score_breakdown;
+      return `<div class="result-item" onclick="closeModal('searchModal');selectMemory('${m.id}')">
+        <span class="score">#${i+1} 得分: ${r.score.toFixed(3)}</span>
+        <strong>${escHtml(m.title).substring(0, 60)}</strong>
+        <span style="font-size:11px;color:#888">${typeName(m.type)}</span>
+        <div class="breakdown">
+          语义=${bd.semantic_similarity?.toFixed(2) || '?'}
+          目标=${bd.goal_relevance?.toFixed(2) || '?'}
+          情绪=${bd.emotion_weight?.toFixed(2) || '?'}
+          时间=${bd.temporal_proximity?.toFixed(2) || '?'}
+          因果=${bd.causal_relevance?.toFixed(2) || '?'}
+        </div>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    document.getElementById('searchResults').innerHTML = `<p style="color:#e74c3c;">错误：${e.message}</p>`;
+  }
+}
+
+async function runConsolidation() {
+  openModal('consoModal');
+  document.getElementById('consoBody').innerHTML = '<p>正在执行巩固...</p>';
+  try {
+    const report = await api('POST', '/api/consolidation/run', { phases: [0, 1, 2, 25, 3] });
+    const phaseNames = { phase0: '权重自适应', phase1: '评分刷新', phase2: '分诊清理', phase25: '冲突仲裁', phase3: '记忆修正' };
+    const actionNames = { phase0_skip: '跳过', phase0_no_change: '无变化', weight_adjusted: '权重调整',
+      emotion_refreshed: '情绪刷新', archived: '归档', review_marked: '标记审查',
+      no_conflicts: '无冲突', conflicts_resolved: '冲突解决', revised: '修正' };
+    let html = `<p style="font-size:13px;color:#888;margin-bottom:8px;">${report.timestamp}</p>`;
+    html += `<p>执行阶段: ${report.phases_executed.map(p => phaseNames[p] || p).join(' → ')}</p>`;
+    for (const [phase, results] of Object.entries(report.phase_results)) {
+      html += `<div class="conso-phase">`;
+      html += `<span class="name">${phaseNames[phase] || phase}</span>: `;
+      html += results.map(r => `${actionNames[r.action] || r.action} x${r.affected_count}`).join(', ');
+      html += `</div>`;
+    }
+    html += `<p style="margin-top:8px;"><strong>总变更: ${report.memory_changes}</strong></p>`;
+    html += `<button class="btn btn-primary" style="margin-top:8px;" onclick="closeModal('consoModal');refreshAll();">完成</button>`;
+    document.getElementById('consoBody').innerHTML = html;
+  } catch (e) {
+    document.getElementById('consoBody').innerHTML = `<p style="color:#e74c3c;">错误：${e.message}</p>
+      <button class="btn" style="margin-top:8px;" onclick="closeModal('consoModal')">关闭</button>`;
+  }
+}
+
+async function runHealthCheck() {
+  try {
+    const overview = await api('GET', '/api/health/overview');
+    alert(`健康检查
+总计: ${overview.total_count}
+各层: ${JSON.stringify(overview.layer_counts)}
+平均强度: ${overview.avg_strength}
+濒危: ${overview.endangered_count}
+低置信度: ${overview.low_confidence_count}
+冲突: ${overview.active_conflicts}
+上次巩固: ${overview.last_consolidation || '从未'}
+已归档: ${overview.archived_count}`);
+  } catch (e) {
+    alert('健康检查错误：' + e.message);
+  }
+}
+
+// ── Utils ──
+const typeNames = { episodic: '情景', semantic: '语义', procedural: '程序', narrative: '叙事', global: '全局' };
+const sourceNames = { direct_experience: '直接经验', observed: '观察', inferred: '推断', told_by: '被告知' };
+function typeName(t) { return typeNames[t] || t; }
+function sourceName(s) { return sourceNames[s] || s; }
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ── Ingest ──
+async function submitIngest() {
+  const text = document.getElementById('ingestText').value.trim();
+  if (!text) { alert('请输入文本'); return; }
+  const res = await api('POST', '/api/v1/ingest', {
+    text, source: document.getElementById('ingestSource').value || 'dashboard',
+    explicit_mark: document.getElementById('ingestMark').checked,
+    force: document.getElementById('ingestForce').checked,
+  });
+  const d = document.getElementById('ingestResult');
+  if (res.accepted) {
+    d.innerHTML = `<div style="color:#27ae60;"> 已摄入: ${escHtml(res.memory_id)} | 类型: ${typeName(res.inferred_type)} | 重要性: ${res.importance}</div>`;
+    refreshAll();
+  } else {
+    const reason = res.skip_reason === 'duplicate'
+      ? `重复记忆 (dup_of: ${res.duplicate_of})`
+      : `门控拒绝: ${res.gate_reason}`;
+    d.innerHTML = `<div style="color:#e74c3c;"> 未摄入: ${reason}</div>`;
+  }
+}
+
+// ── Context Load ──
+async function submitContext() {
+  const query = document.getElementById('ctxQuery').value.trim();
+  if (!query) { alert('请输入查询'); return; }
+  const res = await api('POST', '/api/v1/context', {
+    query,
+    current_goal: document.getElementById('ctxGoal').value || null,
+    top_k: parseInt(document.getElementById('ctxTopK').value) || 5,
+  });
+  const d = document.getElementById('ctxResult');
+  let html = `<div style="color:#888; margin-bottom:8px;">${escHtml(res.query_summary)} | should_inject: <b>${res.should_inject}</b></div>`;
+  if (res.context_block) {
+    html += `<pre style="background:#f9f9f9; padding:8px; border-radius:4px; white-space:pre-wrap; max-height:300px; overflow-y:auto;">${escHtml(res.context_block)}</pre>`;
+  }
+  if (res.memories && res.memories.length > 0) {
+    html += '<div style="margin-top:8px;">';
+    res.memories.forEach(m => {
+      html += `<div class="result-item" style="cursor:default;">
+        <span class="score">${m.score.toFixed(3)}</span>
+        [${typeName(m.type)}] ${escHtml(m.title)}</div>`;
+    });
+    html += '</div>';
+  } else {
+    html += '<div class="empty">无相关记忆</div>';
+  }
+  d.innerHTML = html;
+}
+
+// ── Pipeline Status ──
+async function loadPipelineStatus() {
+  try {
+    const h = await api('GET', '/api/health');
+    const mems = await api('GET', '/api/memories?limit=1&sort_by=created&order=desc');
+    const bar = document.getElementById('pipelineBar');
+    if (!bar) return;
+    bar.innerHTML = `
+      <div class="stat-card" style="border-left:3px solid #4a90d9;">
+        <div class="value" style="font-size:13px; font-weight:600;">摄入管道</div>
+        <div class="label">POST /api/v1/ingest</div>
+      </div>
+      <div class="stat-card" style="border-left:3px solid #27ae60;">
+        <div class="value" style="font-size:13px; font-weight:600;">上下文加载</div>
+        <div class="label">POST /api/v1/context</div>
+      </div>
+      <div class="stat-card" style="border-left:3px solid #8e44ad;">
+        <div class="value" style="font-size:13px; font-weight:600;">Observer</div>
+        <div class="label">cron 每2分钟</div>
+      </div>
+      <div class="stat-card" style="border-left:3px solid #e67e22;">
+        <div class="value" style="font-size:13px; font-weight:600;">MCP</div>
+        <div class="label">6 tools</div>
+      </div>
+    `;
+  } catch(e) { /* silent */ }
+}
+
+
+
+// ── Version Chain ──
+async function loadVersionChain() {
+  const id = document.getElementById('verMemoryId').value.trim();
+  if (!id) { alert('请输入记忆ID'); return; }
+  const d = document.getElementById('versionChainResult');
+  try {
+    const versions = await api('GET', `/api/memories/${id}/versions`);
+    const current = await api('GET', `/api/memories/${id}`);
+    let html = `<div style="margin-bottom:10px; font-size:13px;"><b>当前版本 v${current.version}</b> | 覆写权值: ${current.overwrite_weight?.toFixed(2) || '-'}</div>`;
+    if (!versions || versions.length === 0) {
+      html += '<div class="empty">无历史版本（此记忆尚未被覆写）</div>';
+    } else {
+      html += '<table><tr><th>版本</th><th>标题</th><th>权值</th><th>原因</th><th>时间</th></tr>';
+      versions.forEach(v => {
+        html += `<tr><td>v${v.version}</td><td>${escHtml(v.title?.substring(0,60)||'')}</td>
+          <td>${v.overwrite_weight?.toFixed(2)||'-'}</td>
+          <td><span class="badge">${escHtml(v.overwrite_reason||'-')}</span></td>
+          <td>${(v.created||'').substring(0,16)}</td></tr>`;
+      });
+      html += '</table>';
+    }
+    d.innerHTML = html;
+  } catch(e) {
+    d.innerHTML = `<p style="color:#e74c3c;">错误: ${e.message}</p>`;
+  }
+}
+
+// ── Brain Pipeline Test ──
+async function testBrainPipeline() {
+  const text = document.getElementById('brainTestText').value.trim();
+  if (!text) { alert('请输入测试文本'); return; }
+  const pre = document.getElementById('brainTestResult');
+  pre.style.display = 'block';
+  pre.textContent = '正在执行脑区管线...';
+  try {
+    const res = await api('POST', '/api/v1/pipeline/ingest', { text, source: 'brain-test', bypass_gate: true });
+    pre.textContent = JSON.stringify(res, null, 2);
+  } catch(e) {
+    pre.textContent = '管线测试错误: ' + e.message;
+  }
+}
+
+// ── Init ──
+document.addEventListener('DOMContentLoaded', () => { refreshAll(); loadPipelineStatus(); });
+</script>
+</body>
+</html>
