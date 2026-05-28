@@ -758,7 +758,7 @@ async function submitContext() {
 // ── Pipeline Status ──
 async function loadPipelineStatus() {
   try {
-    const h = await api('GET', '/api/health');
+    const h = await api('GET', '/api/health/overview');
     const mems = await api('GET', '/api/memories?limit=1&sort_by=created&order=desc');
     const bar = document.getElementById('pipelineBar');
     if (!bar) return;
