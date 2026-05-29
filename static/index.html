@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Brain Memory v4.1</title>
+<style>
+:root{--bg:#0a0a14;--card:#12122a;--border:#1e1e3d;--text:#c8d0dc;--dim:#5a6070;--accent:#8b7cf0;--g:#2ecc71;--r:#e74c3c;--o:#f39c12}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,"Microsoft YaHei","PingFang SC",sans-serif;background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column;font-size:14px;line-height:1.6}
+
+/* ——— 顶栏 ——— */
+.top{display:flex;align-items:center;padding:14px 24px;border-bottom:1px solid var(--border);gap:20px;flex-shrink:0}
+.top .dot{width:9px;height:9px;border-radius:50%;background:var(--g);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
+.top h1{font-size:17px;font-weight:700;letter-spacing:.5px}
+.top h1 em{color:var(--accent);font-style:normal}
+.top .stat{font-size:13px;color:var(--dim)}.top .stat b{color:var(--text)}
+
+/* ——— 主区域 ——— */
+.main{flex:1;display:flex;overflow:hidden}
+.left{width:360px;border-right:1px solid var(--border);overflow-y:auto;padding:24px 20px;display:flex;flex-direction:column;gap:28px;flex-shrink:0}
+.right{flex:1;overflow-y:auto;padding:24px 28px;display:flex;flex-direction:column;gap:28px}
+
+/* ——— 区块标题 ——— */
+.block-title{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:2px;margin-bottom:12px;font-weight:600}
+.block-title::before{content:'■ ';color:var(--accent);font-size:8px;vertical-align:middle}
+
+/* ——— 独白 ——— */
+.monologue{font-size:18px;line-height:1.9;color:#d0d6e0;font-style:italic;padding:20px 24px;background:linear-gradient(145deg,#0c0c20,#141430);border-radius:10px;border:1px solid #1a1a3a;min-height:70px}
+
+/* ——— 情绪 ——— */
+.emotion-word{font-size:38px;font-weight:800;text-transform:capitalize;letter-spacing:-1px}
+.emotion-focus{font-size:14px;color:var(--dim);margin-left:8px}
+.emotion-bars{display:flex;gap:16px;margin-top:12px}
+.eb{flex:1;text-align:center}
+.eb .bar{height:5px;background:#1a1a35;border-radius:3px;overflow:hidden}
+.eb .fill{height:100%;border-radius:3px;transition:width 0.6s}
+.eb .lbl{font-size:11px;color:var(--dim);margin-top:6px}
+
+/* ——— 记忆列表 ——— */
+.mem-item{padding:12px 0;border-bottom:1px solid #0e0e22}
+.mem-item .mem-head{display:flex;justify-content:space-between;align-items:baseline}
+.mem-item .mem-title{font-size:15px;font-weight:600}
+.mem-item .mem-imp{font-size:12px;padding:2px 8px;border-radius:10px;font-weight:600}
+.mem-item .mem-imp.high{background:#1f0a0a;color:var(--r)}
+.mem-item .mem-imp.mid{background:#1f1a0a;color:var(--o)}
+.mem-item .mem-imp.low{background:#0a1f1a;color:var(--g)}
+.mem-item .mem-meta{font-size:12px;color:var(--dim);margin-top:2px}
+.mem-item .mem-summary{font-size:13px;color:#9098a8;margin-top:4px;line-height:1.5}
+
+/* ——— 身份 ——— */
+.identity-text{font-size:14px;line-height:1.7;color:#b0b8c8}
+.trait-tag{display:inline-block;padding:3px 12px;margin:3px;background:#1c1436;border:1px solid #2c1e52;border-radius:10px;font-size:12px;color:#a78bfa}
+
+/* ——— 驱动力 ——— */
+.drive-row{display:flex;align-items:center;gap:10px;margin:6px 0;font-size:13px}
+.drive-row .drive-label{width:56px;color:var(--dim);text-align:right}
+.drive-row .drive-track{flex:1;height:6px;background:#1a1a35;border-radius:3px;overflow:hidden}
+.drive-row .drive-fill{height:100%;border-radius:3px;background:var(--accent);transition:width 0.6s}
+.drive-row .drive-pct{width:32px;text-align:right;font-size:11px;color:var(--dim)}
+
+/* ——— 会话 ——— */
+.sess-item{font-size:13px;padding:6px 10px;margin:3px 0;border-radius:6px;display:flex;gap:10px}
+.sess-item:hover{background:#16162e}
+.sess-item .sess-src{font-weight:600;min-width:70px}
+.sess-item .sess-state{color:var(--dim)}
+
+/* ——— 底部输入 ——— */
+.bottom{display:flex;gap:10px;padding:14px 24px;border-top:1px solid var(--border);flex-shrink:0}
+.bottom select{padding:10px 14px;background:#0c0c1e;border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px;outline:none;cursor:pointer}
+.bottom input{flex:1;padding:10px 16px;background:#0c0c1e;border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px;outline:none}
+.bottom input:focus{border-color:var(--accent)}
+.bottom button{padding:10px 28px;background:var(--accent);color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:700;letter-spacing:.5px}
+.bottom button:hover{opacity:.85}
+
+.empty{color:var(--dim);font-size:14px;padding:16px 0}
+</style>
+</head>
+<body>
+
+<!-- 顶栏 -->
+<div class="top">
+  <div class="dot"></div>
+  <h1>脑记忆 <em>v4.1</em></h1>
+  <span class="stat">心跳 <b id="t">0</b></span>
+  <span class="stat">记忆 <b id="mc">0</b></span>
+  <span class="stat">身份 v<b id="iv">1</b></span>
+</div>
+
+<!-- 主体 -->
+<div class="main">
+
+  <!-- 左侧：身份 / 驱动力 / 会话 -->
+  <div class="left">
+    <div>
+      <div class="block-title">自我认知</div>
+      <div class="identity-text" id="id">加载中...</div>
+      <div style="margin-top:8px" id="tg"></div>
+    </div>
+    <div>
+      <div class="block-title">内在驱动</div>
+      <div id="dr"></div>
+    </div>
+    <div>
+      <div class="block-title">活跃会话</div>
+      <div id="ss"></div>
+    </div>
+  </div>
+
+  <!-- 右侧：独白 / 情绪 / 记忆 -->
+  <div class="right">
+    <div>
+      <div class="block-title">正在想</div>
+      <div class="monologue" id="mo">正在苏醒...</div>
+    </div>
+
+    <div>
+      <div class="block-title">当前情绪</div>
+      <div style="display:flex;align-items:baseline;gap:12px">
+        <span class="emotion-word" id="em">—</span>
+        <span class="emotion-focus">关注: <span id="fo">—</span></span>
+      </div>
+      <div class="emotion-bars">
+        <div class="eb"><div class="bar"><div class="fill" id="bV" style="width:50%;background:var(--g)"></div></div><div class="lbl">愉悦度</div></div>
+        <div class="eb"><div class="bar"><div class="fill" id="bA" style="width:50%;background:var(--r)"></div></div><div class="lbl">激活度</div></div>
+        <div class="eb"><div class="bar"><div class="fill" id="bD" style="width:50%;background:#3498db"></div></div><div class="lbl">控制感</div></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="block-title">记忆时间线</div>
+      <div id="ml"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 输入栏 -->
+<div class="bottom">
+  <select id="src">
+    <option value="dashboard">控制台</option>
+    <option value="hermes">Hermes</option>
+    <option value="codex">Codex</option>
+  </select>
+  <input id="msg" placeholder="输入内容，回车发送..." onkeydown="if(event.key==='Enter')send()">
+  <button onclick="send()">发送</button>
+</div>
+
+<script>
+const A='';
+
+async function send(){
+  const t=document.getElementById('msg').value.trim();if(!t)return;
+  document.getElementById('msg').value='';
+  await fetch(A+'/api/v4/input',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t,source:document.getElementById('src').value})});
+  poll();
+}
+
+async function poll(){
+  try{
+    const[s,sf,se,mt]=await Promise.all([
+      fetch(A+'/api/v4/state').then(r=>r.json()),
+      fetch(A+'/api/v4/self').then(r=>r.json()),
+      fetch(A+'/api/v4/sessions').then(r=>r.json()),
+      fetch(A+'/api/v4/memory-timeline?limit=15').then(r=>r.json()),
+    ]);
+    document.getElementById('t').textContent=s.total_ticks||0;
+    document.getElementById('mc').textContent=mt.count||0;
+    document.getElementById('iv').textContent=sf.version||1;
+    document.getElementById('id').textContent=sf.identity||'—';
+    document.getElementById('tg').innerHTML=(sf.traits||[]).map(x=>'<span class="trait-tag">'+x+'</span>').join('');
+    const ev=s.emotion_vector||{};
+    document.getElementById('bV').style.width=((ev.valence||.5)*100)+'%'; document.getElementById('bV').style.background=(ev.valence||0)>.5?'var(--g)':'var(--r)';
+    document.getElementById('bA').style.width=((ev.arousal||.5)*100)+'%';
+    document.getElementById('bD').style.width=((ev.dominance||.5)*100)+'%';
+    document.getElementById('em').textContent=s.current_emotion||'—';
+    document.getElementById('fo').textContent=s.focus_entity||'—';
+    if(s.inner_monologue)document.getElementById('mo').textContent=s.inner_monologue;
+    const dr=sf.drives||{};
+    document.getElementById('dr').innerHTML=Object.keys(dr).sort((a,b)=>(dr[b].weight||0)-(dr[a].weight||0)).map(k=>{const d=dr[k];const p=Math.round((d.weight||0)*100);return'<div class="drive-row"><span class="drive-label">'+d.label+'</span><div class="drive-track"><div class="drive-fill" style="width:'+p+'%"></div></div><span class="drive-pct">'+p+'%</span></div>'}).join('');
+    const srcs=se.active_sources||[];
+    document.getElementById('ss').innerHTML=srcs.length?srcs.map(x=>{const d=se.sessions?.[x]||{};return'<div class="sess-item"><span class="sess-src">'+x+'</span><span class="sess-state">'+ (d.emotion||'?')+' &middot; '+ (d.focus||'—')+'</span></div>'}).join(''):'<div class="empty">暂无活跃会话</div>';
+    const ms=mt.memories||[];
+    document.getElementById('ml').innerHTML=ms.length?ms.slice(0,10).map(m=>{const c=m.importance>.7?'high':m.importance>.4?'mid':'low';return'<div class="mem-item"><div class="mem-head"><span class="mem-title">'+(m.title||'?')+'</span><span class="mem-imp '+c+'">'+(m.importance||0).toFixed(2)+'</span></div><div class="mem-meta">'+(m.emotion_label||'')+' &middot; '+(m.created||'').substring(0,19)+'</div><div class="mem-summary">'+(m.summary||'').substring(0,100)+'</div></div>'}).join(''):'<div class="empty">暂无记忆，发送消息即可开始</div>';
+  }catch(e){}
+}
+
+poll();setInterval(poll,3000);
+</script>
+</body>
+</html>
