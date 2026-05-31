@@ -71,7 +71,7 @@ Private → Shared 的知识升迁需要巩固抽象化、交叉验证、置信�
 ## 快速开始
 
 ```bash
-cd brain-memory-v5.0
+cd brain-memory-v5.4
 copy .env.example .env    # 编辑 .env，填入你的 API Key
 start.bat                 # Windows 一键启动
 ```
@@ -136,7 +136,7 @@ python -m uvicorn api.main:app --host 127.0.0.1 --port 8001
 ## 项目结构
 
 ```
-brain-memory-v5.0/
+brain-memory-v5.4/
 ├── start.bat              # 一键启动
 ├── config.py              # 全局参数
 ├── api/main.py            # FastAPI（16个端点 + WebSocket）

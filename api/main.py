@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Ensure brain-memory-v5.0 is on the path
+# Ensure brain-memory-v5.4 is on the path
 _sys_path_root = Path(__file__).parent.parent
 if str(_sys_path_root) not in sys.path:
     sys.path.insert(0, str(_sys_path_root))
