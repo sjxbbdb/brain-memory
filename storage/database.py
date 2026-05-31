@@ -3,7 +3,7 @@
 import json, logging, sqlite3, uuid
 from datetime import datetime, timezone
 
-logger = logging.getLogger("brain-v4.storage")
+logger = logging.getLogger("brain-v5.storage")
 DB_PATH = "brain_v4.db"
 DB_TIMEOUT = 10.0
 

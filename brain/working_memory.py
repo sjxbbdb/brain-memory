@@ -9,7 +9,7 @@
 import logging
 from config import WORKING_MEMORY_CAPACITY
 
-logger = logging.getLogger("brain-v4.working-memory")
+logger = logging.getLogger("brain-v5.working-memory")
 
 
 class WorkingMemory:

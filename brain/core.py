@@ -26,7 +26,7 @@ from brain.brain_stem import BrainStem
 from config import INPUT_TIMEOUT_SEC
 from storage.database import init_db, StateStore, MemoryStore
 
-logger = logging.getLogger("brain-v4.core")
+logger = logging.getLogger("brain-v5.core")
 
 
 class Brain:

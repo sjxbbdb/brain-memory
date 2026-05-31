@@ -10,7 +10,7 @@ import json
 import logging
 from services.llm_client import get_llm
 
-logger = logging.getLogger("brain-v4.prefrontal")
+logger = logging.getLogger("brain-v5.prefrontal")
 
 PREFRONTAL_PROMPT = """[SYSTEM CONSTRAINT]
 You are the PREFRONTAL CORTEX of a brain memory agent. You are part of the brain, NOT an external assistant.

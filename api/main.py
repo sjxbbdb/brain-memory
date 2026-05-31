@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Ensure brain-memory-v4 is on the path
+# Ensure brain-memory-v5.0 is on the path
 _sys_path_root = Path(__file__).parent.parent
 if str(_sys_path_root) not in sys.path:
     sys.path.insert(0, str(_sys_path_root))
@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field
 from brain.core import Brain
 from config import HOST, PORT
 
-logger = logging.getLogger("brain-v4.api")
+logger = logging.getLogger("brain-v5.api")
 
 # ── Global brain instance ──
 _brain: Brain | None = None
@@ -72,7 +72,7 @@ async def _broadcast_loop():
 
 # ── App ──
 
-app = FastAPI(title="Brain Memory v5.0", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="Brain Memory v5.4", version="5.4.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -243,7 +243,7 @@ async def health():
     state = await brain.get_state()
     return {
         "status": "awake" if brain.is_awake else "asleep",
-        "version": "5.0.0",
+        "version": "5.4.0",
         "total_ticks": state.get("total_ticks", 0),
         "uptime_seconds": state.get("uptime_seconds", 0.0),
         "emotion": state.get("current_emotion", "neutral"),
@@ -255,6 +255,44 @@ async def health():
         "active_sessions": brain.brain_stem.state.session_manager.get_session_count(),
         "sleep_state": brain.brain_stem.sleep_state,
     }
+
+
+@app.get("/api/v4/goals")
+async def get_goals():
+    """v5.1: Get the brain's active goals and goal statistics."""
+    brain = get_brain()
+    gs = brain.brain_stem.goal_system
+    return gs.snapshot()
+
+
+@app.get("/api/v4/metacognition")
+async def get_metacognition():
+    """v5.2: Get the brain's metacognitive state — self-awareness metrics."""
+    brain = get_brain()
+    mc = brain.brain_stem.metacognition
+    return mc.snapshot()
+
+
+@app.get("/api/v4/emotion")
+async def get_emotion():
+    """v5.3: Get the brain's emotional spectrum — continuous blends, trajectory, expression."""
+    brain = get_brain()
+    es = brain.brain_stem.emotional_spectrum
+    return es.snapshot()
+
+
+@app.get("/api/v4/skills")
+async def get_skills():
+    """v5.4: Get learned procedural skills."""
+    brain = get_brain()
+    return brain.brain_stem.procedural_memory.snapshot()
+
+
+@app.get("/api/v4/timesense")
+async def get_timesense():
+    """v5.4: Get time awareness — rhythm, temporal narrative, age."""
+    brain = get_brain()
+    return brain.brain_stem.time_sense.snapshot()
 
 
 # ── WebSocket ──

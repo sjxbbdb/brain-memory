@@ -9,7 +9,7 @@
 import re
 import logging
 
-logger = logging.getLogger("brain-v4.thalamus")
+logger = logging.getLogger("brain-v5.thalamus")
 
 
 class Thalamus:

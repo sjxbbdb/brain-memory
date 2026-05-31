@@ -48,6 +48,11 @@ SALIENCE_THRESHOLD = 0.5         # 突显度超过此值触发注意力聚焦
 # ── Database ──
 DB_PATH = "brain_v4.db"
 
+# ── Goal System (v5.1) ──
+GOAL_MAX_ACTIVE = 3               # 最多活跃目标数
+GOAL_DEFAULT_DEADLINE_TICKS = 150 # 默认目标时限（约5分钟）
+GOAL_GENERATION_INTERVAL_TICKS = 300  # 目标生成间隔（约10分钟）
+
 # ── Sleep / Dream ──
 DROWSY_THRESHOLD_TICKS = 60       # 约 2 分钟无输入 → 进入 drowsy
 LIGHT_SLEEP_THRESHOLD_TICKS = 180  # 约 6 分钟 → 浅睡

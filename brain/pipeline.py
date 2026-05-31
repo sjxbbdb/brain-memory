@@ -9,7 +9,7 @@ import math
 import logging
 from datetime import datetime, timezone, timedelta
 
-logger = logging.getLogger("brain-v4.pipeline")
+logger = logging.getLogger("brain-v5.pipeline")
 
 # ═══════════════════════════════════════════════════════════
 # Pipeline Constants (from v3 config)

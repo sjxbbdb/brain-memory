@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-logger = logging.getLogger("brain-v4.self-model")
+logger = logging.getLogger("brain-v5.self-model")
 
 # ── 核心驱动力定义 ──
 DEFAULT_DRIVES = {

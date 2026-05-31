@@ -107,6 +107,7 @@ class BrainState:
             "self_model": self.self_model.snapshot(),
             "curiosity": self.curiosity.snapshot(),
             "sessions": self.session_manager.all_snapshots(),
+            "goal_system": {},  # filled by BrainStem at snapshot time
         }
 
     @classmethod

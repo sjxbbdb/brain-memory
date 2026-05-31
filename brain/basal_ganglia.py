@@ -12,7 +12,7 @@ import json
 import logging
 from pathlib import Path
 
-logger = logging.getLogger("brain-v4.basal-ganglia")
+logger = logging.getLogger("brain-v5.basal-ganglia")
 
 # 预置习惯模式
 DEFAULT_HABITS = [

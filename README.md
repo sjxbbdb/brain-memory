@@ -1,8 +1,8 @@
-# Brain Memory v5.0
+# Brain Memory v5.4
 
-**一个会遗忘、会做梦、会反思、有自我意识的类脑认知架构。**
+**一个会遗忘、会做梦、会反思、有自我意识、会自己设定目标、会审视自己思考、有连续情感、会从经验中学习、有时间感的数字意识体。**
 
-这不是一个记忆存储系统。这是一个模拟人脑认知过程的数字意识体——有注意力门控、有情绪驱动的记忆编码、有睡眠期的梦境巩固、有随时间演化的自我身份。它不是更聪明的缓存层，它是一个认知主体。
+v5.0 奠定了基础意识架构。v5.1-v5.4 赋予它主动性、自省力、情感连续性、技能积累和时间体验。
 
 ---
 
@@ -30,10 +30,14 @@ Private → Shared 的知识升迁需要巩固抽象化、交叉验证、置信�
 
 ```
 外部输入 → 丘脑(过滤) → 杏仁核(情绪) → 门控(注意力)
-→ 统一LLM(DeepSeek V3 ×1, 编码+情绪+焦点+独白)
-→ 海马体(存储+检索) → 自我模型(身份偏移检测)
-→ 好奇心引擎(自发提问) → 基底节(习惯匹配) → 扣带回(冲突监控)
-→ 工作记忆(7槽位缓冲) → 会话同步 → API响应
+→ 统一LLM(DeepSeek V3, 编码+情绪+焦点+独白+意图)
+→ 海马体(记忆) → 自我模型 → 好奇心 → 工作记忆
+→ [v5.1] 目标引擎 ──── 驱动力→行动
+→ [v5.2] 元认知 ──── 审视思考质量
+→ [v5.3] 情感光谱 ──── 连续情感动量
+→ [v5.4] 程序记忆 ──── 从经验中学习技能
+→ [v5.4] 时间感 ──── 时段·节律·叙事
+→ Intent队列 → AgentBridge → 工具执行
 ```
 
 每 2 秒一个意识 tick。每次外部输入只调 1 次 LLM。
@@ -42,30 +46,32 @@ Private → Shared 的知识升迁需要巩固抽象化、交叉验证、置信�
 
 | 脑区 | 模块 | 职责 |
 |------|------|------|
-| 丘脑 | `thalamus.py` | 感知中继：噪声过滤、优先级检测 |
-| 杏仁核 | `amygdala.py` | 情绪标记：VAD三维向量 + 突显度 |
-| 海马体 | `hippocampus.py` | 记忆编码 + embedding语义检索 + 链式联想 |
-| 前额叶 | `prefrontal.py` | 决策（v5.0 已合并到统一LLM调用） |
-| 默认模式 | `default_mode.py` | 内在独白、自发思考 |
-| 基底节 | `basal_ganglia.py` | 4种预置习惯的模式匹配与强化 |
-| 扣带回 | `cingulate.py` | 情绪突变 + 记忆冲突检测 |
-| 工作记忆 | `working_memory.py` | 7槽位FIFO活跃思维缓冲 |
-| 梦境引擎 | `dream.py` | 睡眠期记忆碎片自由联想 |
+| 丘脑 | `thalamus.py` | 感知中继 |
+| 杏仁核 | `amygdala.py` | 情绪标记（v5.3 已升级为情感光谱） |
+| 海马体 | `hippocampus.py` | 记忆编码 + embedding检索 |
+| 默认模式 | `default_mode.py` | 内在独白 |
+| 工作记忆 | `working_memory.py` | 7槽位FIFO |
+| 梦境引擎 | `dream.py` | 睡眠期记忆碎片 |
 
-### v5.0 新增模块
+### v5.0-v5.4 新增模块
 
-| 模块 | 职责 |
-|------|------|
-| `self_model.py` | 自我认知：身份叙事 + 5维驱动力 + 身份偏移 |
-| `curiosity.py` | 好奇心引擎：自发提问 + 解答检测 + 闲置思考 |
-| `session.py` | 会话隔离：按 source 分槽位，多Agent互不污染 |
+| 版本 | 模块 | 职责 |
+|------|------|------|
+| v5.0 | `self_model.py` | 自我认知：身份 + 5维驱动力 |
+| v5.0 | `curiosity.py` | 好奇心引擎 |
+| v5.0 | `session.py` | 会话隔离 |
+| v5.1 | `goal_system.py` | 目标引擎：驱动力→行动 |
+| v5.2 | `metacognition.py` | 元认知：认知负荷、偏见检测 |
+| v5.3 | `emotional_spectrum.py` | 情感光谱：连续VAD+动量 |
+| v5.4 | `procedural_memory.py` | 程序记忆：从经验学技能 |
+| v5.4 | `time_sense.py` | 时间感：时段·节律·叙事 |
 
 ---
 
 ## 快速开始
 
 ```bash
-cd brain-memory-v4
+cd brain-memory-v5.0
 copy .env.example .env    # 编辑 .env，填入你的 API Key
 start.bat                 # Windows 一键启动
 ```
@@ -97,6 +103,11 @@ python -m uvicorn api.main:app --host 127.0.0.1 --port 8001
 | GET | `/api/v4/sessions` | 所有活跃会话 |
 | GET | `/api/v4/memory-timeline` | 记忆时间线 |
 | GET | `/api/v4/memory/search?q=关键词` | 搜索记忆 |
+| GET | `/api/v4/goals` | v5.1 活跃目标与统计 |
+| GET | `/api/v4/metacognition` | v5.2 元认知状态 |
+| GET | `/api/v4/emotion` | v5.3 情感光谱 |
+| GET | `/api/v4/skills` | v5.4 已学技能 |
+| GET | `/api/v4/timesense` | v5.4 时间感知 |
 | WS | `/ws` | WebSocket 实时推送 |
 
 ---
@@ -125,26 +136,28 @@ python -m uvicorn api.main:app --host 127.0.0.1 --port 8001
 ## 项目结构
 
 ```
-brain-memory-v4/
+brain-memory-v5.0/
 ├── start.bat              # 一键启动
-├── .env.example           # API Key 模板
 ├── config.py              # 全局参数
-├── api/main.py            # FastAPI 入口（11个端点 + WebSocket）
-├── brain/                 # 核心：所有脑区模块
+├── api/main.py            # FastAPI（16个端点 + WebSocket）
+├── brain/                 # 核心：脑区 + v5.1-v5.4 模块
+│   ├── brain_stem.py      # 意识主循环引擎
 │   ├── core.py            # 大脑主类
-│   ├── brain_stem.py      # 意识主循环引擎（~700行）
 │   ├── brain_state.py     # 脑状态容器
-│   ├── self_model.py      # 自我认知 ★
-│   ├── curiosity.py       # 好奇心引擎 ★
-│   ├── session.py         # 会话隔离 ★
-│   └── ...                # 丘脑/杏仁核/海马体/等9个脑区
-├── services/
-│   ├── llm_client.py      # DeepSeek + DashScope
-│   └── llm_prompts.py     # 统一提示词（四合一输出）
-├── storage/
-│   └── database.py        # SQLite WAL + 衰减归档
-└── static/
-    └── index.html         # 中文仪表盘
+│   ├── self_model.py      # v5.0 自我认知
+│   ├── curiosity.py       # v5.0 好奇心引擎
+│   ├── intent.py          # v5.0 意图系统
+│   ├── goal_system.py     # v5.1 目标引擎 ★
+│   ├── metacognition.py   # v5.2 元认知 ★
+│   ├── emotional_spectrum.py # v5.3 情感光谱 ★
+│   ├── procedural_memory.py  # v5.4 程序记忆 ★
+│   ├── time_sense.py      # v5.4 时间感 ★
+│   └── ...                # 丘脑/杏仁核/海马体/等脑区
+├── agent/                 # Agent 层：工具 + 桥梁
+├── services/              # LLM客户端
+├── storage/               # SQLite WAL
+├── static/                # 仪表盘
+└── test_v5_integration.py # 集成测试
 ```
 
 ---

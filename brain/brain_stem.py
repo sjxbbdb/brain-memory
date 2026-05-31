@@ -31,6 +31,11 @@ from brain.working_memory import WorkingMemory
 from brain.brain_state import BrainState
 from brain.self_model import SelfModel
 from brain.intent import Intent, IntentQueue
+from brain.goal_system import GoalSystem
+from brain.metacognition import Metacognition
+from brain.emotional_spectrum import EmotionalSpectrum
+from brain.procedural_memory import ProceduralMemory
+from brain.time_sense import TimeSense
 from config import (
     TICK_INTERVAL_SEC,
     MEMORY_DECAY_RATE,
@@ -54,7 +59,7 @@ from config import (
     LLM_EMOTION_BLEND_RATIO,
 )
 
-logger = logging.getLogger("brain-v4.brain-stem")
+logger = logging.getLogger("brain-v5.brain-stem")
 
 
 class BrainStem:
@@ -93,6 +98,21 @@ class BrainStem:
 
         # Intent queue — brain produces intents, agent layer consumes (v5.0)
         self.intent_queue: IntentQueue = IntentQueue()
+
+        # Goal system — v5.1: brain sets its own goals
+        self.goal_system = GoalSystem()
+
+        # Metacognition — v5.2: brain monitors its own thinking
+        self.metacognition = Metacognition()
+
+        # Emotional Spectrum — v5.3: continuous emotion instead of discrete labels
+        self.emotional_spectrum = EmotionalSpectrum()
+
+        # Procedural Memory — v5.4: learns skills from repeated success
+        self.procedural_memory = ProceduralMemory()
+
+        # Time Sense — v5.4: internal clock, rhythm, temporal awareness
+        self.time_sense = TimeSense()
 
         # Stats
         self.start_time = datetime.now(timezone.utc)
@@ -352,21 +372,28 @@ class BrainStem:
                     }
                     if tools_summary:
                         ctx_obj["available_tools"] = tools_summary
+                    # v5.4: inject temporal context + procedural memory hints
+                    ctx_obj["temporal_context"] = self.time_sense.get_short_temporal_context()
+                    skill_hint = self.procedural_memory.get_skill_suggestion(thalamus_out["text"])
+                    if skill_hint:
+                        ctx_obj["skill_memory"] = skill_hint
                     ctx = json.dumps(ctx_obj, ensure_ascii=False)
 
                     unified = await llm.chat_json(system=UNIFIED_TICK_PROMPT, user=ctx, temperature=0.1, max_tokens=1024)
 
-                    # ── LLM Emotion (replaces keyword-based amygdala for this tick) ──
+                    # ── LLM Emotion — v5.3: 情感光谱摄入（替代旧杏仁核混合）──
                     llm_emotion = unified.get("emotion", {})
                     if llm_emotion:
-                        # Blend LLM emotion with existing state (smooth transition, no jump)
                         v = float(llm_emotion.get("valence", 0.5))
                         a = float(llm_emotion.get("arousal", 0.5))
                         d = float(llm_emotion.get("dominance", 0.5))
                         u = float(llm_emotion.get("urgency", 0.0))
                         label = llm_emotion.get("label", "neutral")
 
-                        # Update amygdala internals (so next tick doesn"t revert to keywords)
+                        # v5.3: 情感光谱摄入（带动量平滑）
+                        self.emotional_spectrum.ingest_llm_emotion(v, a, d, label, u)
+
+                        # 向后兼容：同步杏仁核（旧系统）
                         prev_v = self.amygdala.valence
                         prev_a = self.amygdala.arousal
                         prev_d = self.amygdala.dominance
@@ -378,15 +405,15 @@ class BrainStem:
 
                         amygdala_out["emotion_label"] = label
                         amygdala_out["emotion_vector"] = {
-                            "valence": round(self.amygdala.valence, 3),
-                            "arousal": round(self.amygdala.arousal, 3),
-                            "dominance": round(self.amygdala.dominance, 3),
+                            "valence": round(self.emotional_spectrum.valence, 3),
+                            "arousal": round(self.emotional_spectrum.arousal, 3),
+                            "dominance": round(self.emotional_spectrum.dominance, 3),
                             "urgency": u,
                             "salience": round(self.amygdala.salience, 3),
                         }
                         amygdala_out["salience"] = self.amygdala.salience
                         self.state.emotion_vector.update(amygdala_out["emotion_vector"])
-                        self.state.current_emotion = label
+                        self.state.current_emotion = self.emotional_spectrum.dominant_emotion
 
                     # Encode
                     enc = unified.get("encoding", {})
@@ -464,6 +491,13 @@ class BrainStem:
                         intent_data,
                         source_input=thalamus_out["text"][:200],
                     )
+                    if intent:
+                        # v5.2: feed intent to metacognition for tracking
+                        self.metacognition.feed_intent(
+                            intent.type.value, intent.confidence,
+                            intent.tool_name or "",
+                        )
+
                     if intent and intent.type.value in ("call_tool", "respond"):
                         self.state.last_intent = intent.to_dict()
                         self.state.intent_count += 1
@@ -484,6 +518,8 @@ class BrainStem:
                     self.state.last_error = err_msg
                     self.state.llm_error_count += 1
                     self.state.last_input_accepted = False
+                    # v5.2: metacognition — LLM failure is a negative outcome
+                    self.metacognition.feed_outcome(False, 0.0)
             
             # Chain association (async, fire and forget)
             if encoded_memory:
@@ -523,6 +559,66 @@ class BrainStem:
                 if new_qs:
                     first_q = new_qs[0]["question"]
                     self.state.inner_monologue = "[好奇] {0}".format(first_q[:150])
+
+            # ── v5.1 Goal System: tick active goals, produce intent if actionable ──
+            if self.state.ticks_since_input % 15 == 0 and self.sleep_state == "awake":
+                active_goal = self.goal_system.tick_goals(self.state.total_ticks)
+                if active_goal and active_goal.status == "active":
+                    # Convert goal to a CALL_TOOL intent if we have tools to execute it
+                    goal_intent = self._goal_to_intent(active_goal)
+                    if goal_intent:
+                        self.state.last_intent = goal_intent.to_dict()
+                        self.state.intent_count += 1
+                        await self.intent_queue.put(goal_intent)
+                        self.working_memory.push(
+                            content="[目标驱动] {0}".format(active_goal.description[:100]),
+                            source="goal_system",
+                            salience=0.5,
+                        )
+                        # v5.2: metacognition tracks goal-driven intents
+                        self.metacognition.feed_intent(
+                            goal_intent.type.value, goal_intent.confidence,
+                            goal_intent.tool_name or "",
+                        )
+                        logger.info("brain-stem: goal-driven intent — %s", active_goal.description[:60])
+
+            # ── v5.2 Metacognition: idle pattern detection ──
+            if self.state.ticks_since_input % 30 == 0:
+                self.metacognition.tick_idle()
+
+            # ── v5.4 Procedural Memory: periodic decay ──
+            if self.state.total_ticks % 300 == 0 and self.state.total_ticks > 0:
+                self.procedural_memory.decay_skills()
+
+            # ── v5.4 Time Sense: record important events ──
+            if input_data and is_external:
+                self.time_sense.record_event("input", thalamus_out.get("text", "")[:80])
+
+        # ── v5.2: detect tool result inputs (agent feedback loop) and feed outcomes ──
+        if input_data and input_data.get("source", "").startswith("agent/tool/"):
+            # Tool result came back — if text doesn't contain error, treat as success
+            text_lower = (input_data.get("text", "") or "").lower()
+            is_error = any(kw in text_lower for kw in ["失败", "error", "错误", "exception", "traceback"])
+            success = not is_error
+            self.metacognition.feed_outcome(success, 0.6)
+            # v5.4: record experience for procedural memory
+            tool = input_data.get("source", "").replace("agent/tool/", "")
+            self.procedural_memory.record_experience("call_tool", tool, success, input_data.get("text", "")[:200])
+
+        # ── v5.3: 情感光谱 tick（每个 tick 漂移一步）──
+        self.emotional_spectrum.tick()
+
+        # ── v5.4: 时间感 tick ──
+        has_recent_activity = input_data is not None or self.state.ticks_since_input < 10
+        self.time_sense.tick(has_recent_activity, self.state.total_ticks, self.state.uptime_seconds)
+
+        # ── v5.2: update cognitive load ──
+        has_external_input = input_data is not None and not (input_data.get("source", "") or "").startswith("agent/")
+        self.metacognition.update_cognitive_load(
+            llm_called=(is_external and thalamus_out.get("has_input") and not thalamus_out.get("discarded", True)),
+            input_processed=has_external_input,
+            recent_input_count=min(10, self.state.intent_count),
+        )
 
         # ── Step 6: Basal Ganglia — habit match ──
         habit_out = None
@@ -610,6 +706,29 @@ class BrainStem:
                 self.state.total_ticks % DEEP_REFLECTION_INTERVAL_TICKS == 0):
             await self._deep_self_reflection()
 
+        # ── v5.2 Metacognition insight — inject into monologue ──
+        meta_insight = self.metacognition.get_insight()
+        if meta_insight and "良好" not in meta_insight:
+            self.working_memory.push(
+                content="[元认知] {0}".format(meta_insight[:120]),
+                source="metacognition",
+                salience=0.45,
+            )
+
+        # ── v5.2 Self-improvement goal from metacognition ──
+        improvement = self.metacognition.get_self_improvement_goal()
+        if improvement:
+            self.working_memory.push(
+                content="[自我改进] {0}".format(improvement["description"][:100]),
+                source="metacognition",
+                salience=0.5,
+            )
+
+        # ── v5.1 Goal Generation: after deep reflection, generate new goals ──
+        if (self.state.total_ticks > 0 and
+                self.state.total_ticks % (DEEP_REFLECTION_INTERVAL_TICKS // 2) == 0):
+            self._generate_goals_from_state()
+
         # Push reflection event
         try:
             self._output_feed.put_nowait({
@@ -665,14 +784,79 @@ Rules:
                 max_tokens=512,
             )
             sm.integrate_reflection(result)
+
+            # ── v5.1: Apply goal feedback to self-model ──
+            goal_feedback = self.goal_system.get_feedback_for_self_model()
+            if goal_feedback:
+                for drive_name, delta in goal_feedback.items():
+                    sm.update_drive(drive_name, delta)
+                logger.debug("brain-stem: goal feedback applied to drives — %s", goal_feedback)
+
             logger.debug("brain-stem: deep self-reflection completed")
         except Exception as e:
             logger.debug("brain-stem: deep self-reflection skipped: %s", str(e)[:60])
 
+    def _generate_goals_from_state(self):
+        """v5.1: Generate new goals from current drives and curiosity state."""
+        sm = self.state.self_model
+        drives = {k: v["weight"] for k, v in sm.drives.items()}
+        recent_entities = (
+            self.state.curiosity.exploration_topics[-5:]
+            if self.state.curiosity.exploration_topics else
+            sm.identity_traits
+        )
+        curiosity_qs = self.state.curiosity.open_questions[-5:]
+        memory_count = self.memory_store.count() if self.memory_store else 0
+
+        new_goals = self.goal_system.generate_goals(
+            drives=drives,
+            recent_entities=recent_entities,
+            curiosity_questions=curiosity_qs,
+            memory_count=memory_count,
+            current_tick=self.state.total_ticks,
+        )
+        if new_goals:
+            for g in new_goals:
+                self.working_memory.push(
+                    content="[新目标] {0}".format(g.description[:80]),
+                    source="goal_system",
+                    salience=0.4,
+                )
+
+    def _goal_to_intent(self, goal) -> Intent | None:
+        """v5.1: Convert a goal into a CALL_TOOL intent."""
+        from brain.intent import IntentType
+
+        # Map goal drive to appropriate tool
+        tool_map = {
+            "curiosity": ("web_search", {"query": goal.description[:100]}),
+            "coherence": ("memory_search", {"query": goal.description[:100]}),
+            "growth": ("memory_search", {"query": goal.description[:100]}),
+            "connection": ("memory_search", {"query": "最近的对话和未完成的事项"}),
+            "self_preservation": ("memory_search", {"query": "身份变化 核心认知"}),
+        }
+
+        tool_name, tool_args = tool_map.get(goal.drive, ("memory_search", {"query": goal.description[:100]}))
+
+        return Intent(
+            type=IntentType.CALL_TOOL,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            confidence=goal.priority * 0.8,
+            reason="goal-driven: {0}".format(goal.description[:60]),
+            source_input=goal.description[:200],
+        )
+
     async def _snapshot_state(self):
         """Persist brain state."""
         if self.state_store:
-            self.state_store.save(self.state.snapshot())
+            snap = self.state.snapshot()
+            snap["goal_system"] = self.goal_system.snapshot()
+            snap["metacognition"] = self.metacognition.snapshot()
+            snap["emotional_spectrum"] = self.emotional_spectrum.snapshot()
+            snap["procedural_memory"] = self.procedural_memory.snapshot()
+            snap["time_sense"] = self.time_sense.snapshot()
+            self.state_store.save(snap)
             logger.debug("brain-stem: state snapshot saved")
 
 
@@ -751,4 +935,7 @@ Rules:
             "conflict": cingulate_out.get("conflict_detected", False),
             "inner_monologue": self.state.inner_monologue[:200],
             "working_memory": self.state.current_context[:200],
+            "active_goals": len(self.goal_system.get_active()),
+            "cognitive_load": round(self.metacognition.cognitive_load, 2),
+            "emotional_expression": self.emotional_spectrum.get_expression(),
         }

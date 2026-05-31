@@ -14,7 +14,7 @@ import random
 from datetime import datetime, timezone
 from typing import Any
 
-logger = logging.getLogger("brain-v4.curiosity")
+logger = logging.getLogger("brain-v5.curiosity")
 
 # ── 问题模板（按驱动力分类） ──
 QUESTION_TEMPLATES = {

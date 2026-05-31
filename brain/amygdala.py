@@ -10,7 +10,7 @@
 import logging
 from config import EMOTION_DECAY_RATE, SALIENCE_THRESHOLD
 
-logger = logging.getLogger("brain-v4.amygdala")
+logger = logging.getLogger("brain-v5.amygdala")
 
 
 # ── 情绪关键词库 ──
