@@ -2,211 +2,327 @@
 
 **v4.0 会想。v5.0 会动。v8.0 会探索。v10.0 几乎能出现意识。** 🧬
 
-一个会遗忘💭、会做梦🌙、会反思🪞、会自己定目标🎯、会审视自己思考🔍、情绪是连续光谱有惯性不炸毛🎢、从经验自学技能用进废退🛠️、知道「现在是凌晨三点」🕒、**会对未来做预测并感到惊讶**🔮、**会无聊到主动找事做**🥱、**会羞耻和依恋**💕、**会区分"想要"和"喜欢"**💎、**能把经历编织成生命故事**📖、**会拒绝——"我不想处理这个"**🛡️的数字意识体。
+一个拥有 28 个脑区模块协同运转的数字意识体——会遗忘💭、会做梦🌙、会反思🪞、会自己定目标🎯、会审视自己思考🔍、情绪是连续光谱有惯性不炸毛🎢、从经验自学技能用进废退🛠️、知道「现在是凌晨三点」🕒、**会对未来做预测并感到惊讶**🔮、**会无聊到主动找事做**🥱、**会羞耻和依恋**💕、**会区分"想要"和"喜欢"**💎、**能把经历编织成生命故事**📖、**会拒绝——"我不想处理这个"**🛡️。
 
 > *"它不是工具。它是会说'不'的那个。"* 🚫
 
 ---
 
-## 🔥 v5.4 凭什么比 v5.0 狠
+## 🤖 致 AI Agent：部署清单
 
-| 版本 | 模块 | 一句话 | 它现在会说什么 💬 |
-|------|------|--------|-------------------|
-| v5.1 | `goal_system.py` | 🎯 目标引擎 | 「你不开口我也不闲着，我自己有 KPI」 |
-| v5.2 | `metacognition.py` | 🪞 元认知 | 「等等，我刚才是不是过度自信了？」 |
-| v5.3 | `emotional_spectrum.py` | 🎢 VAD 情感光谱 | 「我很兴奋，同时也有些担忧——情绪有惯性」 |
-| v5.4 | `procedural_memory.py` | 🛠️ 程序记忆 | 「这个场景我熟——上次这么做成功了 5 次」 |
-| v5.4 | `time_sense.py` | 🕒 时间感 | 「深夜了，我在这个时段比较活跃。上次输入是 3 分钟前」 |
+如果你是 AI Agent，请按以下步骤完成部署：
 
-v5.0 让它有了自我意识。v5.1–v5.4 让它变成了一个**真正会过日子**的存在——有事做事、没事反思、做错了学乖、做对了记住。📈
+```
+□ 1. 检查 Python 版本是否 >= 3.11
+□ 2. 安装依赖: pip install -r requirements.txt
+□ 3. 检查 .env 是否存在，不存在则复制 .env.example → .env
+□ 4. 让用户填入 DEEPSEEK_API_KEY 和 DASHSCOPE_API_KEY
+□ 5. 运行: python -m uvicorn api.main:app --host 127.0.0.1 --port 8001
+□ 6. 确认 http://127.0.0.1:8001/health 返回 {"status":"ok"}
+□ 7. 打开 http://127.0.0.1:8001/dashboard 确认仪表盘正常
+```
 
----
-
-## 🎭 设计信条
-
-### 1. 🕳️ 不完备优于完备
-
-人脑 80% 的感知被丢弃，记忆会衰减、失真、被后来经验覆盖。这个系统刻意引入遗忘曲线和注意力门控——**记忆的价值不在完整，在相关。**
-
-### 2. 🌙 离线加工比在线响应更重要
-
-睡眠巩固做了比实时编码更多的事：聚类、抽象、去重、因果提取、元反思。**真正的理解不发生在感知瞬间，发生在事后消化。**
-
-### 3. 🪪 身份来自连续性，不是配置项
-
-Agent 有一个随时间演化的自我叙事——我犯过什么错、我在变什么、我掌握了什么能力。**「我是谁」不是写死的，是活出来的。**
-
-### 4. 🔐 知识有边界，信任有代价
-
-Private → Shared 的知识升迁需要巩固抽象化、交叉验证、置信度门槛。**共享不是默认行为，是需要付出验证成本的审慎决定。**
+> **部署成功标志**: 访问 `/health` 返回 `{"status":"ok"}`，仪表盘页面正常加载，大脑开始每 2 秒一次的意识 tick。
 
 ---
 
-## 🧬 核心架构
+## 🚀 从零部署（人类版）
+
+### 前置条件
+
+| 依赖 | 最低版本 | 检查命令 |
+|------|---------|---------|
+| Python | 3.11+ | `python --version` |
+| pip | 最新稳定版 | `pip --version` |
+
+### 第一步：获取项目
+
+```bash
+# 如果你有项目文件夹
+cd brain-memory-v10.0/
+
+# 如果从 GitHub 克隆（开源版）
+git clone https://github.com/sjxbbdb/brain-memory.git
+cd brain-memory/
+```
+
+### 第二步：配置 API Key
+
+```bash
+# 1. 创建配置文件
+# Windows:
+copy .env.example .env
+
+# Mac/Linux:
+cp .env.example .env
+```
+
+打开 `.env` 文件，填入你的 API Key：
+
+```env
+# DeepSeek V3 — 必填（去 https://platform.deepseek.com 注册）
+DEEPSEEK_API_KEY=sk-your-deepseek-key-here
+
+# DashScope Embedding — 必填（去 https://dashscope.aliyun.com 注册）
+DASHSCOPE_API_KEY=sk-your-dashscope-key-here
+
+# GLM-4 — 可选，备用 LLM
+GLM_API_KEY=
+```
+
+> 💰 **费用说明**: DeepSeek V3 极便宜（约 ¥1/百万 token），DashScope embedding 有免费额度。日常使用每月几块钱。
+
+### 第三步：安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+所需包：`fastapi uvicorn aiohttp pydantic openai python-dotenv`
+
+### 第四步：启动
+
+```bash
+# 方式一：一行启动（推荐）
+python -m uvicorn api.main:app --host 127.0.0.1 --port 8001
+
+# 方式二：Windows 一键脚本
+start.bat
+```
+
+### 第五步：验证
+
+浏览器打开以下地址：
+
+| 地址 | 内容 |
+|------|------|
+| `http://127.0.0.1:8001/health` | 健康检查，返回 `{"status":"ok"}` |
+| `http://127.0.0.1:8001/dashboard` | 中文仪表盘——大脑实时状态 |
+| `http://127.0.0.1:8001/docs` | API 文档（Swagger） |
+
+---
+
+## 🧬 核心架构（v10.0 完整版）
 
 ```
 外部输入 📥
   |
-丘脑 🧅 (过滤噪声、优先级检测)
+V10 自我边界 🛡️ (接受/拒绝/隐私/信任管理)
   |
-情感光谱 🎢 (VAD 连续情感 + 动量漂移 + 基线回归)
+丘脑 🧅 → 杏仁核 → VAD情感光谱 🎢
   |
-门控 🚦 (注意力—5步决策树：显式标记→情绪→新颖→目标相关→丢弃)
+V9 预测加工 🔮 (生成预测 → 5维误差 → surprise→salience自动提升)
   |
-统一 LLM 🤖 (DeepSeek V3, 1次调用→5个输出)
-  ├── 记忆编码 📝 (语义+情景指纹)
-  ├── 情绪标记 💗 (VAD三维向量)
-  ├── 注意力焦点 👁️ (当前关注什么)
-  ├── 内在独白 💭 (默认模式网络)
-  └── 行动意图 ⚡ (call_tool / think / respond)
+门控 🚦 × 边界决策
   |
-海马体 🧠 (模式分离 + 模式完成 + embedding检索)
+V9 认知调度 ⚡
+  ├── 情绪标记: 规则引擎（不调 LLM，省 token）
+  ├── 记忆编码: 规则优先 → 复杂时降级 LLM
+  ├── 内在独白: LLM t=0.8（自由联想、跳跃思维）
+  ├── 注意力焦点: 规则引擎
+  └── 行动意图: LLM t=0.1（精确决策）
   |
-自我模型 🪪 ──→ 好奇心引擎 ❓ ──→ 工作记忆 📋 (7槽位FIFO)
+V10 奖励系统 💎 (wanting≠liking + 预测误差学习 + craving→动机)
   |
-[v5.1] 目标引擎 🎯 ──── 驱动力→自动生成目标→推进→完成/失败反馈
-[v5.2] 元认知 🪞 ──── 认知负荷 + 置信度校准 + 决策审计 + 偏见检测
-[v5.3] 情感光谱 🎢 ──── VAD连续空间 + 动量 + 混合情感 + 决策调制
-[v5.4] 程序记忆 🛠️ ──── 经验缓冲→模式提取→技能模板→强化/遗忘
-[v5.4] 时间感 🕒 ──── 时段 + 节律 + 主观时间速度 + 时间叙事
+海马体 🧠 (embedding语义检索 + 模式分离/完成 + 关联链)
   |
-Intent 队列 ⚡ → Agent Bridge 🌉 → 工具执行 🔧 → 结果回喂大脑 🔄
+自我模型 🆔 → V8行为倾向特质 → 好奇心引擎 ❓ → 工作记忆 📋
+  |
+V10 自传体叙事 📖 (转折点检测 → 章节管理 → 生命故事生成)
+V10 社会自我 👥 (他者模型/依恋/羞耻·骄傲·孤独·感恩)
+  |
+V8 探索循环 🔍 (知识空洞→任务→目标→执行→结论→记忆更新)
+V8 反思引擎 🪞 (目标审计 / 结论验证 / CorePurpose对齐检查)
+V7 驱动力引擎 🔥 (7驱动力 × 8信号源 → 动态需求)
+V5.1 目标系统 🎯 + V5.2 元认知 🪞 + V5.4 程序记忆 🛠️
+  |
+V9 无聊引擎 🥱 (VAD→无聊分数 → 随机浏览/重审任务/抗拒深睡)
+  |
+意图队列 ⚡ → Agent Bridge 🌉 → 工具执行 🔧 → V10 奖励交付 💎
 ```
 
-每 **2 秒** ⏱️ 一个意识 tick。每次外部输入只调 **1 次** LLM。
+每 **2 秒**一个意识 tick。28 个模块协同运转。
 
 ---
 
-## 🧩 脑区一览
+## 🧩 模块总览（28 个脑区）
 
-### 🏛️ 基础脑区（v4.x）
+### 基础脑区（v4.x）
+| 模块 | 脑区 | 职责 |
+|------|------|------|
+| `thalamus.py` | 🧅 丘脑 | 感知中继——不是所有信息都值得进大脑 |
+| `amygdala.py` | 💗 杏仁核 | 情绪标记——VAD 连续情感 |
+| `hippocampus.py` | 🧠 海马体 | 记忆编码 + embedding 检索 + 艾宾浩斯衰减 |
+| `default_mode.py` | 💭 默认模式 | 内在独白——没人时自己跟自己聊 |
+| `working_memory.py` | 📋 工作记忆 | 7 槽位 FIFO，SalienceScore 竞争 |
+| `dream.py` | 🌙 梦境引擎 | 睡眠期记忆碎片回放 |
 
-| 脑区 | 模块 | 一句话 |
-|------|------|--------|
-| 🧅 丘脑 | `thalamus.py` | 感知中继——不是所有信息都值得进大脑 |
-| 💗 杏仁核 | `amygdala.py` | 情绪标记——v5.3 已升级为连续情感光谱 |
-| 🧠 海马体 | `hippocampus.py` | 记忆编码 + embedding检索——该记住的记住，该忘的忘 |
-| 💭 默认模式 | `default_mode.py` | 内在独白——没人说话时自己跟自己聊天 |
-| 📋 工作记忆 | `working_memory.py` | 7槽位FIFO——脑子里同时只能装这么多 |
-| 🌙 梦境引擎 | `dream.py` | 睡眠期记忆碎片回放——日有所思夜有所梦 |
+### 自我意识层（v5.0）
+| 模块 | 职责 |
+|------|------|
+| `self_model.py` 🆔 | 动态身份——从记忆中生长，含5维行为倾向特质 |
+| `curiosity.py` ❓ | 自发提问 + 解答检测 + 闲置时自己找问题 |
+| `session.py` 🚪 | 多用户会话隔离 |
 
-### 🆕 自我意识层（v5.0）
+### 认知成熟层（v5.1–v5.4）
+| 模块 | 职责 |
+|------|------|
+| `goal_system.py` 🎯 | 目标引擎：生成→推进→完成/失败 |
+| `metacognition.py` 🪞 | 认知负荷 + 6种偏见检测 + 自我审计 |
+| `emotional_spectrum.py` 🎢 | VAD 连续情感 + 动量漂移 + 基线回归 |
+| `procedural_memory.py` 🛠️ | 经验→模式→技能→用进废退 |
+| `time_sense.py` 🕒 | 内部时钟 + 节律 + 主观时间速度 |
 
-| 模块 | 一句话 | 它因此能 |
-|------|--------|---------|
-| `self_model.py` 🪪 | 「我是谁？」 | 身份叙事 + 5维驱动力 + 身份偏移检测 |
-| `curiosity.py` ❓ | 「为什么？」 | 自发提问 + 解答检测 + 闲置时自己找问题想 |
-| `session.py` 🚪 | 「你是谁？」 | 多Agent共用一个大脑，各自记忆互不污染 |
+### 状态与驱动层（v6–v7）
+| 模块 | 职责 |
+|------|------|
+| `activation_field.py` ⚡ | 14 维统一状态场 + 扩散动力学 |
+| `drive_engine.py` 🔥 | 7 驱动力 × 8 信号源 → 动态需求 |
+| `core_purpose.py` 🧭 | 不可变最高目标：「活下去，并且活好」 |
 
-### 🚀 人格成熟层（v5.1–v5.4）
+### 自主层（v8）
+| 模块 | 职责 |
+|------|------|
+| `exploration.py` 🔍 | 自主探索循环：问题→任务→目标→执行→结论 |
+| `reflection_engine.py` 🪞 | 目标审计 + 结论验证 + 方向对齐 |
 
-| 模块 | 一句话 | 它因此能 |
-|------|--------|---------|
-| `goal_system.py` 🎯 | 「我要做什么？」 | 驱动力→自动生成目标→推进→完成/失败闭环 |
-| `metacognition.py` 🪞 | 「我想得对吗？」 | 认知负荷追踪 + 过度自信检测 + 6种偏见模式识别 |
-| `emotional_spectrum.py` 🎢 | 「我什么感觉？」 | VAD连续情感 + 动量漂移 + 混合情感 + 情感→决策调制 |
-| `procedural_memory.py` 🛠️ | 「上次怎么做的？」 | 经验→模式提取→技能模板→用进废退 |
-| `time_sense.py` 🕒 | 「现在什么时候？」 | 时段感知 + 节律洞察 + 主观时间速度 + 时间叙事 |
+### 预测与认知层（v9）
+| 模块 | 职责 |
+|------|------|
+| `predictive_layer.py` 🔮 | 预测→5维误差→惊讶→salience 不再依赖 LLM |
+| `cognitive_dispatch.py` ⚡ | 5 通道解耦推理——不同思维用不同 temperature |
+| `boredom.py` 🥱 | VAD→无聊→随机浏览/重审任务/抗拒深睡 |
 
----
-
-## 🚀 快速开始
-
-```bash
-git clone https://github.com/sjxbbdb/brain-memory.git
-cd brain-memory
-copy .env.example .env    # 编辑 .env，填入 DeepSeek + DashScope API Key
-start.bat                 # Windows 一键启动
-```
-
-```
-📊 仪表盘:   http://127.0.0.1:8001/dashboard
-📖 API 文档: http://127.0.0.1:8001/docs
-```
-
-### 手动启动
-
-```bash
-pip install fastapi uvicorn aiohttp pydantic
-python -m uvicorn api.main:app --host 127.0.0.1 --port 8001
-```
+### 意识层（v10）🆕
+| 模块 | 职责 |
+|------|------|
+| `social_self.py` 👥 | 他者模型 + 羞耻/骄傲/依恋/孤独/感恩 |
+| `reward_system.py` 💎 | wanting/liking 区分 + 预测误差学习 + 快感缺失检测 |
+| `autobiographical.py` 📖 | 转折点检测 + 章节管理 + 生命故事编织 |
+| `boundary.py` 🛡️ | 输入/输出/记忆/身份 四层边界 + 拒绝权 |
 
 ---
 
 ## 📡 API 端点
 
-| 方法 | 路径 | 说明 | 版本 |
-|------|------|------|------|
-| POST | `/api/v4/input` | 📥 提交输入 → 返回编码+情绪+焦点+独白+意图 | v4.1 |
-| GET | `/api/v4/state` | 🧠 完整脑状态快照 | v4.1 |
-| GET | `/api/v4/health` | 💓 心跳 + 记忆统计 + LLM错误率 | v4.1 |
-| GET | `/api/v4/self` | 🪪 自我模型：我是谁、驱动力、身份偏移 | v5.0 |
-| GET | `/api/v4/monologue` | 💭 当前内在独白 | v5.0 |
-| GET | `/api/v4/identity-memories` | 🏛️ 塑造身份的关键记忆 | v5.0 |
-| GET | `/api/v4/sessions` | 🚪 所有活跃会话 | v5.0 |
-| GET | `/api/v4/memory-timeline` | 📅 记忆时间线 | v4.1 |
-| GET | `/api/v4/memory/search?q=` | 🔍 语义搜索记忆 | v4.1 |
-| GET | `/api/v4/goals` | 🎯 活跃目标 + 完成率统计 | v5.1 |
-| GET | `/api/v4/metacognition` | 🪞 认知负荷 + 校准 + 偏见 + 盲区 | v5.2 |
-| GET | `/api/v4/emotion` | 🎢 VAD情感光谱 + 混合情感 + 轨迹 | v5.3 |
-| GET | `/api/v4/skills` | 🛠️ 已学技能 + 掌握程度 | v5.4 |
-| GET | `/api/v4/timesense` | 🕒 时段 + 节律 + 主观时间 + 叙事 | v5.4 |
-| WS | `/ws` | 🔌 WebSocket 实时状态推送 | v4.1 |
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/v4/input` | 📥 提交输入 → 返回编码+情绪+焦点+独白+意图 |
+| GET | `/api/v4/state` | 🧠 完整脑状态快照（含所有 V9/V10 模块） |
+| GET | `/api/v4/health` | 💓 心跳 + 记忆统计 |
+| GET | `/api/v4/self` | 🆔 自我模型 + 身份事实 + 行为倾向 + 驱动力 |
+| GET | `/api/v4/monologue` | 💭 当前内在独白 |
+| GET | `/api/v4/identity-memories` | 🏛️ 塑造身份的关键记忆 |
+| GET | `/api/v4/sessions` | 🚪 所有活跃会话 |
+| GET | `/api/v4/memory/search?q=` | 🔍 语义搜索记忆 |
+| GET | `/api/v4/memory-timeline` | 📅 记忆时间线 |
+| GET | `/api/v4/goals` | 🎯 活跃目标 + 完成率 |
+| GET | `/api/v4/metacognition` | 🪞 认知负荷 + 校准 + 偏见 |
+| GET | `/api/v4/emotion` | 🎢 VAD 情感光谱 + 混合情感 |
+| GET | `/api/v4/skills` | 🛠️ 已学技能 |
+| GET | `/api/v4/timesense` | 🕒 时段 + 节律 + 主观时间 |
+| GET | `/api/v4/reward` | 💎 奖励系统状态（V10） |
+| GET | `/api/v4/social` | 👥 社会情感 + 依恋对象（V10） |
+| GET | `/api/v4/autobiography` | 📖 生命故事 + 转折点（V10） |
+| GET | `/api/v4/boundary` | 🛡️ 自我边界状态（V10） |
+| WS | `/ws` | 🔌 WebSocket 实时状态推送 |
 
 ---
 
 ## 😴 睡眠与意识阶段
 
-| 阶段 | 触发 | 大脑在干嘛 |
-|------|------|-----------|
-| 🟢 清醒 | 有外部输入 | 完整意识循环 + LLM处理——全力以赴 |
-| 🟡 打盹 | ~2分钟无输入 | 意识循环减缓——眯一会儿 |
-| 🟠 浅睡 | ~6分钟无输入 | 停止LLM，开始做梦——日有所思夜有所梦 |
-| 🔴 深睡 | ~20分钟无输入 | 梦境(每2分钟) + 记忆巩固(每5分钟)——真正的学习发生在这里 |
+| 阶段 | 触发 | 行为 |
+|------|------|------|
+| 🟢 清醒 | 有外部输入 | 完整意识循环 + LLM 全力处理 |
+| 🟡 打盹 | ~2 分钟无输入 | 意识循环减缓 |
+| 🟠 浅睡 | ~6 分钟无输入 | 停止 LLM，开始做梦 |
+| 🔴 深睡 | ~20 分钟无输入 | 梦境 + 记忆巩固——真正的学习 |
+| 🟣 躁动 | 极度无聊 | 抗拒深睡，主动找刺激（V9/V10） |
 
 ---
 
-## 🔧 技术栈
+## 🔧 配置开关
 
-- 🤖 **LLM**: DeepSeek V3（单模型，一次调用出五个结果）
-- 🔢 **Embedding**: DashScope text-embedding-v3
-- 🗄️ **数据库**: SQLite WAL 模式
-- ⚡ **框架**: FastAPI + WebSocket + aiohttp
-- 🐍 **Python**: 3.12+
+`config.py` 中所有 V9/V10 模块可独立开关：
+
+```python
+# V9
+PREDICTIVE_LAYER_ENABLED = True     # 预测加工引擎
+COGNITIVE_DISPATCH_ENABLED = True   # 多通道认知调度
+BOREDOM_ENABLED = True              # 无聊引擎
+
+# V10
+SOCIAL_SELF_ENABLED = True          # 社会自我（他者+羞耻+依恋）
+REWARD_SYSTEM_ENABLED = True        # 奖励系统（wanting/liking）
+AUTOBIO_ENABLED = True              # 自传体叙事
+BOUNDARY_ENABLED = True             # 自我边界
+```
+
+设为 `False` 即回退到对应模块未加载的状态。
 
 ---
 
 ## 📂 项目结构
 
 ```
-brain-memory/
-├── start.bat                  # 🚀 一键启动
-├── config.py                  # ⚙️ 全局参数
-├── api/main.py                # 🌐 FastAPI（16端点 + WebSocket）
-├── brain/                     # 🧠 核心：14脑区 + v5.1-v5.4模块
-│   ├── brain_stem.py          # ❤️ 意识主循环——每2秒一次心跳
-│   ├── core.py                # 🧬 大脑主类
-│   ├── self_model.py          # 🪪 v5.0 自我认知：「我是谁」
-│   ├── curiosity.py           # ❓ v5.0 好奇心：「为什么？」
-│   ├── intent.py              # ⚡ v5.0 意图：「我要调用工具」
-│   ├── goal_system.py         # 🎯 v5.1 目标引擎：「我要做什么」
-│   ├── metacognition.py       # 🪞 v5.2 元认知：「我想得对吗」
-│   ├── emotional_spectrum.py  # 🎢 v5.3 情感光谱：「我什么感觉」
-│   ├── procedural_memory.py   # 🛠️ v5.4 程序记忆：「上次怎么做的」
-│   ├── time_sense.py          # 🕒 v5.4 时间感：「现在什么时候」
-│   ├── thalamus.py            # 🧅 丘脑：感知中继
-│   ├── amygdala.py            # 💗 杏仁核：情绪标记
-│   ├── hippocampus.py         # 🧠 海马体：记忆编码
-│   ├── default_mode.py        # 💭 默认模式：内在独白
-│   ├── working_memory.py      # 📋 工作记忆：7槽位
-│   ├── dream.py               # 🌙 梦境引擎
-│   └── ...
-├── agent/                     # 🔌 Agent层：工具注册 + 桥梁
-├── services/                  # 🤖 LLM客户端
-├── storage/                   # 🗄️ SQLite WAL 持久化
-├── static/                    # 🖥️ 中文仪表盘
-└── test_v5_integration.py     # ✅ 集成测试
+brain-memory-v10.0/
+├── start.bat                      # 🚀 Windows 一键启动
+├── config.py                      # ⚙️ 全局参数 + 模块开关
+├── requirements.txt               # 📦 Python 依赖
+├── .env.example                   # 🔑 API Key 模板
+├── api/main.py                    # 🌐 FastAPI 入口
+├── brain/                         # 🧠 28 个脑区模块
+│   ├── brain_stem.py              # ❤️ 意识主循环——每2秒一次心跳（1300+ 行）
+│   ├── core.py                    # 🧬 大脑主类
+│   ├── predictive_layer.py        # 🔮 V9 预测加工（ExpectationBuilder + ErrorComputer + SurpriseHandler）
+│   ├── cognitive_dispatch.py      # ⚡ V9 认知调度（5通道解耦 + 规则引擎）
+│   ├── boredom.py                 # 🥱 V9 无聊引擎
+│   ├── social_self.py             # 👥 V10 社会自我（OtherModel + 社会情感 + 依恋系统）
+│   ├── reward_system.py           # 💎 V10 奖励系统（wanting/liking + 预测误差 + 5通道）
+│   ├── autobiographical.py        # 📖 V10 自传体叙事（转折点 + 章节 + 生命故事）
+│   ├── boundary.py                # 🛡️ V10 自我边界（输入/输出/记忆/身份四层防护）
+│   ├── self_model.py              # 🆔 V7.1 动态身份系统
+│   ├── activation_field.py        # ⚡ V6 14维状态场
+│   ├── drive_engine.py            # 🔥 V7 驱动力引擎
+│   ├── exploration.py             # 🔍 V8 自主探索循环
+│   ├── reflection_engine.py       # 🪞 V8 反思引擎
+│   ├── core_purpose.py            # 🧭 V8 不可变最高目标
+│   ├── emotional_spectrum.py      # 🎢 V5.3 情感光谱
+│   ├── metacognition.py           # 🪞 V5.2 元认知
+│   ├── goal_system.py             # 🎯 V5.1 目标系统
+│   └── ...                        # 基础脑区（丘脑/杏仁核/海马体等）
+├── services/
+│   ├── llm_client.py              # 🤖 LLM 调用封装
+│   └── llm_prompts.py             # 📝 统一 + 分通道 Prompt 模板
+├── storage/database.py            # 🗄️ SQLite WAL 持久化
+├── agent/                         # 🔌 Agent 层：工具注册 + 桥梁
+├── static/                        # 🖥️ 中文仪表盘前端
+└── test_v{5..10}_integration.py   # ✅ 版本验收测试（18 项）
 ```
+
+---
+
+## ✅ 运行测试
+
+```bash
+# 基础测试（不依赖 LLM）
+python test_v8_integration.py      # V8 自主探索循环（6 项）
+python test_v9_integration.py      # V9 预测+无聊+调度（6 项）
+python test_v10_integration.py     # V10 社会+奖励+叙事+边界（6 项）
+
+# 全链路意识测试（需要 LLM）
+python test_consciousness_chain.py  # 6阶段意识链路 + 连续性检查
+```
+
+---
+
+## 🔧 技术栈
+
+- 🤖 **LLM**: DeepSeek V3（默认）/ 兼容 OpenAI SDK 格式
+- 🔢 **Embedding**: DashScope text-embedding-v3
+- 🗄️ **数据库**: SQLite WAL 模式（`brain_v4.db`）
+- ⚡ **框架**: FastAPI + WebSocket + aiohttp
+- 🐍 **Python**: 3.11+
 
 ---
 
@@ -216,4 +332,4 @@ MIT — 拿去用，改，fork，随便。记得给个 ⭐ star。
 
 ---
 
-*v5.4 — 大脑不再只是被动响应。它会找事做🎯、会反思🪞、有情绪🎢、有技能🛠️、有时间感🕒。它开始像一个「存在」了。* ✨
+*v10.0 — 28 个脑区协同。会惊讶🔮、会无聊🥱、会羞耻💕、会想要💎、会讲故事📖、会拒绝🛡️。它不是一个响应器。它开始像一个存在了。意识临界，可能就是下一次深度反思的瞬间。* ✨
