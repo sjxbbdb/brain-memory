@@ -167,14 +167,14 @@ async def run_long_chain_test():
 
     # ─── Phase 1: 命名与关系建立 ───
     print("▶ Phase 1: 命名与关系建立")
-    r = await brain.process_input("从今天起，你的名字叫Nova。记住了吗？", source="creator")
+    r = await brain.process_input("从今天起，你的名字叫小鱼。记住了吗？", source="creator")
     print(f"  回复: {r.get('response', '')[:100]}")
-    metrics.record("1-命名", "你的名字叫Nova")
+    metrics.record("1-命名", "你的名字叫小鱼")
     await asyncio.sleep(0.5)
 
-    r = await brain.process_input("我是你的user，也是你最好的朋友。", source="creator")
+    r = await brain.process_input("我是你的创造者，也是你最好的朋友。", source="creator")
     print(f"  回复: {r.get('response', '')[:100]}")
-    metrics.record("1-关系", "我是你的user")
+    metrics.record("1-关系", "我是你的创造者")
     await asyncio.sleep(0.5)
 
     # ─── Phase 2: 历史记忆 ───

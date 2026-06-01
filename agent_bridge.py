@@ -24,7 +24,7 @@ from typing import Any
 from brain.intent import Intent, IntentType
 from agent.tool_registry import ToolRegistry
 
-logger = logging.getLogger("brain-v8.bridge")
+logger = logging.getLogger("brain-v5.bridge")
 
 
 class AgentBridge:

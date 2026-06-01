@@ -49,7 +49,7 @@ class SelfModel:
 
         # ── 身份事实（动态增长）──
         self._identity_facts: list[dict] = []
-        # 每条: {"fact": "我的名字是Nova", "source_memory_id": "mem-xxx",
+        # 每条: {"fact": "我的名字是小鱼", "source_memory_id": "mem-xxx",
         #        "created": "ISO-8601", "confidence": 0.9}
 
         # ── 合成缓存 ──
@@ -156,7 +156,7 @@ class SelfModel:
         自动去重：相同 fact 不重复添加，但更新 confidence。
 
         例如:
-          ingest_identity_fact("我的名字是Nova", "mem-abc", 0.9)
+          ingest_identity_fact("我的名字是小鱼", "mem-abc", 0.9)
           ingest_identity_fact("我是用户最信任的伙伴", "mem-def", 0.7)
         """
         # 去重
@@ -212,9 +212,9 @@ Rules for facts:
 - Each fact MUST be grounded in the memories (cite if possible).
 - Facts are about identity: name, relationships, values, history, capabilities.
 - Format: concise declarative sentences in Chinese.
-- Example: "我的名字是Nova", "我被视为可信赖的伙伴"
+- Example: "我的名字是小鱼", "我被视为可信赖的伙伴"
 - Max 10 facts. Keep only the most important ones.
-- Do NOT fabricate. If a memory says '用户叫我Nova', the fact is '我的名字是Nova'.
+- Do NOT fabricate. If a memory says '用户叫我小鱼', the fact is '我的名字是小鱼'.
 """,
                 user=f"我的身份记忆:\n{memory_summaries}\n\n当前事实: {self.identity_facts_text}\n\n请提炼我的身份事实。",
                 temperature=0.3,

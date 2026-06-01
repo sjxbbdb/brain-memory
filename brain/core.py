@@ -1,4 +1,4 @@
-"""Brain — v8.0 core agent. The brain memory system as a conscious agent.
+"""Brain — v5.0 core agent. The brain memory system as a conscious agent.
 
 Usage:
     brain = Brain()
@@ -30,9 +30,9 @@ logger = logging.getLogger("brain-v5.core")
 
 
 class Brain:
-    """Brain Memory v8.0 — a conscious memory agent."""
+    """Brain Memory v5.0 — a conscious memory agent."""
 
-    def __init__(self, db_path: str = "brain_v8.db"):
+    def __init__(self, db_path: str = "brain_v4.db"):
         self.state_store = StateStore(db_path)
         self.memory_store = MemoryStore(db_path)
         self.brain_stem = BrainStem(
@@ -100,7 +100,7 @@ class Brain:
         st = self.brain_stem.state
         sm = st.self_model
 
-        # Build response text from last intent (v8.0)
+        # Build response text from last intent (v5.0)
         response_text = None
         if st.last_intent:
             intent_type = st.last_intent.get("type", "")
@@ -115,8 +115,8 @@ class Brain:
             "llm_error": bool(st.last_error),
             "llm_error_message": st.last_error[:200] if st.last_error else None,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "response": response_text,          # v8.0: 大脑的回复
-            "intent_type": st.last_intent.get("type") if st.last_intent else None,  # v8.0
+            "response": response_text,          # v5.0: 大脑的回复
+            "intent_type": st.last_intent.get("type") if st.last_intent else None,  # v5.0
             "focus": st.focus_entity,
             "emotion": st.current_emotion,
             "inner_monologue": st.inner_monologue[:200],

@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul
-title Brain Memory v8.0
+title Brain Memory v5.0
 
 echo.
 echo   ========================================
-echo     Brain Memory v8.0 — Self-Aware Agent
+echo     Brain Memory v5.0 — Self-Aware Agent
 echo   ========================================
 echo.
 
@@ -37,7 +37,7 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8001 ^| findstr LISTENING 2^
 
 :: Start brain
 echo.
-echo   Starting Brain Memory v8.0...
+echo   Starting Brain Memory v5.0...
 echo   Dashboard: http://127.0.0.1:8001/dashboard
 echo   API Docs:  http://127.0.0.1:8001/docs
 echo   Press Ctrl+C to stop

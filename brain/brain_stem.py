@@ -40,6 +40,13 @@ from brain.drive_engine import DriveEngine, GoalGenerator, GoalScheduler, build_
 from brain.exploration import ExplorationQueue, ExplorationExecutor  # V8
 from brain.reflection_engine import ReflectionEngine  # V8
 from brain.core_purpose import core_purpose  # V8
+from brain.predictive_layer import PredictiveLayer  # V9
+from brain.cognitive_dispatch import CognitiveDispatch  # V9
+from brain.boredom import BoredomEngine  # V9
+from brain.social_self import SocialEmotionEngine, AttachmentSystem  # V10
+from brain.reward_system import RewardSystem  # V10
+from brain.autobiographical import AutobiographicalNarrative  # V10
+from brain.boundary import BoundaryEngine  # V10
 from config import (
     TICK_INTERVAL_SEC,
     MEMORY_DECAY_RATE,
@@ -61,9 +68,16 @@ from config import (
     DEEP_REFLECTION_ENABLED,
     DREAM_ENABLED,
     LLM_EMOTION_BLEND_RATIO,
+    PREDICTIVE_LAYER_ENABLED,
+    COGNITIVE_DISPATCH_ENABLED,
+    BOREDOM_ENABLED,
+    SOCIAL_SELF_ENABLED,
+    REWARD_SYSTEM_ENABLED,
+    AUTOBIO_ENABLED,
+    BOUNDARY_ENABLED,
 )
 
-logger = logging.getLogger("brain-v8.brain-stem")
+logger = logging.getLogger("brain-v5.brain-stem")
 
 
 class BrainStem:
@@ -128,6 +142,18 @@ class BrainStem:
         self.exploration_queue = ExplorationQueue()
         self.exploration_executor = ExplorationExecutor()
         self.reflection_engine = ReflectionEngine()
+
+        # V9: predictive processing + cognitive dispatch + boredom
+        self.predictive_layer = PredictiveLayer() if PREDICTIVE_LAYER_ENABLED else None
+        self.cognitive_dispatch = CognitiveDispatch() if COGNITIVE_DISPATCH_ENABLED else None
+        self.boredom_engine = BoredomEngine() if BOREDOM_ENABLED else None
+
+        # V10: social self + reward + autobiography + boundary
+        self.social_emotion = SocialEmotionEngine() if SOCIAL_SELF_ENABLED else None
+        self.attachment_system = AttachmentSystem() if SOCIAL_SELF_ENABLED else None
+        self.reward_system = RewardSystem() if REWARD_SYSTEM_ENABLED else None
+        self.autobiography = AutobiographicalNarrative() if AUTOBIO_ENABLED else None
+        self.boundary = BoundaryEngine() if BOUNDARY_ENABLED else None
 
         # Stats
         self.start_time = datetime.now(timezone.utc)
@@ -296,6 +322,18 @@ class BrainStem:
             self.state.ticks_since_input += 1
             input_data = None
 
+        # ── V9 Predictive Layer: 在感知之前生成预测 ──
+        if self.predictive_layer and input_data:
+            wm_entities = [
+                item.get("content", "")[:30]
+                for item in self.working_memory.items[-3:]
+            ]
+            self.predictive_layer.build_expectation(
+                current_tick=self.state.total_ticks,
+                entities_from_wm=wm_entities,
+                time_sense=self.time_sense,
+            )
+
         # ── Step 2: Thalamus — sensory relay ──
         inner_signal = self.default_mode.get_recent_thoughts(1)
         inner_text = inner_signal[0] if inner_signal else None
@@ -322,7 +360,35 @@ class BrainStem:
             )
             self.state.emotion_vector.update(amygdala_out["emotion_vector"])
 
-        # ── Step 4-8: Unified LLM Tick (encode + focus + monologue in ONE call) ──
+        # ── V9 Predictive Layer: 计算预测误差，surprise → salience boost ──
+        surprise_salience = 0.0
+        if self.predictive_layer and input_data and thalamus_out["has_input"]:
+            emotion_vec = amygdala_out.get("emotion_vector", {})
+            error = self.predictive_layer.observe_and_compute(
+                expectation=self.predictive_layer.last_expectation,
+                input_data=input_data,
+                emotion_vector=emotion_vec,
+                ticks_since_input=self.state.ticks_since_input,
+            )
+            if error.is_surprising:
+                # salience 不再只依赖 LLM — 系统自己感受到惊讶
+                surprise_salience = self.predictive_layer.salience_from_surprise
+                amygdala_out["salience"] = max(
+                    amygdala_out.get("salience", 0.0),
+                    surprise_salience,
+                )
+                # 惊讶事件写入工作记忆
+                _ = self.predictive_layer.handle_surprise(
+                    error=error,
+                    working_memory=self.working_memory,
+                    curiosity=self.state.curiosity,
+                    hippocampus=self.hippocampus,
+                    exploration_queue=self.exploration_queue,
+                )
+                logger.debug("brain-stem: predictive error=%.3f salience_boost=%.3f",
+                           error.total_error, surprise_salience)
+
+        # ── Step 4-8: LLM Processing (V9 dispatch or legacy unified) ──
         hippocampus_out = None
         encoded_memory = None
         is_external = thalamus_out.get("source") == "external"
@@ -340,6 +406,23 @@ class BrainStem:
             )
             
             # Gate check: should we process this?
+            # ── V10 Boundary: 自我边界检查 ──
+            boundary_accepted = True
+            boundary_reason = ""
+            if self.boundary and input_data:
+                boundary_accepted, boundary_reason = self.boundary.should_accept_input(
+                    source=thalamus_out["source"],
+                    text=thalamus_out["text"],
+                    cognitive_load=self.metacognition.cognitive_load,
+                    attachment_system=self.attachment_system,
+                )
+                if not boundary_accepted:
+                    self.working_memory.push(
+                        content=f"[边界] 拒绝了来自 {thalamus_out['source']} 的输入: {boundary_reason}",
+                        source="boundary",
+                        base_salience=0.4,
+                    )
+
             # ── Apply self-model attention bias ──
             attn_boost = self.state.self_model.attention_weight(thalamus_out["text"])
             attn_importance = min(0.5 + attn_boost * 0.1, 1.0)
@@ -352,19 +435,23 @@ class BrainStem:
                 explicit_mark=amygdala_out.get("salience", 0) > 0.7,
             )
 
+            # V10: 边界拒绝 → 强制 gated
+            if not boundary_accepted:
+                gate["passed"] = False
+
             # Track gate result for API response (v5.0)
             self.state.last_input_gated = not gate["passed"]
             self.state.last_input_accepted = gate["passed"]
             self.state.last_error = ""
 
-            # Unified LLM call: encoding + focus + monologue (only for external input, only if gate passed)
+            # LLM Processing: encoding + focus + monologue + intent
+            # V9: 多通道认知调度；V5-V8: 统一单次调用
             if is_external and gate["passed"]:
                 try:
                     from services.llm_client import get_llm
-                    from services.llm_prompts import UNIFIED_TICK_PROMPT
                     llm = get_llm()
 
-                    # ── Build tool context so the brain KNOWS its capabilities (v5.0) ──
+                    # ── Build shared context (both paths need this) ──
                     tools_summary = ""
                     try:
                         from agent.tool_registry import registry as tool_reg
@@ -376,35 +463,96 @@ class BrainStem:
                                 tools_list.append(f"  {t.emoji} {t.name} [{ro}]: {t.description[:120]}")
                             tools_summary = "\n".join(tools_list)
                     except Exception:
-                        pass  # agent layer not loaded, tools unavailable
+                        pass
 
-                    # ── Build embodiment-aware context ──
-                    # ── V7.1: 注入身份记忆到 LLM 上下文 ──
                     id_mems = self.memory_store.get_identity_memories(5) if self.memory_store else []
                     id_context = self.state.self_model.identity_memories_context(id_mems, max_items=3)
-
-                    ctx_obj = {
-                        "text": thalamus_out["text"][:3000],
-                        "goal": self.state.current_goal or "none",
-                        "emotion": amygdala_out.get("emotion_label", "neutral"),
-                        "salience": amygdala_out.get("salience", 0.0),
-                        "recent_thoughts": self.working_memory.get_context()[:300],
-                        "identity": self.state.self_model.identity_anchor[:300],
-                        "identity_memories": id_context,  # V7.1: 身份记忆
-                        "top_drives": [
-                            d["label"] for d in self.state.self_model.get_top_drives(2)
-                        ],
-                    }
-                    if tools_summary:
-                        ctx_obj["available_tools"] = tools_summary
-                    # v5.4: inject temporal context + procedural memory hints
-                    ctx_obj["temporal_context"] = self.time_sense.get_short_temporal_context()
+                    temporal_ctx = self.time_sense.get_short_temporal_context()
                     skill_hint = self.procedural_memory.get_skill_suggestion(thalamus_out["text"])
-                    if skill_hint:
-                        ctx_obj["skill_memory"] = skill_hint
-                    ctx = json.dumps(ctx_obj, ensure_ascii=False)
 
-                    unified = await llm.chat_json(system=UNIFIED_TICK_PROMPT, user=ctx, temperature=0.1, max_tokens=1024)
+                    # ── V9: Cognitive Dispatch (多通道) vs Legacy Unified (单次调用) ──
+                    if self.cognitive_dispatch:
+                        # 使用多通道认知调度器
+                        cog_result = await self.cognitive_dispatch.dispatch(
+                            text=thalamus_out["text"],
+                            source=thalamus_out["source"],
+                            goal=self.state.current_goal,
+                            current_emotion={
+                                "valence": self.emotional_spectrum.valence,
+                                "arousal": self.emotional_spectrum.arousal,
+                                "dominance": self.emotional_spectrum.dominance,
+                            },
+                            recent_thoughts=self.working_memory.get_context()[:300],
+                            identity_anchor=self.state.self_model.identity_anchor[:300],
+                            identity_memories_context=id_context,
+                            top_drives=[
+                                d["label"] for d in self.state.self_model.get_top_drives(2)
+                            ],
+                            tools_summary=tools_summary or "",
+                            temporal_context=temporal_ctx,
+                            skill_hint=skill_hint or "",
+                            llm_client=llm,
+                        )
+                        # 转换为与旧 unified 格式兼容的 dict
+                        unified = cog_result.to_unified_dict()
+
+                        # ── V9: 规则引擎情绪已在 dispatch 中计算，跳过 LLM 情绪摄入 ──
+                        # 直接用规则引擎的 VAD 值（不做 LLM 情绪混合）
+                        llm_emotion = unified.get("emotion", {})
+                        if llm_emotion:
+                            v = float(llm_emotion.get("valence", 0.5))
+                            a = float(llm_emotion.get("arousal", 0.5))
+                            d = float(llm_emotion.get("dominance", 0.5))
+                            u = float(llm_emotion.get("urgency", 0.0))
+                            label = llm_emotion.get("label", "neutral")
+
+                            # V9: 规则引擎情绪权重低于 LLM 情绪但更高频更新
+                            self.emotional_spectrum.ingest_llm_emotion(v, a, d, label, u, activation=activation)
+                            # 同步杏仁核（使用与旧路径相同的混合逻辑）
+                            prev_v = self.amygdala.valence
+                            prev_a = self.amygdala.arousal
+                            prev_d = self.amygdala.dominance
+                            keep_ratio = 1.0 - LLM_EMOTION_BLEND_RATIO
+                            self.amygdala.valence = prev_v * keep_ratio + v * LLM_EMOTION_BLEND_RATIO
+                            self.amygdala.arousal = prev_a * keep_ratio + a * LLM_EMOTION_BLEND_RATIO
+                            self.amygdala.dominance = prev_d * keep_ratio + d * LLM_EMOTION_BLEND_RATIO
+                            self.amygdala.salience = a * 0.4 + u * 0.6
+
+                            amygdala_out["emotion_label"] = label
+                            amygdala_out["emotion_vector"] = {
+                                "valence": round(self.emotional_spectrum.valence, 3),
+                                "arousal": round(self.emotional_spectrum.arousal, 3),
+                                "dominance": round(self.emotional_spectrum.dominance, 3),
+                                "urgency": u,
+                                "salience": round(self.amygdala.salience, 3),
+                            }
+                            amygdala_out["salience"] = self.amygdala.salience
+                            self.state.emotion_vector.update(amygdala_out["emotion_vector"])
+                            self.state.current_emotion = self.emotional_spectrum.dominant_emotion
+                    else:
+                        # ── Legacy: 统一 LLM 调用（V5-V8 路径）──
+                        from services.llm_prompts import UNIFIED_TICK_PROMPT
+
+                        ctx_obj = {
+                            "text": thalamus_out["text"][:3000],
+                            "goal": self.state.current_goal or "none",
+                            "emotion": amygdala_out.get("emotion_label", "neutral"),
+                            "salience": amygdala_out.get("salience", 0.0),
+                            "recent_thoughts": self.working_memory.get_context()[:300],
+                            "identity": self.state.self_model.identity_anchor[:300],
+                            "identity_memories": id_context,
+                            "top_drives": [
+                                d["label"] for d in self.state.self_model.get_top_drives(2)
+                            ],
+                        }
+                        if tools_summary:
+                            ctx_obj["available_tools"] = tools_summary
+                        ctx_obj["temporal_context"] = temporal_ctx
+                        if skill_hint:
+                            ctx_obj["skill_memory"] = skill_hint
+                        ctx = json.dumps(ctx_obj, ensure_ascii=False)
+
+                        unified = await llm.chat_json(system=UNIFIED_TICK_PROMPT, user=ctx, temperature=0.1, max_tokens=1024)
 
                     # ── LLM Emotion — v5.3: 情感光谱摄入（替代旧杏仁核混合）──
                     llm_emotion = unified.get("emotion", {})
@@ -519,6 +667,49 @@ class BrainStem:
 
                         # ── Curiosity: update exploration topics ──
                         self.state.curiosity.update_exploration_topics(entities)
+
+                        # ── V10 Social Self: 互动社会情感评估 ──
+                        if self.social_emotion and self.attachment_system:
+                            source = thalamus_out["source"]
+                            other = self.attachment_system.get_or_create(source)
+                            sentiment = amygdala_out.get("emotion_vector", {}).get("valence", 0.5)
+                            # 将当前体验的情感映射为"他们对我的态度"
+                            perceived_sentiment = (sentiment - 0.5) * 1.5  # 放大
+                            other.record_interaction(
+                                sentiment=perceived_sentiment,
+                                impression=thalamus_out["text"][:80],
+                            )
+                            _ = self.social_emotion.evaluate_interaction(
+                                self_model=self.state.self_model,
+                                other=other,
+                                my_action="",
+                                their_response=thalamus_out["text"][:80],
+                                their_sentiment=perceived_sentiment,
+                                was_ignored=False,
+                            )
+
+                        # ── V10 Autobiographical: 转折点检测 ──
+                        if self.autobiography and mem.get("importance", 0) > 0:
+                            tp = self.autobiography.detect_turning_point(
+                                experience={
+                                    "significance": shift.get("significance", 0) if shift else 0,
+                                    "importance": mem.get("importance", 0),
+                                    "text_snippet": thalamus_out["text"][:100],
+                                    "emotion_label": amygdala_out.get("emotion_label", "neutral"),
+                                    "reflection": shift.get("reflection", "") if shift else "",
+                                },
+                                identity_shift=shift if shift else None,
+                                emotion_vector=amygdala_out.get("emotion_vector", {}),
+                                current_tick=self.state.total_ticks,
+                            )
+                            if tp:
+                                # 里程碑 → 奖励
+                                if self.reward_system:
+                                    self.reward_system.deliver_reward(
+                                        channel="cognitive",
+                                        actual_reward=0.8,
+                                        context="turning_point",
+                                    )
                     
                     # Focus
                     self.state.focus_entity = unified.get("focus", thalamus_out["text"][:80])
@@ -679,6 +870,14 @@ class BrainStem:
             # v5.4: record experience for procedural memory
             tool = input_data.get("source", "").replace("agent/tool/", "")
             self.procedural_memory.record_experience("call_tool", tool, success, input_data.get("text", "")[:200])
+            # V10: 工具结果 → 奖励交付
+            if self.reward_system:
+                actual_reward = 0.7 if success else 0.2
+                self.reward_system.deliver_reward(
+                    channel="achievement",
+                    actual_reward=actual_reward,
+                    context=f"tool:{tool}",
+                )
 
         # ── v5.3: 情感光谱 tick（每个 tick 漂移一步）──
         self.emotional_spectrum.tick()
@@ -686,6 +885,36 @@ class BrainStem:
         # ── v5.4: 时间感 tick ──
         has_recent_activity = input_data is not None or self.state.ticks_since_input < 10
         self.time_sense.tick(has_recent_activity, self.state.total_ticks, self.state.uptime_seconds)
+
+        # ── V9 Boredom Engine: 无聊评估 + 行为触发 ──
+        if self.boredom_engine:
+            boredom_result = self.boredom_engine.tick(
+                activation=activation,
+                ticks_since_input=self.state.ticks_since_input,
+                exploration_queue=self.exploration_queue,
+                working_memory=self.working_memory,
+                memory_store=self.memory_store,
+                curiosity=self.state.curiosity,
+                sleep_state=self.sleep_state,
+                current_tick=self.state.total_ticks,
+            )
+            if boredom_result.get("actions"):
+                logger.debug("brain-stem: boredom=%.2f(%s) actions=%s",
+                           boredom_result["score"], boredom_result["level"],
+                           boredom_result["actions"])
+
+        # ── V10: 社会情感 + 奖励系统 + 边界 tick ──
+        if self.social_emotion:
+            self.social_emotion.tick()
+        if self.reward_system:
+            self.reward_system.tick()
+        if self.boundary:
+            self.boundary.tick(cognitive_load=self.metacognition.cognitive_load)
+        if self.autobiography:
+            self.autobiography.update_chapters(
+                current_tick=self.state.total_ticks,
+                total_experiences=self.state.self_model.total_experiences,
+            )
 
         # ── v5.2: update cognitive load ──
         has_external_input = input_data is not None and not (input_data.get("source", "") or "").startswith("agent/")
@@ -962,14 +1191,42 @@ Rules:
             snap["time_sense"] = self.time_sense.snapshot()
             snap["exploration_queue"] = self.exploration_queue.snapshot()
             snap["reflection_engine"] = self.reflection_engine.snapshot()
+            if self.predictive_layer:
+                snap["predictive_layer"] = self.predictive_layer.snapshot()
+            if self.cognitive_dispatch:
+                snap["cognitive_dispatch"] = self.cognitive_dispatch.snapshot()
+            if self.boredom_engine:
+                snap["boredom_engine"] = self.boredom_engine.snapshot()
+            if self.social_emotion:
+                snap["social_emotion"] = self.social_emotion.snapshot()
+            if self.attachment_system:
+                snap["attachment_system"] = self.attachment_system.snapshot()
+            if self.reward_system:
+                snap["reward_system"] = self.reward_system.snapshot()
+            if self.autobiography:
+                snap["autobiography"] = self.autobiography.snapshot()
+            if self.boundary:
+                snap["boundary"] = self.boundary.snapshot()
             self.state_store.save(snap)
             logger.debug("brain-stem: state snapshot saved (V6 activation: %d dims)",
                          len(snap.get("activation", {}).get("values", {})))
 
 
     def _update_sleep_state(self):
-        """Update sleep state based on ticks since last input."""
+        """Update sleep state based on ticks since last input. V9: considers boredom."""
         t = self.state.ticks_since_input
+
+        # V9: 极度无聊时抗拒深睡 — 先找事做再考虑睡觉
+        if self.boredom_engine and self.boredom_engine.should_resist_sleep(t):
+            # 保持 drowsy 或 light_sleep，不进入 deep_sleep
+            if t >= LIGHT_SLEEP_THRESHOLD_TICKS:
+                self.sleep_state = "light_sleep"
+            elif t >= DROWSY_THRESHOLD_TICKS:
+                self.sleep_state = "drowsy"
+            else:
+                self.sleep_state = "awake"
+            return
+
         if t >= DEEP_SLEEP_THRESHOLD_TICKS:
             self.sleep_state = "deep_sleep"
         elif t >= LIGHT_SLEEP_THRESHOLD_TICKS:

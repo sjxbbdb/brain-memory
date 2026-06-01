@@ -53,13 +53,13 @@ async def lifespan(app: FastAPI):
     broadcaster = asyncio.create_task(_broadcast_loop())
 
     await _brain.wake_up()
-    logger.info("Brain v8.0 API started")
+    logger.info("Brain v5.0 API started")
 
     yield
 
     await _brain.sleep()
     broadcaster.cancel()
-    logger.info("Brain v8.0 API stopped")
+    logger.info("Brain v5.0 API stopped")
 
 
 async def _broadcast_loop():
@@ -73,7 +73,7 @@ async def _broadcast_loop():
 
 # ── App ──
 
-app = FastAPI(title="Brain Memory v8.0", version="8.0.0", lifespan=lifespan)
+app = FastAPI(title="Brain Memory v6.0", version="6.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
