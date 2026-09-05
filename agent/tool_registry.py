@@ -10,9 +10,12 @@
 
 import asyncio
 import importlib
+import importlib.util
 import ast
+import inspect
 import json
 import logging
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -143,10 +146,17 @@ class ToolRegistry:
         tool = self.get(name)
         if not tool:
             return json.dumps({"error": f"Unknown tool: {name}"}, ensure_ascii=False)
+        if not tool.is_enabled():
+            return json.dumps({"error": f"Tool is disabled: {name}"}, ensure_ascii=False)
+        if not isinstance(args, dict):
+            return json.dumps({"error": "tool arguments must be an object"}, ensure_ascii=False)
         try:
-            if asyncio.iscoroutinefunction(tool.call):
-                return await tool.call(args, context or {})
-            return tool.call(args, context or {})
+            result = tool.call(args, context or {})
+            if inspect.isawaitable(result):
+                result = await result
+            if not isinstance(result, str):
+                result = json.dumps(result, ensure_ascii=False, default=str)
+            return result[:max(1, int(tool.max_result_chars))]
         except Exception as e:
             logger.exception("Tool dispatch error: %s", name)
             return json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
@@ -179,6 +189,8 @@ def discover_tools(tools_dir: Path | None = None) -> List[str]:
     """自动扫描并导入 agent/tools/ 下的所有工具模块。"""
     if tools_dir is None:
         tools_dir = Path(__file__).resolve().parent / "tools"
+    tools_dir = Path(tools_dir).resolve()
+    default_tools_dir = (Path(__file__).resolve().parent / "tools").resolve()
     if not tools_dir.exists():
         return []
     imported = []
@@ -186,15 +198,26 @@ def discover_tools(tools_dir: Path | None = None) -> List[str]:
         if path.name.startswith("_") or path.name == "__init__.py":
             continue
         if _module_registers_tools(path):
-            mod_name = f"tools.{path.stem}"
+            mod_name = path.stem
             try:
-                # 把 tools_dir 的父目录加到 sys.path
-                import sys
-                parent = str(tools_dir.parent)
-                if parent not in sys.path:
-                    sys.path.insert(0, parent)
-                mod_name = path.stem
-                importlib.import_module(mod_name)
+                if tools_dir == default_tools_dir:
+                    # ``builtin_tools.py`` lives in the ``agent.tools``
+                    # package.  Importing only ``builtin_tools`` depended on
+                    # an accidental sys.path mutation and failed in a normal
+                    # checkout.
+                    importlib.import_module(f"agent.tools.{path.stem}")
+                else:
+                    # Support an operator-provided tools directory without
+                    # making its parent globally importable.  A namespaced
+                    # module key also avoids collisions between two custom
+                    # directories containing the same filename.
+                    custom_name = f"_brain_memory_tool_{abs(hash(str(path))) :x}_{path.stem}"
+                    spec = importlib.util.spec_from_file_location(custom_name, path)
+                    if spec is None or spec.loader is None:
+                        raise ImportError(f"cannot load spec for {path}")
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules[custom_name] = module
+                    spec.loader.exec_module(module)
                 imported.append(mod_name)
             except Exception as e:
                 logger.warning("Could not import tool module %s: %s", mod_name, e)

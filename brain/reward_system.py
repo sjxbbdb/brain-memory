@@ -62,6 +62,29 @@ class RewardEvent:
     def was_disappointing(self) -> bool:
         return self.prediction_error < -0.3
 
+    def to_dict(self) -> dict:
+        return {
+            "source": self.source,
+            "wanting_before": self.wanting_before,
+            "liking_after": self.liking_after,
+            "prediction_error": self.prediction_error,
+            "context": self.context,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "RewardEvent | None":
+        if not isinstance(data, dict):
+            return None
+        return cls(
+            source=str(data.get("source", "unknown")),
+            wanting_before=float(data.get("wanting_before", 0.5)),
+            liking_after=float(data.get("liking_after", 0.5)),
+            prediction_error=float(data.get("prediction_error", 0.0)),
+            context=str(data.get("context", "")),
+            timestamp=str(data.get("timestamp", "")),
+        )
+
 
 # ══════════════════════════════════════════════
 # 奖励系统
@@ -278,8 +301,38 @@ class RewardSystem:
                     "wanting": round(d["wanting"], 3),
                     "liking": round(d["liking"], 3),
                     "craving": round(d["craving"], 3),
+                    "satiety": round(d["satiety"], 3),
                 }
                 for ch, d in self.channels.items()
             },
             "total_rewards": self.total_rewards,
+            "recent_rewards": [event.to_dict() for event in self.recent_rewards],
         }
+
+    @classmethod
+    def from_snapshot(cls, data: dict | None) -> "RewardSystem":
+        system = cls()
+        if not isinstance(data, dict):
+            return system
+        for key in ("global_wanting", "global_liking", "anhedonia"):
+            if isinstance(data.get(key), (int, float)):
+                setattr(system, key, float(data[key]))
+        channels = data.get("channels", {})
+        if isinstance(channels, dict):
+            for name, raw in channels.items():
+                if not isinstance(raw, dict):
+                    continue
+                channel = system.channels.setdefault(
+                    str(name),
+                    {"wanting": 0.5, "liking": 0.5, "craving": 0.0, "satiety": 0.0},
+                )
+                for key, default in (("wanting", 0.5), ("liking", 0.5), ("craving", 0.0), ("satiety", 0.0)):
+                    channel[key] = float(raw.get(key, default))
+        system.total_rewards = int(data.get("total_rewards", 0))
+        events = data.get("recent_rewards", [])
+        if isinstance(events, list):
+            for raw in events:
+                event = RewardEvent.from_dict(raw)
+                if event:
+                    system.recent_rewards.append(event)
+        return system

@@ -18,6 +18,7 @@ Salience 公式:
 """
 
 import logging
+import math
 from typing import Any
 from config import WORKING_MEMORY_CAPACITY
 
@@ -129,7 +130,7 @@ class WorkingMemory:
     def get_context(self) -> str:
         """获取当前上下文——大脑'正在想什么'（只读，不触发 tick）。"""
         if not self.items:
-            return ""
+            return self.context_text
 
         recent = sorted(self.items, key=lambda x: x.get("salience", 0), reverse=True)[:3]
         return " | ".join(
@@ -160,3 +161,61 @@ class WorkingMemory:
     def clear(self):
         self.items.clear()
         self.context_text = ""
+
+    # ── 持久化 ──
+
+    def snapshot(self) -> dict:
+        """Return a lossless-enough snapshot for restart continuity.
+
+        ``get_state_snapshot`` is intentionally a short dashboard view.  It
+        cannot be used to restore working memory because it drops the scoring
+        weights and age.  Keep a separate full snapshot for the brain-state
+        journal.
+        """
+        return {
+            "items": [dict(item) for item in self.items],
+            "context_text": self.context_text,
+        }
+
+    @classmethod
+    def from_snapshot(cls, data: dict | None) -> "WorkingMemory":
+        """Restore working memory while tolerating older/partial snapshots."""
+        wm = cls()
+        if not isinstance(data, dict):
+            return wm
+
+        items = data.get("items", [])
+        if isinstance(items, list):
+            restored: list[dict] = []
+            def _number(value, default=0.0):
+                try:
+                    result = float(value)
+                    return result if math.isfinite(result) else default
+                except (TypeError, ValueError, OverflowError):
+                    return default
+
+            def _age(value):
+                try:
+                    return max(0, int(value))
+                except (TypeError, ValueError, OverflowError):
+                    return 0
+
+            for raw in items:
+                if not isinstance(raw, dict) or not raw.get("content"):
+                    continue
+                item = {
+                    "content": str(raw.get("content", ""))[:500],
+                    "source": str(raw.get("source", "unknown")),
+                    "base_salience": _number(raw.get("base_salience", 0.5), 0.5),
+                    "emotion_weight": _number(raw.get("emotion_weight", 0.3), 0.3),
+                    "goal_weight": _number(raw.get("goal_weight", 0.3), 0.3),
+                    "identity_weight": _number(raw.get("identity_weight", 0.2), 0.2),
+                    "novelty": _number(raw.get("novelty", 0.3), 0.3),
+                    "age_ticks": _age(raw.get("age_ticks", 0)),
+                    "salience": _number(raw.get("salience", raw.get("base_salience", 0.5)), 0.5),
+                }
+                restored.append(item)
+            restored.sort(key=lambda x: x.get("salience", 0), reverse=True)
+            wm.items = restored[:WORKING_MEMORY_CAPACITY]
+        wm.context_text = str(data.get("context_text", ""))[:2000]
+        return wm

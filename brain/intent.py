@@ -52,7 +52,7 @@ class Intent:
     question: str | None = None
     # 元数据
     confidence: float = 0.5  # 大脑对这条意图的置信度
-    reason: str = ""          # 为什么产���这条意图（来自 LLM 的 reasoning）
+    reason: str = ""          # 为什么产生这条意图（来自 LLM 的 reasoning）
     timestamp: str = ""
     source_input: str = ""    # 触发这条意图的原始输入
 
@@ -133,13 +133,38 @@ class IntentQueue:
 
     def __init__(self, maxsize: int = 100):
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
+        self._bound_loop = None
         self.total_produced: int = 0
         self.total_consumed: int = 0
 
+    def _assert_current_loop(self) -> None:
+        """Require queue access from the loop that owns the queue.
+
+        ``asyncio.Queue`` is deliberately not thread-safe.  Letting a bridge
+        consume it from a second loop can appear to work while no waiter is
+        attached, then fail much later when ``get`` blocks.  An explicit
+        check turns that latent corruption into an actionable lifecycle
+        error.  ``rebind_loop`` is the only supported way to move an idle
+        queue between sequential event loops.
+        """
+        current = asyncio.get_running_loop()
+        bound = self._bound_loop
+        if bound is None:
+            self._bound_loop = current
+        elif bound is not current:
+            raise RuntimeError(
+                "intent queue belongs to a different event loop; "
+                "start BrainStem and AgentBridge on the same loop"
+            )
+
     async def put(self, intent: Intent) -> None:
         """大脑产出一条意图。"""
+        self._assert_current_loop()
         try:
-            await self._queue.put(intent)
+            # Intent production is part of the heartbeat.  Waiting for an
+            # absent/slow consumer here can freeze the whole brain, so use a
+            # bounded non-blocking write and explicitly drop on saturation.
+            self._queue.put_nowait(intent)
             self.total_produced += 1
             logger.debug("intent: produced %s (total=%d)", intent.type.value, self.total_produced)
         except asyncio.QueueFull:
@@ -147,6 +172,7 @@ class IntentQueue:
 
     async def get(self, timeout: float = 1.0) -> Intent | None:
         """Agent 层读取一条意图（非阻塞）。"""
+        self._assert_current_loop()
         try:
             intent = await asyncio.wait_for(self._queue.get(), timeout=timeout)
             self.total_consumed += 1
@@ -156,6 +182,53 @@ class IntentQueue:
 
     def qsize(self) -> int:
         return self._queue.qsize()
+
+    def rebind_loop(self):
+        """Move queued intents to primitives owned by the current event loop.
+
+        The runtime normally lives in one long-running loop, but test runners
+        and embedded callers may stop and restart it through separate
+        ``asyncio.run`` invocations.  asyncio queues become loop-affine once a
+        waiter is attached; rebuilding the queue keeps that restart safe while
+        preserving any intents that were already buffered.
+        """
+        current = asyncio.get_running_loop()
+        bound = getattr(self, "_bound_loop", None)
+        if bound is current:
+            return
+        if bound is None:
+            # A queue constructed before an event loop exists has not become
+            # loop-affine yet.  Claim it in place so pre-start buffered
+            # intents remain available to the first runtime loop.
+            self._bound_loop = current
+            return
+        old_queue = self._queue
+        # Never orphan a live consumer by replacing a queue underneath it.
+        # Cancelled waiters are pruned by asyncio, but tolerate completed
+        # futures left behind by an interrupted loop.
+        active_getters = [
+            waiter for waiter in (getattr(old_queue, "_getters", ()) or ())
+            if not waiter.done()
+        ]
+        active_putters = [
+            waiter for waiter in (getattr(old_queue, "_putters", ()) or ())
+            if not waiter.done()
+        ]
+        if active_getters or active_putters:
+            raise RuntimeError(
+                "cannot rebind an intent queue while a consumer or producer "
+                "is waiting; stop the owning bridge first"
+            )
+        new_queue = asyncio.Queue(maxsize=old_queue.maxsize)
+        while True:
+            try:
+                new_queue.put_nowait(old_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+            except asyncio.QueueFull:
+                break
+        self._queue = new_queue
+        self._bound_loop = current
 
     async def get_latest(self) -> Intent | None:
         """获取最新的一条意图，丢弃中间的。用于响应场景——只关心最新决策。"""

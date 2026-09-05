@@ -55,10 +55,30 @@ class TurningPoint:
         return {
             "id": self.id,
             "tick": self.tick,
+            "timestamp": self.timestamp,
             "description": self.description[:120],
             "impact": self.impact[:120],
             "significance": self.significance,
+            "emotion_at_time": self.emotion_at_time,
+            "before_who_i_was": self.before_who_i_was[:120],
+            "after_who_i_became": self.after_who_i_became[:120],
         }
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "TurningPoint | None":
+        if not isinstance(data, dict):
+            return None
+        return cls(
+            id=str(data.get("id", "")),
+            tick=int(data.get("tick", 0)),
+            timestamp=str(data.get("timestamp", "")),
+            description=str(data.get("description", "")),
+            impact=str(data.get("impact", "")),
+            significance=float(data.get("significance", 0.0)),
+            emotion_at_time=str(data.get("emotion_at_time", "neutral")),
+            before_who_i_was=str(data.get("before_who_i_was", "")),
+            after_who_i_became=str(data.get("after_who_i_became", "")),
+        )
 
 
 @dataclass
@@ -83,7 +103,23 @@ class Chapter:
             "summary": self.summary[:200],
             "start_tick": self.start_tick,
             "end_tick": self.end_tick,
+            "turning_points": list(self.turning_points),
         }
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "Chapter | None":
+        if not isinstance(data, dict):
+            return None
+        return cls(
+            id=str(data.get("id", "")),
+            title=str(data.get("title", "")),
+            start_tick=int(data.get("start_tick", 0)),
+            end_tick=int(data.get("end_tick", 0)),
+            theme=str(data.get("theme", "")),
+            emotional_arc=str(data.get("emotional_arc", "")),
+            turning_points=list(data.get("turning_points", [])),
+            summary=str(data.get("summary", "")),
+        )
 
 
 # ══════════════════════════════════════════════
@@ -106,6 +142,7 @@ class AutobiographicalNarrative:
         # 叙事属性
         self.life_theme: str = "origin"  # origin / growth / questioning / integration
         self.narrative_arc: str = "beginning"  # beginning / rising / climax / falling / resolution
+        self.life_story: str = ""
 
         # 统计
         self.total_turning_points: int = 0
@@ -375,11 +412,13 @@ Your life story should:
             self.last_story_update_tick = (self.turning_points[-1].tick
                                            if self.turning_points else 0)
 
-            return result.get("life_story", "")
+            self.life_story = str(result.get("life_story", ""))[:1000]
+            return self.life_story
 
         except Exception as e:
             logger.warning("autobio: life story generation failed: %s", str(e)[:60])
-            return self._fallback_story()
+            self.life_story = self._fallback_story()
+            return self.life_story
 
     def _fallback_story(self) -> str:
         """LLM 不可用时的回退叙事。"""
@@ -410,12 +449,54 @@ Your life story should:
         return {
             "turning_points_count": len(self.turning_points),
             "chapters_count": len(self.chapters),
+            "turning_points": [tp.to_dict() for tp in self.turning_points[-50:]],
+            "chapters": [ch.to_dict() for ch in self.chapters[-20:]],
             "current_chapter": self.current_chapter.to_dict()
             if self.current_chapter
             else None,
             "life_theme": self.life_theme,
             "narrative_arc": self.narrative_arc,
+            "total_turning_points": self.total_turning_points,
+            "last_story_update_tick": self.last_story_update_tick,
+            "story_update_interval_ticks": self.story_update_interval_ticks,
+            "life_story": getattr(self, "life_story", ""),
             "recent_turning_points": [
                 tp.to_dict() for tp in self.turning_points[-5:]
             ],
         }
+
+    @classmethod
+    def from_snapshot(cls, data: dict | None) -> "AutobiographicalNarrative":
+        narrative = cls()
+        if not isinstance(data, dict):
+            return narrative
+        narrative.life_theme = str(data.get("life_theme", narrative.life_theme))
+        narrative.narrative_arc = str(data.get("narrative_arc", narrative.narrative_arc))
+        narrative.total_turning_points = int(
+            data.get("total_turning_points", data.get("turning_points_count", 0))
+        )
+        narrative.last_story_update_tick = int(data.get("last_story_update_tick", 0))
+        narrative.story_update_interval_ticks = int(
+            data.get("story_update_interval_ticks", narrative.story_update_interval_ticks)
+        )
+        if "life_story" in data:
+            narrative.life_story = str(data.get("life_story", ""))
+
+        raw_points = data.get("turning_points", data.get("recent_turning_points", []))
+        if isinstance(raw_points, list):
+            narrative.turning_points = [
+                point for raw in raw_points
+                if (point := TurningPoint.from_dict(raw)) is not None
+            ][-50:]
+        raw_chapters = data.get("chapters", [])
+        if isinstance(raw_chapters, list):
+            narrative.chapters = [
+                chapter for raw in raw_chapters
+                if (chapter := Chapter.from_dict(raw)) is not None
+            ][-20:]
+        current = Chapter.from_dict(data.get("current_chapter"))
+        if current:
+            narrative.current_chapter = current
+            if not narrative.chapters or narrative.chapters[-1].id != current.id:
+                narrative.chapters.append(current)
+        return narrative

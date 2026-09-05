@@ -10,8 +10,12 @@
   - file_read: 读取文件
 """
 
+import asyncio
 import json
 import logging
+import urllib.parse
+import urllib.request
+from pathlib import Path
 from agent.tool_registry import registry, ToolDef
 
 logger = logging.getLogger("brain-v5.tool.web-search")
@@ -27,8 +31,6 @@ async def _web_search(args: dict, context: dict) -> str:
         return json.dumps({"error": "query required"}, ensure_ascii=False)
     # 实际搜索通过 Hermes 的 web_tools 或直接 HTTP 调用
     try:
-        import urllib.request
-        import urllib.parse
         url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
         # 简化实现 — 实际集成时使用 Hermes web_tools 或 Brave API
         return json.dumps({
@@ -75,10 +77,16 @@ async def _memory_search(args: dict, context: dict) -> str:
     brain = context.get("brain_client")
     if brain:
         try:
-            import urllib.request
-            url = f"http://127.0.0.1:8001/api/v4/memory/search?q={urllib.parse.quote(query)}&limit={limit}"
-            r = urllib.request.urlopen(url, timeout=5)
-            data = json.loads(r.read())
+            base_url = getattr(brain, "brain_api_url", None) or context.get(
+                "brain_api_url"
+            ) or "http://127.0.0.1:8001"
+            base_url = str(base_url).rstrip("/")
+            url = f"{base_url}/api/v4/memory/search?q={urllib.parse.quote(query)}&limit={limit}"
+            def _request_memory():
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    return json.loads(response.read())
+
+            data = await asyncio.to_thread(_request_memory)
             return json.dumps({
                 "count": data.get("count", 0),
                 "memories": data.get("memories", []),
@@ -156,21 +164,52 @@ registry.register(ToolDef(
 # ── file_read ──
 
 async def _file_read(args: dict, context: dict) -> str:
-    """读取文件内容。"""
+    """Read a non-secret file from the configured workspace boundary."""
     path = args.get("path", "")
     if not path:
         return json.dumps({"error": "path required"}, ensure_ascii=False)
     try:
-        import os
-        if not os.path.exists(path):
-            return json.dumps({"error": f"file not found: {path}"}, ensure_ascii=False)
-        # 安全检查
-        if os.path.getsize(path) > 1024 * 1024:  # 1MB limit
+        workspace_root = Path(
+            context.get("workspace_root") or Path(__file__).resolve().parents[2]
+        ).resolve()
+        requested = Path(str(path))
+        target = (workspace_root / requested).resolve() if not requested.is_absolute() else requested.resolve()
+
+        try:
+            relative = target.relative_to(workspace_root)
+        except ValueError:
+            return json.dumps({
+                "error": "path outside workspace boundary",
+                "workspace_root": str(workspace_root),
+            }, ensure_ascii=False)
+
+        lowered_parts = {part.lower() for part in relative.parts}
+        lowered_name = target.name.lower()
+        sensitive_names = {
+            ".env", ".env.local", ".env.production", ".env.development",
+            "id_rsa", "id_ed25519", "credentials.json",
+        }
+        if (
+            ".git" in lowered_parts
+            or lowered_name in sensitive_names
+            or "apikey" in lowered_name
+            or "api_key" in lowered_name
+            or target.suffix.lower() in {".pem", ".key", ".p12", ".pfx"}
+        ):
+            return json.dumps({"error": "sensitive file access denied"}, ensure_ascii=False)
+
+        if not target.exists() or not target.is_file():
+            return json.dumps({"error": f"file not found: {relative}"}, ensure_ascii=False)
+        if target.stat().st_size > 1024 * 1024:  # 1MB limit
             return json.dumps({"error": "file too large (>1MB)"}, ensure_ascii=False)
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()[:50000]
+
+        def _read_text():
+            with target.open("r", encoding="utf-8", errors="replace") as file:
+                return file.read(50000)
+
+        content = await asyncio.to_thread(_read_text)
         return json.dumps({
-            "path": path,
+            "path": str(relative),
             "size": len(content),
             "content": content[:10000],  # truncate for LLM
         }, ensure_ascii=False)

@@ -12,6 +12,7 @@
 """
 import json
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -301,33 +302,94 @@ Rules for facts:
     @classmethod
     def from_snapshot(cls, data: dict) -> "SelfModel":
         sm = cls()
-        if not data:
+        if not isinstance(data, dict):
             return sm
+
+        def _text(value, default=""):
+            return default if value is None else str(value)
+
+        def _int(value, default=0, minimum=None):
+            try:
+                result = int(value)
+            except (TypeError, ValueError, OverflowError):
+                result = default
+            return max(minimum, result) if minimum is not None else result
+
+        def _number(value, default=0.0, low=None, high=None):
+            try:
+                result = float(value)
+            except (TypeError, ValueError, OverflowError):
+                result = default
+            if not math.isfinite(result):
+                result = default
+            if low is not None:
+                result = max(low, result)
+            if high is not None:
+                result = min(high, result)
+            return result
+
         # 恢复身份事实
-        if data.get("identity_facts"):
-            sm._identity_facts = list(data["identity_facts"])
+        raw_facts = data.get("identity_facts")
+        if isinstance(raw_facts, list):
+            sm._identity_facts = [
+                {
+                    "fact": _text(item.get("fact", ""))[:300],
+                    "source_memory_id": _text(item.get("source_memory_id", ""))[:200],
+                    "created": _text(item.get("created", "")),
+                    "confidence": _number(item.get("confidence", 0.8), 0.8, 0.0, 1.0),
+                }
+                for item in raw_facts
+                if isinstance(item, dict) and _text(item.get("fact", "")).strip()
+            ][-100:]
             sm._anchor_dirty = True
         # 恢复基底
-        if data.get("base_anchor"):
-            sm._base_anchor = data["base_anchor"]
+        if isinstance(data.get("base_anchor"), str) and data["base_anchor"]:
+            sm._base_anchor = data["base_anchor"][:2000]
         # 向后兼容：旧快照只有 identity_anchor 字符串
-        elif data.get("identity_anchor"):
-            sm.identity_anchor = data["identity_anchor"]  # 触发 setter 解析
-        sm.identity_traits = list(data.get("identity_traits", sm.identity_traits))
-        sm.identity_version = data.get("identity_version", sm.identity_version)
-        if data.get("drives"):
-            sm.drives.update(data["drives"])
-        sm.self_narrative = list(data.get("self_narrative", []))
-        if data.get("emotional_baseline"):
-            sm.emotional_baseline.update(data["emotional_baseline"])
-        sm.mood_tendency = data.get("mood_tendency", sm.mood_tendency)
-        if data.get("attention_biases"):
-            sm.attention_biases.update(data["attention_biases"])
-        sm.total_experiences = data.get("total_experiences", 0)
-        sm.identity_shifts = list(data.get("identity_shifts", []))
-        sm.last_reflection = data.get("last_reflection", "")
-        if data.get("behavioral_traits"):
-            sm.behavioral_traits.update(data["behavioral_traits"])
+        elif isinstance(data.get("identity_anchor"), str) and data["identity_anchor"]:
+            sm.identity_anchor = data["identity_anchor"][:2000]  # 触发 setter 解析
+
+        raw_traits = data.get("identity_traits")
+        if isinstance(raw_traits, list):
+            sm.identity_traits = [_text(item)[:80] for item in raw_traits if item is not None][-20:]
+        sm.identity_version = _int(data.get("identity_version", sm.identity_version), sm.identity_version, 1)
+
+        raw_drives = data.get("drives")
+        if isinstance(raw_drives, dict):
+            for name, raw in raw_drives.items():
+                if isinstance(raw, dict):
+                    drive = dict(raw)
+                    if "weight" in drive:
+                        drive["weight"] = _number(drive["weight"], 0.5, 0.0, 1.0)
+                    sm.drives[str(name)] = drive
+
+        raw_narrative = data.get("self_narrative")
+        if isinstance(raw_narrative, list):
+            sm.self_narrative = [dict(item) for item in raw_narrative if isinstance(item, dict)][-sm.max_narrative_entries:]
+
+        raw_baseline = data.get("emotional_baseline")
+        if isinstance(raw_baseline, dict):
+            for name in ("valence", "arousal", "dominance"):
+                if name in raw_baseline:
+                    sm.emotional_baseline[name] = _number(raw_baseline[name], sm.emotional_baseline[name], 0.0, 1.0)
+        if isinstance(data.get("mood_tendency"), str):
+            sm.mood_tendency = data["mood_tendency"][:80]
+
+        raw_biases = data.get("attention_biases")
+        if isinstance(raw_biases, dict):
+            for name, value in raw_biases.items():
+                sm.attention_biases[str(name)] = _number(value, 0.5, 0.0, 1.0)
+
+        sm.total_experiences = _int(data.get("total_experiences", 0), 0, 0)
+        raw_shifts = data.get("identity_shifts")
+        if isinstance(raw_shifts, list):
+            sm.identity_shifts = [dict(item) for item in raw_shifts if isinstance(item, dict)][-50:]
+        sm.last_reflection = _text(data.get("last_reflection", ""))[:500]
+
+        raw_behavioral = data.get("behavioral_traits")
+        if isinstance(raw_behavioral, dict):
+            for name, value in raw_behavioral.items():
+                sm.behavioral_traits[str(name)] = _number(value, 0.5, 0.0, 1.0)
         return sm
 
     # ══════════════════════════════════════════════

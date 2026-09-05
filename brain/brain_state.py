@@ -8,6 +8,7 @@ V6: ActivationField 是全局状态总线，所有脑区通过它交换状态。
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import math
 from typing import Any
 
 from brain.self_model import SelfModel
@@ -16,12 +17,16 @@ from brain.session import SessionManager, SessionState
 from brain.activation_field import ActivationField
 
 
+SNAPSHOT_SCHEMA_VERSION = 2
+
+
 @dataclass
 class BrainState:
     """Live brain state — the "what is the brain thinking/feeling right now"."""
 
     # ── Consciousness ──
     awake: bool = True
+    sleep_state: str = "awake"
     last_tick: str = ""
     ticks_since_input: int = 0
 
@@ -82,6 +87,13 @@ class BrainState:
     # ── Intent (v5.0) ──
     last_intent: dict | None = None      # 大脑上一次产出的意图 {type, tool_name, tool_args, ...}
     intent_count: int = 0               # 累计产出的意图数量
+    last_input_id: str = ""              # 最近一次输入的关联 ID
+    last_input_source: str = ""          # 最近一次输入的原始来源
+
+    # ── Runtime health ──
+    loop_error_count: int = 0
+    last_loop_error: str = ""
+    last_heartbeat_at: str = ""
 
     # ── V6 Activation Field（全局状态总线）──
     activation: ActivationField = field(default_factory=ActivationField)
@@ -92,27 +104,70 @@ class BrainState:
 
     def snapshot(self) -> dict:
         """Serializable snapshot for persistence."""
+        def _text(value: Any, limit: int | None = None) -> str:
+            # Runtime values can be supplied by optional adapters.  Coerce
+            # them at the persistence boundary so one malformed field cannot
+            # abort the heartbeat's final snapshot.
+            text = "" if value is None else str(value)
+            return text[:limit] if limit is not None else text
+
+        def _tail(value: Any, limit: int) -> list:
+            if not isinstance(value, (list, tuple)):
+                return []
+            return list(value[-limit:])
+
+        emotion_vector = self.emotion_vector if isinstance(self.emotion_vector, dict) else {}
+        emotion_history = _tail(self.emotion_history, 50)
+        goal_stack = _tail(self.goal_stack, 20)
+        last_retrieved = _tail(self.last_retrieved, 20)
+        association_chain = _tail(self.association_chain, 20)
+        recent_errors = _tail(self.recent_errors, 20)
+        active_thoughts = _tail(self.active_thoughts, len(self.active_thoughts) if isinstance(self.active_thoughts, list) else 0)
+
         return {
+            "schema_version": SNAPSHOT_SCHEMA_VERSION,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "awake": self.awake,
-            "emotion_vector": dict(self.emotion_vector),
+            "sleep_state": self.sleep_state,
+            "last_tick": self.last_tick,
+            "ticks_since_input": self.ticks_since_input,
+            "emotion_vector": dict(emotion_vector),
             "current_emotion": self.current_emotion,
+            "emotion_history": [dict(item) if isinstance(item, dict) else item
+                                 for item in emotion_history],
             "focus_entity": self.focus_entity,
             "current_goal": self.current_goal,
-            "current_context": self.current_context[:500],
-            "inner_monologue": self.inner_monologue[:500],
+            "goal_stack": [_text(item, 200) for item in goal_stack],
+            "attention_span_ticks": self.attention_span_ticks,
+            "current_context": _text(self.current_context, 500),
+            "inner_monologue": _text(self.inner_monologue, 500),
+            "last_narrative": _text(self.last_narrative, 500),
             "active_thoughts_count": len(self.active_thoughts),
+            "last_retrieved": [_text(item, 200) for item in last_retrieved],
+            "association_chain": [_text(item, 200) for item in association_chain],
             "last_input_gated": self.last_input_gated,
             "last_input_accepted": self.last_input_accepted,
-            "last_error": self.last_error[:200],
+            "last_error": _text(self.last_error, 200),
             "llm_error_count": self.llm_error_count,
             "last_intent": self.last_intent,
             "intent_count": self.intent_count,
+            "last_input_id": _text(self.last_input_id, 200),
+            "last_input_source": _text(self.last_input_source, 200),
+            "loop_error_count": self.loop_error_count,
+            "last_loop_error": _text(self.last_loop_error, 500),
+            "last_heartbeat_at": _text(self.last_heartbeat_at),
             "total_ticks": self.total_ticks,
             "uptime_seconds": round(self.uptime_seconds, 1),
+            "active_habit": _text(self.active_habit, 200) if self.active_habit is not None else None,
+            "habit_confidence": self.habit_confidence,
+            "conflict_detected": self.conflict_detected,
+            "conflict_detail": _text(self.conflict_detail, 500),
+            "error_count": self.error_count,
+            "recent_errors": [_text(item, 500) for item in recent_errors],
             "self_model": self.self_model.snapshot(),
             "curiosity": self.curiosity.snapshot(),
             "sessions": self.session_manager.all_snapshots(),
+            "active_thoughts": [dict(item) for item in active_thoughts if isinstance(item, dict)],
             "goal_system": {},  # filled by BrainStem at snapshot time
             "activation": self.activation.snapshot(),  # V6
         }
@@ -121,19 +176,110 @@ class BrainState:
     def from_snapshot(cls, data: dict) -> "BrainState":
         """Restore from snapshot."""
         state = cls()
-        state.awake = data.get("awake", True)
-        if data.get("emotion_vector"):
-            state.emotion_vector.update(data["emotion_vector"])
-        state.current_emotion = data.get("current_emotion", "neutral")
-        state.focus_entity = data.get("focus_entity")
-        state.current_goal = data.get("current_goal")
-        state.current_context = data.get("current_context", "")
-        state.inner_monologue = data.get("inner_monologue", "")
-        state.total_ticks = data.get("total_ticks", 0)
-        state.uptime_seconds = data.get("uptime_seconds", 0.0)
-        state.self_model = SelfModel.from_snapshot(data.get("self_model", {}))
-        state.curiosity = CuriosityEngine.from_snapshot(data.get("curiosity", {}))
-        if data.get("activation"):
-            state.activation = ActivationField.from_snapshot(data["activation"])
-        # Sessions are ephemeral, not restored from snapshot
+        if not isinstance(data, dict):
+            return state
+        def _int(value, default=0, minimum=None):
+            try:
+                result = int(value)
+            except (TypeError, ValueError, OverflowError):
+                result = default
+            return max(minimum, result) if minimum is not None else result
+
+        def _float(value, default=0.0):
+            try:
+                result = float(value)
+                return result if math.isfinite(result) else default
+            except (TypeError, ValueError, OverflowError):
+                return default
+
+        def _text(value, default=""):
+            return default if value is None else str(value)
+
+        def _bool(value, default=False):
+            if value is None:
+                return default
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on"}
+            return bool(value)
+
+        state.awake = _bool(data.get("awake", True), default=True)
+        sleep_state = _text(data.get("sleep_state", "awake"), "awake")
+        state.sleep_state = sleep_state if sleep_state in {
+            "awake", "drowsy", "light_sleep", "deep_sleep"
+        } else "awake"
+        state.last_tick = _text(data.get("last_tick", ""))
+        state.ticks_since_input = _int(data.get("ticks_since_input", 0), minimum=0)
+        if isinstance(data.get("emotion_vector"), dict):
+            for key, value in data["emotion_vector"].items():
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(number):
+                    state.emotion_vector[str(key)] = number
+        state.current_emotion = _text(data.get("current_emotion", "neutral"), "neutral")
+        emotion_history = data.get("emotion_history", [])
+        if isinstance(emotion_history, list):
+            state.emotion_history = [dict(item) if isinstance(item, dict) else item
+                                     for item in emotion_history[-50:]]
+        focus = data.get("focus_entity")
+        state.focus_entity = str(focus) if focus is not None else None
+        goal = data.get("current_goal")
+        state.current_goal = str(goal) if goal is not None else None
+        goal_stack = data.get("goal_stack", [])
+        if isinstance(goal_stack, list):
+            state.goal_stack = [str(item) for item in goal_stack[-20:]]
+        state.attention_span_ticks = _int(data.get("attention_span_ticks", 0), minimum=0)
+        state.current_context = _text(data.get("current_context", ""))
+        state.inner_monologue = _text(data.get("inner_monologue", ""))
+        state.last_narrative = _text(data.get("last_narrative", ""))
+        for field_name in ("last_retrieved", "association_chain"):
+            raw = data.get(field_name, [])
+            if isinstance(raw, list):
+                setattr(state, field_name, [str(item) for item in raw[-20:]])
+        active_thoughts = data.get("active_thoughts", [])
+        if isinstance(active_thoughts, list):
+            state.active_thoughts = [dict(item) for item in active_thoughts if isinstance(item, dict)]
+        state.last_input_gated = _bool(data.get("last_input_gated", False))
+        state.last_input_accepted = _bool(data.get("last_input_accepted", True), default=True)
+        state.last_error = _text(data.get("last_error", ""))
+        state.llm_error_count = _int(data.get("llm_error_count", 0), minimum=0)
+        state.last_intent = data.get("last_intent") if isinstance(data.get("last_intent"), dict) else None
+        state.intent_count = _int(data.get("intent_count", 0), minimum=0)
+        state.last_input_id = _text(data.get("last_input_id", ""))
+        state.last_input_source = _text(data.get("last_input_source", ""))
+        state.loop_error_count = _int(data.get("loop_error_count", 0), minimum=0)
+        state.last_loop_error = _text(data.get("last_loop_error", ""))
+        state.last_heartbeat_at = _text(data.get("last_heartbeat_at", ""))
+        state.total_ticks = _int(data.get("total_ticks", 0), minimum=0)
+        state.uptime_seconds = max(0.0, _float(data.get("uptime_seconds", 0.0)))
+        active_habit = data.get("active_habit")
+        state.active_habit = str(active_habit) if active_habit is not None else None
+        state.habit_confidence = _float(data.get("habit_confidence", 0.0))
+        state.conflict_detected = _bool(data.get("conflict_detected", False))
+        state.conflict_detail = _text(data.get("conflict_detail", ""))
+        state.error_count = _int(data.get("error_count", 0), minimum=0)
+        recent_errors = data.get("recent_errors", [])
+        if isinstance(recent_errors, list):
+            state.recent_errors = [str(item) for item in recent_errors[-20:]]
+
+        # A malformed optional component should not prevent the heartbeat from
+        # starting.  Keep the default component when its decoder rejects data.
+        try:
+            state.self_model = SelfModel.from_snapshot(data.get("self_model", {}))
+        except Exception:
+            pass
+        try:
+            state.curiosity = CuriosityEngine.from_snapshot(data.get("curiosity", {}))
+        except Exception:
+            pass
+        try:
+            state.session_manager = SessionManager.from_snapshot(data.get("sessions", {}))
+        except Exception:
+            pass
+        if isinstance(data.get("activation"), dict):
+            try:
+                state.activation = ActivationField.from_snapshot(data["activation"])
+            except Exception:
+                pass
         return state

@@ -259,3 +259,15 @@ class ExplorationExecutor:
             "cycles_completed": self.cycles_completed,
             "total_issues_found": self.total_issues_found,
         }
+
+    @classmethod
+    def from_snapshot(cls, data: dict | None) -> "ExplorationExecutor":
+        executor = cls()
+        if not isinstance(data, dict):
+            return executor
+        try:
+            executor.cycles_completed = max(0, int(data.get("cycles_completed", 0)))
+            executor.total_issues_found = max(0, int(data.get("total_issues_found", 0)))
+        except (TypeError, ValueError):
+            pass
+        return executor

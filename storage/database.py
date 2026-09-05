@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 logger = logging.getLogger("brain-v5.storage")
 DB_PATH = "brain_v4.db"
 DB_TIMEOUT = 10.0
+STATE_SNAPSHOT_RETENTION = 200
 
 
 def _connect(path: str = DB_PATH) -> sqlite3.Connection:
@@ -17,8 +18,15 @@ def _connect(path: str = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
-def init_db():
-    conn = _connect()
+def init_db(db_path: str = DB_PATH):
+    """Create the database schema at ``db_path`` if it does not exist.
+
+    The original implementation always initialized ``DB_PATH`` even when a
+    ``Brain`` instance was configured with another database.  Keeping the
+    path explicit is important for isolated tests, backups, and running more
+    than one brain instance on the same machine.
+    """
+    conn = _connect(db_path)
     try:
         conn.execute("""CREATE TABLE IF NOT EXISTS memories (
             id TEXT PRIMARY KEY, type TEXT NOT NULL, title TEXT, content TEXT,
@@ -69,17 +77,50 @@ class StateStore:
             self._conn = _connect(self.db_path)
         return self._conn
 
-    def save(self, snapshot: dict):
+    def save(self, snapshot: dict) -> bool:
+        if not isinstance(snapshot, dict) or not snapshot.get("timestamp"):
+            logger.error("state-store snapshot is missing a timestamp")
+            return False
         try:
-            self.conn.execute(
-                "INSERT INTO brain_state (timestamp, snapshot) VALUES (?, ?)",
-                (snapshot["timestamp"], json.dumps(snapshot, ensure_ascii=False)),
-            )
-            self.conn.commit()
-        except sqlite3.OperationalError as e:
-            logger.warning("state-store save failed: %s", str(e)[:80])
-            self._conn = None
-            self.save(snapshot)
+            payload = json.dumps(snapshot, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            logger.error("state-store snapshot is not serializable: %s", str(exc)[:120])
+            return False
+        # Retry once after reconnecting.  Recursive retry used to make a
+        # persistent disk/lock error recurse until the process crashed.
+        for attempt in range(2):
+            try:
+                self.conn.execute(
+                    "INSERT INTO brain_state (timestamp, snapshot) VALUES (?, ?)",
+                    (snapshot["timestamp"], payload),
+                )
+                # Keep the journal bounded so an always-on consciousness does
+                # not eventually exhaust the local disk.  The newest 200
+                # snapshots still provide ample crash/restart history.
+                self.conn.execute(
+                    "DELETE FROM brain_state WHERE id NOT IN "
+                    "(SELECT id FROM brain_state ORDER BY id DESC LIMIT ?)",
+                    (STATE_SNAPSHOT_RETENTION,),
+                )
+                self.conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logger.warning("state-store save failed (attempt %d): %s", attempt + 1, str(e)[:80])
+                self._reset_connection()
+        logger.error("state-store save abandoned after reconnect retry")
+        return False
+
+    def _reset_connection(self):
+        try:
+            if self._conn is not None:
+                self._conn.close()
+        except Exception:
+            pass
+        self._conn = None
+
+    def close(self):
+        """Close the persistent connection, if it is open."""
+        self._reset_connection()
 
     def load_latest(self) -> dict | None:
         try:
@@ -87,8 +128,9 @@ class StateStore:
                 "SELECT snapshot FROM brain_state ORDER BY id DESC LIMIT 1"
             ).fetchone()
             return json.loads(row["snapshot"]) if row else None
-        except sqlite3.OperationalError:
-            self._conn = None
+        except (sqlite3.Error, json.JSONDecodeError) as exc:
+            logger.warning("state-store load failed: %s", str(exc)[:100])
+            self._reset_connection()
             return None
 
 
@@ -110,6 +152,15 @@ class MemoryStore:
         except Exception:
             pass
         self._conn = _connect(self.db_path)
+
+    def close(self):
+        """Close the persistent connection, if it is open."""
+        try:
+            if self._conn is not None:
+                self._conn.close()
+        except Exception:
+            pass
+        self._conn = None
 
     def save(self, memory: dict) -> str:
         mem_id = memory.get("id") or "mem-" + uuid.uuid4().hex[:12]
@@ -133,7 +184,7 @@ class MemoryStore:
         try:
             self.conn.execute(sql, vals)
             self.conn.commit()
-        except sqlite3.OperationalError as e:
+        except sqlite3.Error as e:
             logger.warning("memory-store save failed: %s", str(e)[:80])
             self._reconnect()
             self.conn.execute(sql, vals)
@@ -165,7 +216,7 @@ class MemoryStore:
                 params,
             ).fetchall()
             return [dict(r) for r in rows]
-        except sqlite3.OperationalError:
+        except sqlite3.Error:
             self._reconnect()
             return []
 
@@ -176,7 +227,7 @@ class MemoryStore:
                 (limit,),
             ).fetchall()
             return [dict(r) for r in rows]
-        except sqlite3.OperationalError:
+        except sqlite3.Error:
             self._reconnect()
             return []
 
@@ -201,7 +252,7 @@ class MemoryStore:
                 )
             self.conn.commit()
             return {"decayed": True, "archived": to_archive}
-        except sqlite3.OperationalError:
+        except sqlite3.Error:
             self._reconnect()
             return {"decayed": False, "archived": 0}
 
@@ -213,7 +264,7 @@ class MemoryStore:
                 (boost, __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(), mem_id),
             )
             self.conn.commit()
-        except sqlite3.OperationalError:
+        except sqlite3.Error:
             self._reconnect()
 
     def total_archived(self) -> int:
@@ -221,7 +272,7 @@ class MemoryStore:
         try:
             row = self.conn.execute("SELECT COUNT(*) FROM memories WHERE archived = 1").fetchone()
             return row[0] if row else 0
-        except sqlite3.OperationalError:
+        except sqlite3.Error:
             self._reconnect()
             return 0
 
@@ -229,6 +280,6 @@ class MemoryStore:
         try:
             row = self.conn.execute("SELECT COUNT(*) FROM memories WHERE archived=0").fetchone()
             return row[0] if row else 0
-        except sqlite3.OperationalError:
+        except sqlite3.Error:
             self._reconnect()
             return 0

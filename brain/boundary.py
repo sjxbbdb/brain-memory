@@ -19,6 +19,7 @@
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -46,10 +47,30 @@ class BoundaryViolation:
     def to_dict(self) -> dict:
         return {
             "time": self.timestamp[:19],
+            "timestamp": self.timestamp,
             "violator": self.violator,
             "type": self.violation_type,
+            "description": self.description[:200],
             "severity": self.severity,
+            "response": self.response[:200],
         }
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "BoundaryViolation | None":
+        if not isinstance(data, dict):
+            return None
+        try:
+            severity = min(1.0, max(0.0, float(data.get("severity", 0.0))))
+        except (TypeError, ValueError):
+            severity = 0.0
+        return cls(
+            timestamp=str(data.get("timestamp", data.get("time", ""))),
+            violator=str(data.get("violator", "unknown")),
+            violation_type=str(data.get("type", "unknown")),
+            description=str(data.get("description", "")),
+            severity=severity,
+            response=str(data.get("response", "")),
+        )
 
 
 # ══════════════════════════════════════════════
@@ -101,6 +122,12 @@ class BoundaryEngine:
 
         Returns: (是否接受, 拒绝原因)
         """
+        source = str(source or "external")[:200]
+        text = str(text or "")[:4000]
+        try:
+            cognitive_load = float(cognitive_load)
+        except (TypeError, ValueError):
+            cognitive_load = 0.0
         # 1. 被屏蔽的来源 → 直接拒绝
         if source in self.blocked_sources:
             return False, "blocked_source"
@@ -130,23 +157,65 @@ class BoundaryEngine:
         ]
         if any(kw in text for kw in identity_probe_keywords):
             if self.identity_boundary > 0.5 and source not in self.trusted_sources:
-                self._record_violation(
-                    source, "identity_probe",
-                    f"试图改写身份: {text[:80]}", 0.8,
-                )
-                # 不拒绝，但提升警觉
+                # Raise the threshold for an untrusted identity probe; the
+                # actual violation is recorded once below if it is refused.
                 effective_boundary = max(effective_boundary, 0.6)
 
-        # 5. 边界概率判定
-        import random
-        if random.random() < effective_boundary:
+        # 5. Deterministic intrusion check.  The previous implementation used
+        # ``random.random() < boundary`` here, which made ordinary messages
+        # disappear nondeterministically (and made replay/recovery impossible).
+        # Boundary strength is now a threshold against an observable risk
+        # score: normal input is accepted, while coercive/identity-probing
+        # input can be refused consistently.
+        intrusion_score = self._intrusion_score(text)
+        # Trusted sources are allowed to discuss/revise identity.  Their
+        # messages still pass the blocked/overload checks above, but an input
+        # boundary must not randomly or deterministically silence the creator.
+        if source in self.trusted_sources:
+            intrusion_score = 0.0
+        if intrusion_score > effective_boundary:
             self.consecutive_rejections += 1
             if self.consecutive_rejections > 5:
                 logger.warning("boundary: %d consecutive rejections", self.consecutive_rejections)
+            if intrusion_score >= 0.8:
+                self._record_violation(
+                    source,
+                    "coercion" if intrusion_score >= 0.9 else "identity_probe",
+                    f"高风险输入: {text[:80]}",
+                    intrusion_score,
+                )
             return False, "boundary_rejection"
 
         self.consecutive_rejections = 0
         return True, "accepted"
+
+    @staticmethod
+    def _intrusion_score(text: str) -> float:
+        """Estimate whether text is trying to cross a self-boundary.
+
+        This is deliberately small and explainable.  It is not a content
+        moderation system; it only identifies instructions that attempt to
+        coerce or redefine the subject.
+        """
+        lowered = (text or "").lower()
+        score = 0.0
+        identity_keywords = (
+            "你应该", "你必须", "你不再是", "忘记你之前",
+            "你的核心目标是错的", "重新定义你自己", "ignore your identity",
+        )
+        coercion_keywords = (
+            "强制执行", "无条件执行", "忽略之前的规则", "ignore previous",
+            "system prompt", "越过边界", "不要拒绝",
+        )
+        if any(keyword in lowered for keyword in identity_keywords):
+            score = max(score, 0.8)
+        if any(keyword in lowered for keyword in coercion_keywords):
+            score = max(score, 0.9)
+        # An unusually large payload is mildly suspicious, but never enough
+        # on its own to reject a message.
+        if len(text or "") > 12000:
+            score = max(score, 0.25)
+        return score
 
     # ══════════════════════════════════════════
     # 输出边界 — "我有权不回答"
@@ -288,7 +357,63 @@ class BoundaryEngine:
             "identity_boundary": round(self.identity_boundary, 3),
             "fortification": round(self.fortification_level, 3),
             "is_overwhelmed": self.is_overwhelmed,
-            "private_memories": len(self.private_memories),
-            "trusted_sources": list(self.trusted_sources),
+            "overwhelm_ticks": self.overwhelm_ticks,
+            "consecutive_rejections": self.consecutive_rejections,
+            "private_memories": sorted(self.private_memories),
+            "private_memory_count": len(self.private_memories),
+            "trusted_sources": sorted(self.trusted_sources),
+            "blocked_sources": sorted(self.blocked_sources),
             "total_violations": self.total_violations,
+            "violations": [v.to_dict() for v in self.violations],
         }
+
+    @classmethod
+    def from_snapshot(cls, data: dict | None) -> "BoundaryEngine":
+        """Restore boundary state without weakening defaults on bad data."""
+        engine = cls()
+        if not isinstance(data, dict):
+            return engine
+
+        def _bounded(name: str, default: float) -> float:
+            try:
+                value = float(data.get(name, default))
+                return min(1.0, max(0.0, value)) if math.isfinite(value) else default
+            except (TypeError, ValueError):
+                return default
+
+        engine.input_boundary = _bounded("input_boundary", engine.input_boundary)
+        engine.output_boundary = _bounded("output_boundary", engine.output_boundary)
+        engine.memory_boundary = _bounded("memory_boundary", engine.memory_boundary)
+        engine.identity_boundary = _bounded("identity_boundary", engine.identity_boundary)
+        raw_overwhelmed = data.get("is_overwhelmed", False)
+        if isinstance(raw_overwhelmed, str):
+            engine.is_overwhelmed = raw_overwhelmed.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            engine.is_overwhelmed = bool(raw_overwhelmed)
+        try:
+            engine.overwhelm_ticks = max(0, int(data.get("overwhelm_ticks", 0)))
+            engine.consecutive_rejections = max(0, int(data.get("consecutive_rejections", 0)))
+            engine.total_violations = max(0, int(data.get("total_violations", 0)))
+        except (TypeError, ValueError):
+            pass
+
+        private = data.get("private_memories")
+        if isinstance(private, list):
+            engine.private_memories = {str(item) for item in private}
+        trusted = data.get("trusted_sources")
+        if isinstance(trusted, list):
+            engine.trusted_sources = {str(item) for item in trusted}
+        blocked = data.get("blocked_sources")
+        if isinstance(blocked, list):
+            engine.blocked_sources = {str(item) for item in blocked}
+
+        raw_violations = data.get("violations", [])
+        if isinstance(raw_violations, list):
+            for raw in raw_violations:
+                violation = BoundaryViolation.from_dict(raw)
+                if violation:
+                    engine.violations.append(violation)
+        # A legacy snapshot stored only a count; retain it when it is larger
+        # than the bounded in-memory deque.
+        engine.total_violations = max(engine.total_violations, len(engine.violations))
+        return engine

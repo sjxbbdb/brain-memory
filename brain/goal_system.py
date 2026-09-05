@@ -17,6 +17,7 @@ v5.0 有驱动力但没有目标——好奇、想成长、要一致，但从不
 """
 
 import logging
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -114,6 +115,14 @@ class Goal:
             "progress": self.progress,
             "status": self.status,
             "created_at": self.created_at,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "result_note": self.result_note,
+            "attempt_count": self.attempt_count,
+            "survival_gain": self.survival_gain,
+            "growth_gain": self.growth_gain,
+            "identity_gain": self.identity_gain,
+            "source_drive": self.source_drive,
             "urgency": round(self.urgency, 2),
         }
 
@@ -356,13 +365,17 @@ class GoalSystem:
         return {
             "active_goals": [g.to_dict() for g in self.get_active()],
             "recent_completed": [
-                {"description": g.description, "drive": g.drive, "completed_at": g.completed_at}
+                g.to_dict()
                 for g in self.get_recently_completed(5)
             ],
             "recent_failed": [
-                {"description": g.description, "drive": g.drive, "note": g.result_note}
+                g.to_dict()
                 for g in self.get_recently_failed(3)
             ],
+            "history": [g.to_dict() for g in self._history[-20:]],
+            "max_active": self.max_active,
+            "default_deadline_ticks": self.default_deadline_ticks,
+            "last_generation_tick": self.last_generation_tick,
             "stats": {
                 "active": self.active_count,
                 "pending": self.pending_count,
@@ -377,26 +390,84 @@ class GoalSystem:
 
     @classmethod
     def from_snapshot(cls, data: dict) -> "GoalSystem":
-        gs = cls()
-        if not data:
-            return gs
+        if not isinstance(data, dict):
+            return cls()
+
+        def _safe_int(value, default=0):
+            try:
+                return int(value)
+            except (TypeError, ValueError, OverflowError):
+                return default
+
+        def _safe_float(value, default=0.0):
+            try:
+                result = float(value)
+                return result if math.isfinite(result) else default
+            except (TypeError, ValueError, OverflowError):
+                return default
+
+        gs = cls(
+            max_active=min(100, max(1, _safe_int(data.get("max_active", 3), 3))),
+            default_deadline_ticks=max(0, _safe_int(data.get("default_deadline_ticks", 150), 150)),
+        )
         # 恢复活跃目标
-        for gd in data.get("active_goals", []):
-            goal = Goal(
-                id=gd.get("id", ""),
-                drive=gd.get("drive", "curiosity"),
-                description=gd.get("description", ""),
-                priority=gd.get("priority", 0.5),
-                deadline_ticks=gd.get("deadline_ticks", 150),
-                elapsed_ticks=gd.get("elapsed_ticks", 0),
-                progress=gd.get("progress", 0.0),
-                status=gd.get("status", GoalStatus.PENDING),
-                created_at=gd.get("created_at", ""),
+        def _goal_from_dict(gd: dict) -> Goal:
+            def _text(value, default=""):
+                return default if value is None else str(value)
+
+            return Goal(
+                id=_text(gd.get("id", "")),
+                drive=_text(gd.get("drive", "curiosity"), "curiosity"),
+                description=_text(gd.get("description", "")),
+                priority=_safe_float(gd.get("priority", 0.5), 0.5),
+                deadline_ticks=max(0, _safe_int(gd.get("deadline_ticks", 150), 150)),
+                elapsed_ticks=max(0, _safe_int(gd.get("elapsed_ticks", 0), 0)),
+                progress=min(1.0, max(0.0, _safe_float(gd.get("progress", 0.0)))),
+                status=_text(gd.get("status", GoalStatus.PENDING), GoalStatus.PENDING),
+                created_at=_text(gd.get("created_at", "")),
+                started_at=_text(gd.get("started_at", "")),
+                completed_at=_text(gd.get("completed_at", "")),
+                result_note=_text(gd.get("result_note", gd.get("note", ""))),
+                attempt_count=max(0, _safe_int(gd.get("attempt_count", 0), 0)),
+                survival_gain=_safe_float(gd.get("survival_gain", 0.0)),
+                growth_gain=_safe_float(gd.get("growth_gain", 0.0)),
+                identity_gain=_safe_float(gd.get("identity_gain", 0.0)),
+                source_drive=_text(gd.get("source_drive", "")),
             )
-            gs._goals.append(goal)
-        gs.total_generated = data.get("stats", {}).get("total_generated", 0)
-        gs.total_completed = data.get("stats", {}).get("total_completed", 0)
-        gs.total_failed = data.get("stats", {}).get("total_failed", 0)
+
+        active_goals = data.get("active_goals", [])
+        if not isinstance(active_goals, list):
+            active_goals = []
+        for gd in active_goals:
+            if isinstance(gd, dict):
+                gs._goals.append(_goal_from_dict(gd))
+
+        history = data.get("history", [])
+        if not isinstance(history, list):
+            history = []
+        if not history:
+            # v1 snapshots had only short completed/failed projections.
+            recent_completed = data.get("recent_completed", [])
+            recent_failed = data.get("recent_failed", [])
+            history = (
+                (recent_completed if isinstance(recent_completed, list) else [])
+                + (recent_failed if isinstance(recent_failed, list) else [])
+            )
+        gs._history = [
+            _goal_from_dict(gd) for gd in history if isinstance(gd, dict)
+        ][-gs._max_history:]
+        stats = data.get("stats", {})
+        if not isinstance(stats, dict):
+            stats = {}
+        def _nonnegative_int(value, default=0):
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError, OverflowError):
+                return default
+        gs.total_generated = _nonnegative_int(stats.get("total_generated", 0))
+        gs.total_completed = _nonnegative_int(stats.get("total_completed", 0))
+        gs.total_failed = _nonnegative_int(stats.get("total_failed", 0))
+        gs.last_generation_tick = _nonnegative_int(data.get("last_generation_tick", 0))
         return gs
 
     # ── 自我叙事反馈 ──

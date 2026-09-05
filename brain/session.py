@@ -13,6 +13,7 @@ Shared across all sessions:
 """
 
 from dataclasses import dataclass, field
+import math
 from brain.working_memory import WorkingMemory
 
 
@@ -74,15 +75,19 @@ class SessionManager:
                 "inner_monologue": s.inner_monologue[:200],
                 "current_context": s.current_context[:300],
                 "last_active": s.last_active,
+                "working_memory": s.working_memory.snapshot(),
             }
 
         return {
             "sources": {
                 k: {
                     "emotion": v.current_emotion,
+                    "emotion_vector": dict(v.emotion_vector),
                     "focus": v.focus_entity,
                     "monologue": v.inner_monologue[:100],
+                    "context": v.current_context[:200],
                     "last_active": v.last_active,
+                    "working_memory": v.working_memory.snapshot(),
                 }
                 for k, v in self.sessions.items()
             },
@@ -95,6 +100,8 @@ class SessionManager:
         return {
             "active_sources": list(self.sessions.keys()),
             "count": len(self.sessions),
+            "max_sessions": self.max_sessions,
+            "default_source": self.default_source,
             "sessions": {
                 k: {
                     "emotion": v.current_emotion,
@@ -103,7 +110,61 @@ class SessionManager:
                     "monologue": v.inner_monologue[:100],
                     "context": v.current_context[:200],
                     "last_active": v.last_active,
+                    "working_memory": v.working_memory.snapshot(),
                 }
                 for k, v in self.sessions.items()
             },
         }
+
+    @classmethod
+    def from_snapshot(cls, data: dict | None) -> "SessionManager":
+        """Restore per-source context from a full or legacy snapshot."""
+        manager = cls()
+        if not isinstance(data, dict):
+            return manager
+
+        try:
+            manager.max_sessions = min(
+                1000,
+                max(1, int(data.get("max_sessions", manager.max_sessions))),
+            )
+        except (TypeError, ValueError):
+            pass
+        if data.get("default_source"):
+            manager.default_source = str(data["default_source"])
+
+        sessions = data.get("sessions", data.get("sources", {}))
+        if not isinstance(sessions, dict):
+            return manager
+
+        for source, raw in list(sessions.items())[: manager.max_sessions]:
+            if not isinstance(raw, dict):
+                continue
+            source_id = str(source)[:200] or manager.default_source
+            session = SessionState(source=source_id)
+            session.current_emotion = str(raw.get("emotion", raw.get("current_emotion", "neutral")))
+            vector = raw.get("emotion_vector", {})
+            if isinstance(vector, dict):
+                for key, value in vector.items():
+                    try:
+                        number = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(number):
+                        session.emotion_vector[str(key)] = number
+            focus = raw.get("focus", raw.get("focus_entity"))
+            session.focus_entity = str(focus)[:200] if focus is not None else None
+            session.inner_monologue = str(raw.get("monologue", raw.get("inner_monologue", "")))[:500]
+            session.current_context = str(raw.get("context", raw.get("current_context", "")))[:1000]
+            session.last_active = str(raw.get("last_active", ""))
+            raw_wm = raw.get("working_memory", {})
+            if not isinstance(raw_wm, dict) or not raw_wm.get("items"):
+                # Legacy snapshots stored only the compact context string.
+                raw_wm = {
+                    "items": raw_wm.get("items", []) if isinstance(raw_wm, dict) else [],
+                    "context_text": session.current_context,
+                }
+            session.working_memory = WorkingMemory.from_snapshot(raw_wm)
+            manager.sessions[source_id] = session
+
+        return manager

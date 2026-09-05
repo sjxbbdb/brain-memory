@@ -59,8 +59,26 @@ class Expectation:
             "arousal": self.expected_arousal,
             "interval_sec": round(self.expected_input_interval_sec, 1),
             "source": self.expected_source,
+            "generated_at": self.generated_at,
+            "based_on_ticks": self.based_on_ticks,
             "confidence": round(self.confidence, 3),
         }
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> Optional["Expectation"]:
+        if not isinstance(data, dict):
+            return None
+        return cls(
+            expected_topics=list(data.get("topics", [])),
+            expected_entities=list(data.get("entities", [])),
+            expected_valence=float(data.get("valence", 0.5)),
+            expected_arousal=float(data.get("arousal", 0.5)),
+            expected_input_interval_sec=float(data.get("interval_sec", 120.0)),
+            expected_source=data.get("source"),
+            generated_at=str(data.get("generated_at", "")),
+            based_on_ticks=int(data.get("based_on_ticks", 0)),
+            confidence=float(data.get("confidence", 0.5)),
+        )
 
 
 @dataclass
@@ -90,6 +108,26 @@ class PredictionError:
             "is_shocking": self.is_shocking,
             "surprise_type": self.surprise_type,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> Optional["PredictionError"]:
+        if not isinstance(data, dict):
+            return None
+        components = data.get("components", {})
+        if not isinstance(components, dict):
+            components = {}
+        return cls(
+            total_error=float(data.get("total", 0.0)),
+            components={str(k): float(v) for k, v in components.items()},
+            content_error=float(components.get("content", 0.0)),
+            entity_error=float(components.get("entity", 0.0)),
+            emotion_error=float(components.get("emotion", 0.0)),
+            timing_error=float(components.get("timing", 0.0)),
+            source_error=float(components.get("source", 0.0)),
+            is_surprising=bool(data.get("is_surprising", False)),
+            is_shocking=bool(data.get("is_shocking", False)),
+            surprise_type=str(data.get("surprise_type", "none")),
+        )
 
 
 # ══════════════════════════════════════════════
@@ -237,6 +275,53 @@ class ExpectationBuilder:
         ]
         found = [kw for kw in keywords if kw in text.lower()]
         return ":".join(found[:2]) if found else "general"
+
+    def snapshot(self) -> dict:
+        return {
+            "history": list(self.history),
+            "topic_transitions": self.topic_transitions,
+            "source_patterns": self.source_patterns,
+            "emotion_trajectory": [list(item) for item in self.emotion_trajectory],
+            "total_observations": self.total_observations,
+        }
+
+    @classmethod
+    def from_snapshot(cls, data: dict | None) -> "ExpectationBuilder":
+        builder = cls(history_size=30)
+        if not isinstance(data, dict):
+            return builder
+        history = data.get("history", [])
+        if isinstance(history, list):
+            builder.history.extend(item for item in history if isinstance(item, dict))
+        transitions = data.get("topic_transitions", {})
+        if isinstance(transitions, dict):
+            builder.topic_transitions = {
+                str(topic): {
+                    str(next_topic): int(count)
+                    for next_topic, count in values.items()
+                    if isinstance(values, dict) and isinstance(count, (int, float))
+                }
+                for topic, values in transitions.items()
+                if isinstance(values, dict)
+            }
+        patterns = data.get("source_patterns", {})
+        if isinstance(patterns, dict):
+            builder.source_patterns = {
+                str(source): [float(v) for v in values if isinstance(v, (int, float))]
+                for source, values in patterns.items()
+                if isinstance(values, list)
+            }
+        trajectory = data.get("emotion_trajectory", [])
+        if isinstance(trajectory, list):
+            builder.emotion_trajectory.extend(
+                (float(item[0]), float(item[1]))
+                for item in trajectory
+                if isinstance(item, (list, tuple)) and len(item) >= 2
+            )
+        builder.total_observations = int(
+            data.get("total_observations", len(builder.history))
+        )
+        return builder
 
 
 # ══════════════════════════════════════════════
@@ -453,6 +538,20 @@ class SurpriseHandler:
             "recent": list(self.recent_surprises)[-5:],
         }
 
+    @classmethod
+    def from_snapshot(cls, data: dict | None) -> "SurpriseHandler":
+        handler = cls()
+        if not isinstance(data, dict):
+            return handler
+        handler.total_surprises = int(data.get("total_surprises", 0))
+        handler.total_shocks = int(data.get("total_shocks", 0))
+        recent = data.get("recent", [])
+        if isinstance(recent, list):
+            handler.recent_surprises.extend(
+                item for item in recent if isinstance(item, dict)
+            )
+        return handler
+
 
 # ══════════════════════════════════════════════
 # PredictiveLayer — 顶层封装
@@ -548,6 +647,8 @@ class PredictiveLayer:
     def snapshot(self) -> dict:
         return {
             "enabled": self.enabled,
+            "builder": self.builder.snapshot(),
+            # Keep the old scalar for consumers written against v9 snapshots.
             "builder_observations": self.builder.total_observations,
             "last_expectation": self.last_expectation.to_dict()
             if self.last_expectation
@@ -555,3 +656,19 @@ class PredictiveLayer:
             "last_error": self.last_error.to_dict() if self.last_error else None,
             "handler": self.handler.snapshot(),
         }
+
+    @classmethod
+    def from_snapshot(cls, data: dict | None) -> "PredictiveLayer":
+        layer = cls()
+        if not isinstance(data, dict):
+            return layer
+        layer.enabled = bool(data.get("enabled", True))
+        builder_data = data.get("builder")
+        if isinstance(builder_data, dict):
+            layer.builder = ExpectationBuilder.from_snapshot(builder_data)
+        else:
+            layer.builder.total_observations = int(data.get("builder_observations", 0))
+        layer.last_expectation = Expectation.from_dict(data.get("last_expectation"))
+        layer.last_error = PredictionError.from_dict(data.get("last_error"))
+        layer.handler = SurpriseHandler.from_snapshot(data.get("handler", {}))
+        return layer

@@ -223,6 +223,23 @@ class DriveEngine:
                             if v > 0},
         }
 
+    @classmethod
+    def from_snapshot(cls, data: dict | None) -> "DriveEngine":
+        """Restore the drive-engine bookkeeping from a brain snapshot."""
+        engine = cls()
+        if not isinstance(data, dict):
+            return engine
+        engine.total_signals_emitted = int(data.get("total_signals_emitted", 0))
+        engine.total_goals_generated = int(data.get("total_goals_generated", 0))
+        engine._ticks_since_last_completion = int(data.get("ticks_since_completion", 0))
+        last_signals = data.get("last_signals", {})
+        if isinstance(last_signals, dict):
+            engine._last_signal_ticks = {
+                str(k): int(v) for k, v in last_signals.items()
+                if isinstance(v, (int, float))
+            }
+        return engine
+
 
 # ══════════════════════════════════════════════
 # GoalGenerator — 驱动力 → 目标

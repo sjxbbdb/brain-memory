@@ -1,4 +1,4 @@
-"""Brain Memory v5.0 API — FastAPI + WebSocket.
+"""Brain Memory v10.0 API — FastAPI + WebSocket.
 
 REST:
   GET  /api/v4/state        — 当前脑状态
@@ -13,12 +13,13 @@ WebSocket:
 import asyncio
 import json
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Ensure brain-memory-v5.4 is on the path
+# Ensure the brain-memory project root is on the path when launched as a module.
 _sys_path_root = Path(__file__).parent.parent
 if str(_sys_path_root) not in sys.path:
     sys.path.insert(0, str(_sys_path_root))
@@ -29,17 +30,57 @@ from pydantic import BaseModel, Field
 
 from brain.core import Brain
 from brain.core_purpose import core_purpose  # V8
+from agent.tool_registry import discover_tools
 from config import HOST, PORT
 
 logger = logging.getLogger("brain-v5.api")
 
 # ── Global brain instance ──
 _brain: Brain | None = None
+_API_RESERVED_SOURCES = {"creator", "self"}
+_API_REQUESTOR = "api"
 
 
 def get_brain() -> Brain:
     assert _brain is not None, "Brain not initialized"
     return _brain
+
+
+def _sanitize_api_source(source: str) -> str:
+    """Keep request-body labels from granting trusted in-process identity.
+
+    ``creator`` and ``self`` are meaningful only to trusted in-process
+    callers.  The HTTP body is untrusted—even on localhost—so a client cannot
+    claim either label and bypass the self-boundary.  Session labels for
+    ordinary callers are retained for isolation.
+    """
+    normalized = str(source or "external").strip()[:200] or "external"
+    if (
+        normalized in _API_RESERVED_SOURCES
+        or normalized in {"internal", "none"}
+        or normalized.startswith("agent/")
+    ):
+        return "external"
+    return normalized
+
+
+def _shareable_memories(brain: Brain, memories: list[dict]) -> list[dict]:
+    """Apply the memory boundary to every HTTP memory response."""
+    boundary = brain.brain_stem.boundary
+    if boundary is None:
+        return memories
+    return [
+        memory for memory in memories
+        if isinstance(memory, dict)
+        and boundary.should_share_memory(str(memory.get("id", "")), _API_REQUESTOR)
+    ]
+
+
+def _bounded_limit(value: int, default: int = 20, maximum: int = 100) -> int:
+    try:
+        return max(1, min(maximum, int(value)))
+    except (TypeError, ValueError):
+        return default
 
 
 # ── Lifecycle ──
@@ -48,18 +89,40 @@ def get_brain() -> Brain:
 async def lifespan(app: FastAPI):
     global _brain
     _brain = Brain()
+    broadcaster = None
+    try:
+        # Registration is safe at startup; actual execution remains behind the
+        # explicit AgentBridge boundary.  A broken optional module should not
+        # prevent the core heartbeat from coming up.
+        try:
+            discovered_tools = discover_tools()
+        except Exception as exc:
+            discovered_tools = []
+            logger.warning("tool discovery failed: %s", str(exc)[:120])
 
-    # Start background state broadcaster
-    broadcaster = asyncio.create_task(_broadcast_loop())
-
-    await _brain.wake_up()
-    logger.info("Brain v5.0 API started")
-
-    yield
-
-    await _brain.sleep()
-    broadcaster.cancel()
-    logger.info("Brain v5.0 API stopped")
+        await _brain.wake_up()
+        # Start broadcasting only after the heartbeat is live.  Otherwise a
+        # startup failure leaves an orphan background task behind.
+        broadcaster = asyncio.create_task(_broadcast_loop())
+        logger.info("Brain v10.0 API started (tools=%s)", discovered_tools)
+        yield
+    finally:
+        if broadcaster is not None:
+            broadcaster.cancel()
+            try:
+                await broadcaster
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.warning("state broadcaster stopped with an error: %s", str(exc)[:120])
+        if _brain is not None:
+            try:
+                await _brain.sleep()
+            except Exception as exc:
+                # Shutdown should remain best-effort even when a storage
+                # handle or optional subsystem failed during startup.
+                logger.warning("brain shutdown encountered an error: %s", str(exc)[:120])
+        logger.info("Brain v10.0 API stopped")
 
 
 async def _broadcast_loop():
@@ -73,11 +136,19 @@ async def _broadcast_loop():
 
 # ── App ──
 
-app = FastAPI(title="Brain Memory v6.0", version="6.0.0", lifespan=lifespan)
+app = FastAPI(title="Brain Memory v10.0", version="10.0.0", lifespan=lifespan)
+
+_cors_origins = [
+    origin.strip()
+    for origin in os.getenv("BRAIN_MEMORY_CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Same-origin dashboard access does not need CORS.  Operators who expose
+    # a separate frontend must opt in with a comma-separated allow-list.
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -86,9 +157,9 @@ app.add_middleware(
 # ── REST Endpoints ──
 
 class InputRequest(BaseModel):
-    text: str = Field(..., min_length=1, description="input text from calling agent")
-    source: str = Field("external", description="source identifier")
-    goal: str | None = Field(None, description="current goal")
+    text: str = Field(..., min_length=1, max_length=4000, description="input text from calling agent")
+    source: str = Field("external", min_length=1, max_length=200, description="source identifier")
+    goal: str | None = Field(None, max_length=500, description="current goal")
 
 
 @app.get("/api/v4/state")
@@ -106,7 +177,7 @@ async def post_input(req: InputRequest):
     brain = get_brain()
     result = await brain.process_input(
         text=req.text,
-        source=req.source,
+        source=_sanitize_api_source(req.source),
         goal=req.goal,
     )
     # 立即推送最新状态给所有 WebSocket 客户端
@@ -130,7 +201,7 @@ async def get_monologue():
 async def get_identity_memories(limit: int = 20):
     """Get memories that shaped the brain's identity."""
     brain = get_brain()
-    memories = await brain.get_identity_memories(limit)
+    memories = _shareable_memories(brain, await brain.get_identity_memories(_bounded_limit(limit)))
     return {
         "count": len(memories),
         "memories": [
@@ -155,7 +226,7 @@ async def get_memory_timeline(limit: int = 20):
     brain = get_brain()
     from storage.database import MemoryStore
     ms = brain.memory_store
-    recent = ms.search("", limit=limit)
+    recent = _shareable_memories(brain, ms.search("", limit=_bounded_limit(limit)))
     return {
         "count": len(recent),
         "memories": [
@@ -178,7 +249,7 @@ async def search_memories(q: str = "", limit: int = 20):
     """Search memories by keyword query."""
     brain = get_brain()
     ms = brain.memory_store
-    results = ms.search(q, limit=limit)
+    results = _shareable_memories(brain, ms.search(q[:4000], limit=_bounded_limit(limit)))
     return {
         "query": q,
         "count": len(results),
@@ -242,17 +313,29 @@ async def get_self():
 async def health():
     brain = get_brain()
     state = await brain.get_state()
+    loop_task = brain.brain_stem._task
+    loop_running = bool(loop_task and not loop_task.done())
     return {
-        "status": "awake" if brain.is_awake else "asleep",
-        "version": "5.4.0",
+        "status": (
+            "awake" if brain.is_awake and loop_running
+            else "degraded" if brain.is_awake
+            else "asleep"
+        ),
+        "version": "10.0.0",
+        "loop_running": loop_running,
         "total_ticks": state.get("total_ticks", 0),
         "uptime_seconds": state.get("uptime_seconds", 0.0),
         "emotion": state.get("current_emotion", "neutral"),
         "focus": state.get("focus_entity"),
         "memory_count": brain.memory_store.count(),
-        "identity_memory_count": len(brain.memory_store.get_identity_memories(100)),
+        "identity_memory_count": len(
+            _shareable_memories(brain, brain.memory_store.get_identity_memories(100))
+        ),
         "llm_error_count": state.get("llm_error_count", 0),
         "last_error": state.get("last_error", ""),
+        "loop_error_count": state.get("loop_error_count", 0),
+        "last_loop_error": state.get("last_loop_error", ""),
+        "last_heartbeat_at": state.get("last_heartbeat_at", ""),
         "active_sessions": brain.brain_stem.state.session_manager.get_session_count(),
         "sleep_state": brain.brain_stem.sleep_state,
     }

@@ -37,32 +37,41 @@ class Thalamus:
         self.noise_discarded: int = 0
         self.total_relayed: int = 0
 
-    def relay(self, input_text: str | None, inner_signal: str | None = None) -> dict:
+    def relay(
+        self,
+        input_text: str | None,
+        inner_signal: str | None = None,
+        source: str = "external",
+    ) -> dict:
         """Relay input through attention filter.
 
         Args:
             input_text: external agent message (None if no external input)
             inner_signal: internal signal from default mode (None if no internal)
+            source: original source of the external input.  It is preserved so
+                boundary and session policy can distinguish creator/user/tool
+                traffic instead of collapsing everything to ``external``.
 
         Returns:
             {
                 "has_input": bool,
                 "text": str,           # 过滤后的归一化文本
-                "source": "external"|"internal",
+                "source": original source (or "internal"/"none"),
                 "priority": "high"|"normal"|"low",
                 "discarded": bool,
             }
         """
         # Merge external + internal signals
+        external_source = str(source or "external")
         if input_text and inner_signal:
             text = "{0}\n[internal: {1}]".format(input_text, inner_signal)
-            source = "external"
+            relay_source = external_source
         elif input_text:
             text = input_text
-            source = "external"
+            relay_source = external_source
         elif inner_signal:
             text = inner_signal
-            source = "internal"
+            relay_source = "internal"
         else:
             return {
                 "has_input": False, "text": "", "source": "none",
@@ -77,7 +86,7 @@ class Thalamus:
                 self.noise_discarded += 1
                 logger.debug("thalamus: noise discarded: %s", text[:40])
                 return {
-                    "has_input": False, "text": "", "source": source,
+                    "has_input": False, "text": "", "source": relay_source,
                     "priority": "low", "discarded": True,
                 }
 
@@ -92,7 +101,7 @@ class Thalamus:
         return {
             "has_input": True,
             "text": text[:4000],
-            "source": source,
+            "source": relay_source,
             "priority": priority,
             "discarded": False,
         }

@@ -13,10 +13,12 @@
 """
 
 import asyncio
+import inspect
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from brain.thalamus import Thalamus
 from brain.amygdala import Amygdala
@@ -28,7 +30,7 @@ from brain.cingulate import Cingulate
 from brain.dream import DreamEngine
 from brain.pipeline import gate_check, compute_emotion_weight, compute_strength, compress_clusters, run_consolidation, format_context_block
 from brain.working_memory import WorkingMemory
-from brain.brain_state import BrainState
+from brain.brain_state import BrainState, SNAPSHOT_SCHEMA_VERSION
 from brain.self_model import SelfModel
 from brain.intent import Intent, IntentQueue
 from brain.goal_system import GoalSystem
@@ -107,9 +109,21 @@ class BrainStem:
 
         # Loop control
         self._stop_event = asyncio.Event()
+        self._lifecycle_lock = asyncio.Lock()
+        self._bound_loop = None
         self._task: asyncio.Task | None = None
+        self._has_started = False
+        # Inputs may be buffered before the first ``start()`` (useful for
+        # embedded callers), but once a running instance is stopped we reject
+        # new input until the next explicit start.  This prevents a shutdown
+        # race from leaving work that unexpectedly executes after restart.
+        self._accepting_input = True
         self._pending_input: asyncio.Queue = asyncio.Queue(maxsize=50)
         self._input_processed = asyncio.Event()
+        self._input_waiters: dict[str, asyncio.Future] = {}
+        self._input_sources: dict[str, str] = {}
+        self._active_input_id: str | None = None
+        self._restored_uptime_seconds: float = 0.0
 
         # Output feed — external agents consume this
         self._output_feed: asyncio.Queue = asyncio.Queue(maxsize=100)
@@ -164,49 +178,322 @@ class BrainStem:
 
     # ── Public API ──
 
+    @staticmethod
+    def _transfer_queue(queue: asyncio.Queue) -> asyncio.Queue:
+        """Copy buffered items into a queue owned by the current loop."""
+        # A blocked reader/writer belongs to the old loop.  Replacing the
+        # queue underneath it would strand that task forever, which is worse
+        # than rejecting an unsafe cross-loop migration explicitly.
+        active_getters = [
+            waiter for waiter in (getattr(queue, "_getters", ()) or ())
+            if not waiter.done()
+        ]
+        active_putters = [
+            waiter for waiter in (getattr(queue, "_putters", ()) or ())
+            if not waiter.done()
+        ]
+        if active_getters or active_putters:
+            raise RuntimeError(
+                "cannot move brain queue while a reader or writer is waiting; "
+                "finish the owning event loop first"
+            )
+        replacement = asyncio.Queue(maxsize=queue.maxsize)
+        while True:
+            try:
+                replacement.put_nowait(queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+            except asyncio.QueueFull:
+                break
+        return replacement
+
+    def _ensure_loop_primitives(self):
+        """Rebind asyncio primitives when an embedded caller changes loops."""
+        current = asyncio.get_running_loop()
+        if self._bound_loop is current:
+            # AgentBridge may have been started before the stem on this loop,
+            # or may have moved an idle queue during a sequential restart.
+            # Validate the shared queue even when the stem itself is already
+            # bound so cross-loop ownership cannot remain implicit.
+            if getattr(self.intent_queue, "_bound_loop", None) is not current:
+                self.intent_queue.rebind_loop()
+            return
+        if self._bound_loop is None:
+            # Objects are often constructed before an event loop exists.  The
+            # primitives above are still unbound at that point, so simply
+            # claim them for the first running loop.  In particular, preserve
+            # a request future submitted before ``start()``; replacing the
+            # maps here would silently cancel that caller's completion path.
+            self.intent_queue.rebind_loop()
+            self._bound_loop = current
+            return
+        lifecycle_lock = self._lifecycle_lock
+        if lifecycle_lock.locked() or any(
+            not waiter.done()
+            for waiter in (getattr(lifecycle_lock, "_waiters", ()) or ())
+        ):
+            # A stop/start transition may have cleared ``_task`` before its
+            # awaitable finished.  The lock is the authoritative ownership
+            # marker in that window; do not replace it from another loop.
+            raise RuntimeError(
+                "brain-stem lifecycle transition is still running on another event loop"
+            )
+        if self._task and not self._task.done():
+            # A live heartbeat must never be moved underneath itself.
+            raise RuntimeError("brain-stem cannot change event loops while running")
+
+        # Futures belong to the old loop and cannot safely be completed from a
+        # new one.  They represent calls that outlived that loop, so cancel
+        # them and let their callers observe cancellation rather than leak.
+        for future in self._input_waiters.values():
+            if not future.done():
+                future.cancel()
+        self._input_waiters.clear()
+        self._input_sources.clear()
+
+        self._stop_event = asyncio.Event()
+        self._input_processed = asyncio.Event()
+        self._pending_input = self._transfer_queue(self._pending_input)
+        self._output_feed = self._transfer_queue(self._output_feed)
+        self.intent_queue.rebind_loop()
+        self._lifecycle_lock = asyncio.Lock()
+        self._bound_loop = current
+
     async def start(self):
+        """Start the consciousness loop, serializing lifecycle transitions."""
+        self._ensure_loop_primitives()
+        async with self._lifecycle_lock:
+            await self._start_unlocked()
+
+    async def _start_unlocked(self):
         """Start the consciousness loop."""
+        if self._task and not self._task.done():
+            return
+        self._task = None
+
         logger.info("brain-stem: consciousness loop starting")
         self._stop_event.clear()
-        self._task = asyncio.create_task(self._loop())
+        self._accepting_input = True
+        self._has_started = True
         self.start_time = datetime.now(timezone.utc)
 
-        # Restore state if available
+        # Restore state before starting the loop.  Starting the task first
+        # allowed a tick to race with state replacement and lose continuity.
         if self.state_store:
-            restored = self.state_store.load_latest()
+            try:
+                restored = self.state_store.load_latest()
+            except Exception as exc:
+                restored = None
+                self._record_loop_error("state_restore", exc)
             if restored:
-                self.state = BrainState.from_snapshot(restored)
-                logger.info("brain-stem: state restored from snapshot")
+                try:
+                    self._restore_snapshot(restored)
+                    logger.info("brain-stem: state restored from snapshot")
+                except Exception as exc:
+                    # A corrupt/old snapshot must not prevent a fresh
+                    # heartbeat from starting.  The in-memory defaults remain
+                    # usable and the failure is visible in health state.
+                    self._record_loop_error("state_restore", exc)
+                    logger.warning("brain-stem: ignoring invalid snapshot: %s", str(exc)[:120])
+
+        self.state.awake = True
+        self._restored_uptime_seconds = max(0.0, float(self.state.uptime_seconds or 0.0))
+        # ``wake_up`` means the process is available, but preserve the
+        # recovered sleep phase so the next tick can make the same decision.
+        if self.sleep_state not in {"awake", "drowsy", "light_sleep", "deep_sleep"}:
+            self.sleep_state = "awake"
+        self.state.sleep_state = self.sleep_state
+        self._task = asyncio.create_task(self._loop())
+        self._task.add_done_callback(self._on_loop_done)
 
     async def stop(self):
+        """Stop the consciousness loop, serializing lifecycle transitions."""
+        self._ensure_loop_primitives()
+        async with self._lifecycle_lock:
+            await self._stop_unlocked()
+
+    async def _stop_unlocked(self):
         """Stop the consciousness loop."""
         logger.info("brain-stem: stopping consciousness loop")
+        # Close the admission gate before cancelling the task.  Callers that
+        # race with shutdown then receive an immediate, correlated failure
+        # instead of enqueueing work that could survive into the next start.
+        self._accepting_input = False
         self._stop_event.set()
-        if self._task:
-            self._task.cancel()
+        task = self._task
+        self._task = None
+        if task:
+            task.cancel()
             try:
-                await self._task
+                await task
             except asyncio.CancelledError:
                 pass
+            except Exception as exc:
+                # A failed background task must not make shutdown fail too.
+                self._record_loop_error("loop_shutdown", exc)
+
+        self._discard_pending_inputs("brain stopped")
+        self._fail_all_waiters("brain stopped")
+        self.state.awake = False
 
         # Final snapshot
-        await self._snapshot_state()
+        try:
+            await self._snapshot_state()
+        except Exception as exc:
+            self._record_loop_error("final_snapshot", exc)
+
+    def _on_loop_done(self, task: asyncio.Task):
+        """Fail pending callers if the heartbeat exits unexpectedly."""
+        # A completed task's callback can run just after an explicit restart.
+        # Never let an old callback mark the newly-created heartbeat as dead.
+        if self._task is not None and self._task is not task:
+            return
+        if task.cancelled() or self._stop_event.is_set():
+            return
+        try:
+            error = task.exception()
+        except Exception as exc:
+            error = exc
+        if error is None:
+            error = "heartbeat exited without a stop request"
+        self._record_loop_error("loop_exit", error)
+        self._accepting_input = False
+        self._discard_pending_inputs("brain loop stopped unexpectedly")
+        self._fail_all_waiters("brain loop stopped unexpectedly")
+        self.state.awake = False
+
+    def _fail_all_waiters(self, error: str):
+        """Resolve every outstanding input future with its own correlation ID."""
+        self._fail_active_input(error)
+        for request_id, future in list(self._input_waiters.items()):
+            if not future.done():
+                source = self._input_sources.get(request_id, "external")
+                future.set_result(self._build_input_result(
+                    source=source,
+                    pending=False,
+                    request_id=request_id,
+                    error=error,
+                ))
+            self._input_waiters.pop(request_id, None)
+            self._input_sources.pop(request_id, None)
+
+    def _discard_pending_inputs(self, error: str) -> int:
+        """Drop queued requests during shutdown and resolve their futures.
+
+        A request that has not reached ``_tick`` must never be replayed after
+        restart.  Tracked callers still receive a normal structured result so
+        they do not hang waiting for a future that can no longer complete.
+        """
+        discarded = 0
+        while True:
+            try:
+                input_data = self._pending_input.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            discarded += 1
+            request_id = input_data.get("request_id") if isinstance(input_data, dict) else None
+            if not request_id:
+                continue
+            future = self._input_waiters.pop(request_id, None)
+            source = self._input_sources.pop(
+                request_id,
+                input_data.get("source", "external") if isinstance(input_data, dict) else "external",
+            )
+            if future and not future.done():
+                future.set_result(self._build_input_result(
+                    source=source,
+                    pending=False,
+                    request_id=request_id,
+                    error=error,
+                ))
+        if discarded:
+            logger.info("brain-stem: discarded %d queued input(s) during shutdown", discarded)
+        return discarded
 
     async def receive_input(self, text: str, source: str = "external", goal: str | None = None):
         """Receive input from an external agent. Pushes to input queue."""
+        self._ensure_loop_primitives()
+        # This legacy one-way API does not need a completion future.  Avoid
+        # retaining an unobserved waiter when a caller only wants to enqueue.
+        request_id, _ = self.submit_input(
+            text=text,
+            source=source,
+            goal=goal,
+            track=False,
+            _raise_on_reject=True,
+        )
+        logger.debug("brain-stem: input queued from %s (id=%s)", source, request_id)
+        return request_id
+
+    def submit_input(
+        self,
+        text: str,
+        source: str = "external",
+        goal: str | None = None,
+        track: bool = True,
+        _raise_on_reject: bool = False,
+    ) -> tuple[str, asyncio.Future | None]:
+        """Queue an input and return an isolated completion future.
+
+        Each caller gets its own correlation ID.  The old shared Event made
+        concurrent requests observe one another's result and could return a
+        stale intent after a timeout.
+        """
+        request_id = uuid.uuid4().hex
+        source = str(source or "external")[:200]
+        text = str(text or "")[:4000]
+        goal = str(goal)[:500] if goal is not None else None
+        future = None
+        # ``submit_input`` is also used by the legacy pre-start path.  A first
+        # request may be buffered before ``start()``, but after an instance has
+        # been started and stopped admission is closed until the next start.
+        running = self._task is not None and not self._task.done()
+        if self._has_started and (not running or self._stop_event.is_set()):
+            if _raise_on_reject:
+                raise RuntimeError("brain stopped")
+            if track:
+                self._ensure_loop_primitives()
+                future = asyncio.get_running_loop().create_future()
+                future.set_result(self._build_input_result(
+                    source=source,
+                    pending=False,
+                    request_id=request_id,
+                    error="brain stopped",
+                ))
+            return request_id, future
+        if track:
+            self._ensure_loop_primitives()
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            self._input_waiters[request_id] = future
+            self._input_sources[request_id] = source
+        item = {
+            "text": text,
+            "source": source,
+            "goal": goal,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if track:
+            item["request_id"] = request_id
         try:
-            await self._pending_input.put({
-                "text": text,
-                "source": source,
-                "goal": goal,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-            logger.debug("brain-stem: input queued from %s", source)
+            self._pending_input.put_nowait(item)
         except asyncio.QueueFull:
-            logger.warning("brain-stem: input queue full, dropping input")
+            self._input_waiters.pop(request_id, None)
+            self._input_sources.pop(request_id, None)
+            if _raise_on_reject:
+                raise RuntimeError("input queue full")
+            if future is not None:
+                future.set_result(self._build_input_result(
+                    source=source,
+                    pending=False,
+                    request_id=request_id,
+                    error="input queue full",
+                ))
+        return request_id, future
 
     async def get_output(self) -> dict | None:
         """Get the latest output event (non-blocking)."""
+        self._ensure_loop_primitives()
         try:
             return self._output_feed.get_nowait()
         except asyncio.QueueEmpty:
@@ -214,6 +501,7 @@ class BrainStem:
 
     async def get_state(self) -> dict:
         """Get current brain state snapshot."""
+        self._ensure_loop_primitives()
         return self.state.snapshot()
 
     # ── Main Loop ──
@@ -227,45 +515,61 @@ class BrainStem:
 
             try:
                 await self._tick()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                logger.exception("brain-stem: tick error: %s", str(e)[:120])
+                self._record_loop_error("tick", e)
+                self._fail_active_input(str(e)[:200])
 
             self.state.total_ticks += 1
-            self.state.uptime_seconds = (datetime.now(timezone.utc) - self.start_time).total_seconds()
+            self.state.last_heartbeat_at = datetime.now(timezone.utc).isoformat()
+            self.state.uptime_seconds = self._restored_uptime_seconds + (
+                datetime.now(timezone.utc) - self.start_time
+            ).total_seconds()
 
             # Periodic tasks
-            now_ts = datetime.now(timezone.utc).timestamp()
+            try:
+                now_ts = datetime.now(timezone.utc).timestamp()
 
-            # Sleep-time dream + consolidation
-            if self.sleep_state != "awake" and DREAM_ENABLED:
-                if now_ts - self.last_dream_time >= DREAM_INTERVAL_SEC:
-                    self.last_dream_time = now_ts
-                    await self._dream_tick()
-                if now_ts - self.last_consolidation_time >= CONSOLIDATION_INTERVAL_SEC:
-                    self.last_consolidation_time = now_ts
-                    await self._consolidation_tick()
+                # Sleep-time dream + consolidation
+                if self.sleep_state != "awake" and DREAM_ENABLED:
+                    if now_ts - self.last_dream_time >= DREAM_INTERVAL_SEC:
+                        self.last_dream_time = now_ts
+                        await self._run_periodic("dream", self._dream_tick)
+                    if now_ts - self.last_consolidation_time >= CONSOLIDATION_INTERVAL_SEC:
+                        self.last_consolidation_time = now_ts
+                        await self._run_periodic("consolidation", self._consolidation_tick)
 
-            # Reflection (every REFLECTION_INTERVAL_SEC)
-            if now_ts - self.last_reflection >= REFLECTION_INTERVAL_SEC:
-                self.last_reflection = now_ts
-                await self._reflection_tick()
-                logger.debug("brain-stem: reflection tick")
+                # Reflection (every REFLECTION_INTERVAL_SEC)
+                if now_ts - self.last_reflection >= REFLECTION_INTERVAL_SEC:
+                    self.last_reflection = now_ts
+                    await self._run_periodic("reflection", self._reflection_tick)
+                    logger.debug("brain-stem: reflection tick")
 
-            # Memory decay (every MEMORY_DECAY_INTERVAL_TICKS ticks)
-            if self.state.total_ticks % MEMORY_DECAY_INTERVAL_TICKS == 0 and self.state.total_ticks > 0:
-                self.last_decay = now_ts
-                if self.memory_store:
-                    result = self.memory_store.decay_all(
-                        decay_rate=MEMORY_DECAY_RATE,
-                        archive_threshold=MEMORY_ARCHIVE_THRESHOLD,
-                    )
-                    if result.get("archived", 0) > 0:
-                        logger.info("brain-stem: archived %d decayed memories", result["archived"])
+                # Memory decay (every MEMORY_DECAY_INTERVAL_TICKS ticks)
+                if self.state.total_ticks % MEMORY_DECAY_INTERVAL_TICKS == 0 and self.state.total_ticks > 0:
+                    self.last_decay = now_ts
+                    if self.memory_store:
+                        def _decay():
+                            return self.memory_store.decay_all(
+                                decay_rate=MEMORY_DECAY_RATE,
+                                archive_threshold=MEMORY_ARCHIVE_THRESHOLD,
+                            )
 
-            # State snapshot (every STATE_SNAPSHOT_INTERVAL_SEC)
-            if now_ts - self.last_snapshot >= STATE_SNAPSHOT_INTERVAL_SEC:
-                self.last_snapshot = now_ts
-                await self._snapshot_state()
+                        result = await self._run_periodic("memory_decay", _decay)
+                        if isinstance(result, dict):
+                            self._last_archived_count = int(result.get("archived", 0) or 0)
+
+                # State snapshot (every STATE_SNAPSHOT_INTERVAL_SEC)
+                if now_ts - self.last_snapshot >= STATE_SNAPSHOT_INTERVAL_SEC:
+                    self.last_snapshot = now_ts
+                    await self._run_periodic("snapshot", self._snapshot_state)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # The maintenance scheduler itself is part of the heartbeat;
+                # protect it even if a future task is added without a wrapper.
+                self._record_loop_error("maintenance", exc)
 
             # Sleep until next tick
             elapsed = (datetime.now(timezone.utc) - tick_start).total_seconds()
@@ -278,12 +582,307 @@ class BrainStem:
 
         logger.info("brain-stem: loop stopped after %d ticks", self.state.total_ticks)
 
+    async def _run_periodic(
+        self,
+        name: str,
+        operation: Callable[[], Awaitable[Any] | Any],
+    ) -> Any:
+        """Run a maintenance task without taking down the heartbeat."""
+        try:
+            result = operation()
+            if inspect.isawaitable(result):
+                result = await result
+            if isinstance(result, dict) and result.get("archived", 0) > 0:
+                logger.info("brain-stem: archived %d decayed memories", result["archived"])
+            return result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._record_loop_error(name, exc)
+            return None
+
+    def _record_loop_error(self, phase: str, error: Exception | str):
+        message = f"{phase}: {str(error)[:300]}"
+        self.state.loop_error_count += 1
+        self.state.last_loop_error = message
+        self.state.recent_errors.append(message)
+        self.state.recent_errors = self.state.recent_errors[-20:]
+        if isinstance(error, Exception) and error.__traceback__ is not None:
+            logger.error(
+                "brain-stem: %s",
+                message,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        else:
+            logger.error("brain-stem: %s", message)
+
+    def _fail_active_input(self, error: str):
+        request_id = self._active_input_id
+        if not request_id:
+            return
+        future = self._input_waiters.pop(request_id, None)
+        source = self._input_sources.pop(request_id, self.state.last_input_source or "external")
+        if future and not future.done():
+            future.set_result(self._build_input_result(
+                source=source,
+                pending=False,
+                request_id=request_id,
+                error=error,
+            ))
+        self._active_input_id = None
+
+    def _complete_input_waiter(self, input_data: dict | None):
+        """Resolve exactly the future associated with ``input_data``."""
+        if not input_data:
+            self._active_input_id = None
+            return
+        request_id = input_data.get("request_id")
+        if request_id:
+            future = self._input_waiters.pop(request_id, None)
+            source = self._input_sources.pop(request_id, input_data.get("source", "external"))
+            if future and not future.done():
+                future.set_result(self._build_input_result(
+                    source=source,
+                    pending=False,
+                    request_id=request_id,
+                ))
+        self._active_input_id = None
+
+    def _build_input_result(
+        self,
+        source: str,
+        pending: bool,
+        request_id: str | None = None,
+        error: str | None = None,
+    ) -> dict:
+        """Build a stable response snapshot for one input request."""
+        st = self.state
+        sm = st.self_model
+        # A pending response is deliberately a neutral acknowledgement: it
+        # must not leak a different request's error or intent while the actor
+        # is still working.  For completed requests only expose state errors
+        # when the state belongs to this request.
+        request_matches = request_id is None or request_id == st.last_input_id
+        effective_error = None if pending else (
+            error if error is not None else (st.last_error if request_matches else "")
+        )
+
+        # Never expose an intent from a different request.  A pending or
+        # failed request has no response even if a prior intent exists.
+        intent = None if pending or error is not None else st.last_intent
+        # Keep completed responses type-stable for callers that render or
+        # slice the field even when the brain only produced a ``think`` intent.
+        # ``None`` remains reserved for a still-pending acknowledgement.
+        response_text = None if pending else ""
+        intent_type = None
+        if intent:
+            intent_type = intent.get("type")
+            if intent_type == "respond":
+                response_text = intent.get("response_text", "")
+            elif intent_type == "ask_question":
+                response_text = intent.get("question", "")
+
+        try:
+            memory_total = self.memory_store.count() if self.memory_store else 0
+            identity_total = (
+                len(self.memory_store.get_identity_memories(20))
+                if self.memory_store else 0
+            )
+        except Exception:
+            memory_total = identity_total = 0
+
+        try:
+            top_drives = [
+                {
+                    "name": d.get("name", ""),
+                    "label": d.get("label", ""),
+                    "weight": d.get("weight", 0.0),
+                }
+                for d in sm.get_top_drives(3)
+                if isinstance(d, dict)
+            ]
+        except Exception:
+            top_drives = []
+        return {
+            "accepted": False if pending or error is not None else (
+                st.last_input_accepted if request_matches else False
+            ),
+            "gated": False if pending else st.last_input_gated,
+            "llm_error": bool(effective_error),
+            "llm_error_message": effective_error[:200] if effective_error else None,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "response": response_text,
+            "intent_type": intent_type,
+            "focus": st.focus_entity,
+            "emotion": st.current_emotion,
+            "inner_monologue": (st.inner_monologue or "")[:200],
+            "working_memory": (st.current_context or "")[:300],
+            "memories": {
+                "total": memory_total,
+                "identity_forming": identity_total,
+            },
+            "self": {
+                "identity": str(sm.identity_anchor or "")[:200],
+                "traits": list(sm.identity_traits or []),
+                "top_drives": top_drives,
+                "mood": str(sm.mood_tendency or "balanced"),
+                "version": sm.identity_version,
+                "experiences": sm.total_experiences,
+                "last_reflection": str(sm.last_reflection or "")[:100],
+            },
+            "session": {
+                "source": source,
+                "active_sessions": st.session_manager.get_session_count(),
+            },
+            "request_id": request_id or st.last_input_id or None,
+            "pending": pending,
+        }
+
+    def _restore_snapshot(self, snapshot: dict) -> None:
+        """Restore the durable parts of the consciousness runtime.
+
+        Snapshots are an interoperability boundary: they may have been
+        written by an older release or be partially damaged after a power
+        loss.  The core state is decoded first, and each optional subsystem
+        is restored independently so one bad component cannot erase the rest
+        of the subject's continuity.
+        """
+        if not isinstance(snapshot, dict):
+            raise ValueError("snapshot must be an object")
+
+        version = snapshot.get("schema_version", 1)
+        if isinstance(version, (int, float)) and version > SNAPSHOT_SCHEMA_VERSION:
+            logger.warning(
+                "brain-stem: snapshot schema %s is newer than supported %s; best-effort restore",
+                version,
+                SNAPSHOT_SCHEMA_VERSION,
+            )
+
+        # BrainState has its own defensive decoder and is the source of truth
+        # for self-model, curiosity, activation, and per-source sessions.
+        self.state = BrainState.from_snapshot(snapshot)
+
+        raw_wm = snapshot.get("working_memory")
+        if isinstance(raw_wm, dict):
+            self.working_memory = WorkingMemory.from_snapshot(raw_wm)
+        elif self.state.active_thoughts:
+            # v1 snapshots exposed active thoughts as a bare list.
+            self.working_memory = WorkingMemory.from_snapshot({
+                "items": self.state.active_thoughts,
+                "context_text": self.state.current_context,
+            })
+        self.state.active_thoughts = [dict(item) for item in self.working_memory.items]
+        if not self.state.current_context:
+            self.state.current_context = self.working_memory.get_context()
+
+        valid_sleep_states = {"awake", "drowsy", "light_sleep", "deep_sleep"}
+        self.sleep_state = (
+            self.state.sleep_state
+            if self.state.sleep_state in valid_sleep_states
+            else "awake"
+        )
+
+        def _restore_component(attribute: str, key: str, decoder):
+            raw = snapshot.get(key)
+            if raw is None:
+                return
+            try:
+                restored = decoder(raw)
+                if restored is not None:
+                    setattr(self, attribute, restored)
+            except Exception as exc:
+                self._record_loop_error(f"restore_{key}", exc)
+                logger.warning("brain-stem: component restore skipped (%s): %s", key, str(exc)[:120])
+
+        _restore_component("goal_system", "goal_system", GoalSystem.from_snapshot)
+        _restore_component("metacognition", "metacognition", Metacognition.from_snapshot)
+        _restore_component("emotional_spectrum", "emotional_spectrum", EmotionalSpectrum.from_snapshot)
+        _restore_component("procedural_memory", "procedural_memory", ProceduralMemory.from_snapshot)
+        _restore_component("time_sense", "time_sense", TimeSense.from_snapshot)
+        _restore_component("exploration_queue", "exploration_queue", ExplorationQueue.from_snapshot)
+        _restore_component("reflection_engine", "reflection_engine", ReflectionEngine.from_snapshot)
+        _restore_component("drive_engine", "drive_engine", DriveEngine.from_snapshot)
+
+        raw_thalamus = snapshot.get("thalamus", {})
+        if isinstance(raw_thalamus, dict):
+            self.thalamus.last_input = str(raw_thalamus.get("last_input", ""))
+            try:
+                self.thalamus.noise_discarded = max(0, int(raw_thalamus.get("noise_discarded", 0)))
+                self.thalamus.total_relayed = max(0, int(raw_thalamus.get("total_relayed", 0)))
+            except (TypeError, ValueError):
+                pass
+        raw_amygdala = snapshot.get("amygdala", {})
+        if isinstance(raw_amygdala, dict):
+            for name in ("valence", "arousal", "dominance", "salience"):
+                try:
+                    setattr(self.amygdala, name, float(raw_amygdala.get(name, getattr(self.amygdala, name))))
+                except (TypeError, ValueError):
+                    pass
+
+        # Optional V9/V10 regions are only restored when enabled by the
+        # current configuration; a snapshot must not silently turn features
+        # back on after an operator disabled them.
+        if self.predictive_layer is not None:
+            _restore_component("predictive_layer", "predictive_layer", PredictiveLayer.from_snapshot)
+        if self.cognitive_dispatch is not None:
+            _restore_component("cognitive_dispatch", "cognitive_dispatch", CognitiveDispatch.from_snapshot)
+        if self.boredom_engine is not None:
+            _restore_component("boredom_engine", "boredom_engine", BoredomEngine.from_snapshot)
+        if self.social_emotion is not None:
+            _restore_component("social_emotion", "social_emotion", SocialEmotionEngine.from_snapshot)
+        if self.attachment_system is not None:
+            _restore_component("attachment_system", "attachment_system", AttachmentSystem.from_snapshot)
+        if self.reward_system is not None:
+            _restore_component("reward_system", "reward_system", RewardSystem.from_snapshot)
+        if self.autobiography is not None:
+            _restore_component("autobiography", "autobiography", AutobiographicalNarrative.from_snapshot)
+        if self.boundary is not None:
+            _restore_component("boundary", "boundary", BoundaryEngine.from_snapshot)
+
+        if isinstance(snapshot.get("exploration_executor"), dict):
+            try:
+                self.exploration_executor = ExplorationExecutor.from_snapshot(
+                    snapshot["exploration_executor"]
+                )
+            except Exception as exc:
+                self._record_loop_error("restore_exploration_executor", exc)
+
+        # Scheduling timestamps are wall-clock values.  Restore them only
+        # when valid; a missing value simply causes the corresponding task to
+        # run on its next eligible cycle.
+        maintenance = snapshot.get("maintenance", {})
+        if not isinstance(maintenance, dict):
+            maintenance = {}
+
+        def _timestamp(name: str) -> float:
+            value = maintenance.get(name, snapshot.get(name, 0.0))
+            try:
+                return max(0.0, float(value))
+            except (TypeError, ValueError):
+                return 0.0
+
+        self.last_dream_time = _timestamp("last_dream_time")
+        self.last_consolidation_time = _timestamp("last_consolidation_time")
+        self.last_reflection = _timestamp("last_reflection")
+        self.last_snapshot = _timestamp("last_snapshot")
+        self.last_decay = _timestamp("last_decay")
+        try:
+            self._last_archived_count = max(0, int(snapshot.get("last_archived_count", 0)))
+        except (TypeError, ValueError):
+            self._last_archived_count = 0
+
     async def _tick(self):
         """One tick of consciousness. V6: ActivationField drives state dynamics."""
+
+        # A tick owns at most one queued request.  The ID is used by the
+        # per-request future so an exception can be reported to the correct
+        # caller instead of waking every caller at once.
+        self._active_input_id = None
 
         # ── V6: ActivationField tick — 状态扩散 + 基线回归 ──
         activation = self.state.activation
         activation.tick(dt=1.0)
+        self.state.last_tick = datetime.now(timezone.utc).isoformat()
 
         # ── Step 0: Sleep state management ──
         was_asleep = self.sleep_state != "awake"
@@ -296,34 +895,89 @@ class BrainStem:
 
         # ── Step 1: Check for input ──
         input_data = None
+        previous_ticks_since_input = self.state.ticks_since_input
+        previous_sleep_state = self.sleep_state
         try:
             input_data = self._pending_input.get_nowait()
-            self.state.ticks_since_input = 0
-            # ── Session: switch to this source's session ──
-            source_id = input_data.get("source", "default")
-            session = self.state.session_manager.get(source_id)
-            from datetime import datetime as _dt, timezone
-            session.last_active = _dt.now(timezone.utc).isoformat()
-            # Restore per-source state as the active context
-            self.state.emotion_vector.update(session.emotion_vector)
-            self.state.current_emotion = session.current_emotion
-            self.state.focus_entity = session.focus_entity
-            self.state.inner_monologue = session.inner_monologue
-            # Set goal from input (v5.0 fix: was never extracted before)
-            self.state.current_goal = input_data.get("goal") or None
-            # Restore working memory from session (copy contents, don't replace reference)
-            if session.working_memory.get_context():
-                self.working_memory.items = [dict(it) for it in session.working_memory.items]
-            # Wake on input
-            if self.sleep_state != "awake":
-                logger.info("brain-stem: input received, waking from %s", self.sleep_state)
-                self.sleep_state = "awake"
+            self._active_input_id = input_data.get("request_id")
+            # Record the correlation metadata immediately, but defer session,
+            # emotion, and wake-up changes until the boundary has accepted the
+            # message.  A refused input must not be able to perturb the active
+            # subject state merely by reaching the queue.
+            self.state.last_input_id = self._active_input_id or ""
+            self.state.last_input_source = input_data.get("source", "external")
+            # An intent belongs to the current input.  Clear the previous one
+            # before processing so a gated/failed input cannot return stale
+            # output from an earlier turn.
+            self.state.last_intent = None
+            self.state.last_error = ""
+            self.state.last_retrieved = []
+            self.state.association_chain = []
         except asyncio.QueueEmpty:
             self.state.ticks_since_input += 1
             input_data = None
 
+        # ── Step 2: Thalamus — sensory relay ──
+        inner_signal = self.default_mode.get_recent_thoughts(1)
+        inner_text = inner_signal[0] if inner_signal else None
+
+        thalamus_out = self.thalamus.relay(
+            input_text=input_data["text"] if input_data else None,
+            inner_signal=inner_text,
+            source=input_data.get("source", "external") if input_data else "internal",
+        )
+
+        # Apply the self-boundary immediately after sensory normalization.  A
+        # refused message must not alter emotional state, prediction history,
+        # or long-term-memory access counters.
+        boundary_accepted = True
+        boundary_reason = "accepted"
+        if self.boundary and input_data and thalamus_out.get("has_input"):
+            boundary_accepted, boundary_reason = self.boundary.should_accept_input(
+                source=thalamus_out.get("source", input_data.get("source", "external")),
+                text=thalamus_out.get("text", ""),
+                cognitive_load=self.metacognition.cognitive_load,
+                attachment_system=self.attachment_system,
+            )
+
+        refused_input = bool(
+            input_data and thalamus_out.get("has_input") and not boundary_accepted
+        )
+
+        # Commit per-source context only after the input boundary has passed.
+        # Rejected traffic remains observable as a boundary event, but cannot
+        # switch the active session, wake the subject, or reset its idle clock.
+        if input_data and not refused_input:
+            self.state.ticks_since_input = 0
+            source_id = input_data.get("source", "default")
+            session = self.state.session_manager.get(source_id)
+            session.last_active = datetime.now(timezone.utc).isoformat()
+            # Replace, rather than update, the shared view.  Updating left
+            # custom keys from the previous source alive when sessions used
+            # different emotion dimensions, causing cross-session leakage.
+            self.state.emotion_vector = dict(session.emotion_vector)
+            self.state.current_emotion = session.current_emotion
+            self.state.focus_entity = session.focus_entity
+            self.state.inner_monologue = session.inner_monologue
+            self.state.current_goal = input_data.get("goal") or None
+            # Always replace the shared working-memory view, including with an
+            # empty list.  Only copying non-empty sessions allowed source A's
+            # context to bleed into a newly activated source B.
+            self.working_memory.items = [dict(it) for it in session.working_memory.items]
+            self.working_memory.context_text = session.working_memory.context_text
+            if self.sleep_state != "awake":
+                logger.info("brain-stem: input received, waking from %s", self.sleep_state)
+                self.sleep_state = "awake"
+                self.state.sleep_state = self.sleep_state
+        elif refused_input:
+            self.state.ticks_since_input = previous_ticks_since_input + 1
+            self.sleep_state = previous_sleep_state
+            self.state.sleep_state = self.sleep_state
+
         # ── V9 Predictive Layer: 在感知之前生成预测 ──
-        if self.predictive_layer and input_data:
+        # Build an expectation only for an accepted message.  A rejected
+        # message must not train or mutate the predictive subsystem.
+        if self.predictive_layer and input_data and not refused_input:
             wm_entities = [
                 item.get("content", "")[:30]
                 for item in self.working_memory.items[-3:]
@@ -334,17 +988,19 @@ class BrainStem:
                 time_sense=self.time_sense,
             )
 
-        # ── Step 2: Thalamus — sensory relay ──
-        inner_signal = self.default_mode.get_recent_thoughts(1)
-        inner_text = inner_signal[0] if inner_signal else None
-
-        thalamus_out = self.thalamus.relay(
-            input_text=input_data["text"] if input_data else None,
-            inner_signal=inner_text,
-        )
-
         # ── Step 3: Amygdala — emotion ──
-        if thalamus_out["has_input"] and not thalamus_out["discarded"]:
+        if refused_input:
+            # Do not call Amygdala with an empty string: that path applies
+            # emotion decay and changes short-term state for an input the
+            # subject explicitly refused.  Keep a neutral event envelope for
+            # downstream formatting without mutating the live values.
+            amygdala_out = {
+                "emotion_label": self.state.current_emotion,
+                "emotion_vector": dict(self.state.emotion_vector),
+                "emotional_tags": [],
+                "salience": self.amygdala.salience,
+            }
+        elif thalamus_out["has_input"] and not thalamus_out["discarded"]:
             amygdala_out = self.amygdala.evaluate(
                 text=thalamus_out["text"],
                 current_state={"current_emotion": self.state.current_emotion, "emotion_vector": self.state.emotion_vector},
@@ -360,9 +1016,16 @@ class BrainStem:
             )
             self.state.emotion_vector.update(amygdala_out["emotion_vector"])
 
+        self.state.emotion_history.append({
+            "tick": self.state.total_ticks,
+            "emotion": self.state.current_emotion,
+            "vector": dict(self.state.emotion_vector),
+        })
+        self.state.emotion_history = self.state.emotion_history[-50:]
+
         # ── V9 Predictive Layer: 计算预测误差，surprise → salience boost ──
         surprise_salience = 0.0
-        if self.predictive_layer and input_data and thalamus_out["has_input"]:
+        if self.predictive_layer and boundary_accepted and input_data and thalamus_out["has_input"]:
             emotion_vec = amygdala_out.get("emotion_vector", {})
             error = self.predictive_layer.observe_and_compute(
                 expectation=self.predictive_layer.last_expectation,
@@ -391,55 +1054,57 @@ class BrainStem:
         # ── Step 4-8: LLM Processing (V9 dispatch or legacy unified) ──
         hippocampus_out = None
         encoded_memory = None
-        is_external = thalamus_out.get("source") == "external"
+        input_source = thalamus_out.get("source", "none")
+        # All non-internal sources are externally supplied from the brain's
+        # point of view (creator/user/tool are distinct for policy, but none
+        # should be silently downgraded to the legacy literal "external").
+        is_external = bool(input_data) and input_source not in {"internal", "none"}
+        is_subject_input = is_external and not input_source.startswith("agent/")
         dmn_out = None
 
         # Reset input tracking at start of each tick
         self.state.last_input_accepted = False
         self.state.last_input_gated = True
         
+        gate = {"passed": False}
         if thalamus_out["has_input"] and not thalamus_out["discarded"]:
-            # Hippocampus retrieval (embedding — doesn't use LLM chat)
-            hippocampus_out = await self.hippocampus.retrieve(
-                query=thalamus_out["text"],
-                top_k=5,
-            )
-            
-            # Gate check: should we process this?
-            # ── V10 Boundary: 自我边界检查 ──
-            boundary_accepted = True
-            boundary_reason = ""
-            if self.boundary and input_data:
-                boundary_accepted, boundary_reason = self.boundary.should_accept_input(
-                    source=thalamus_out["source"],
-                    text=thalamus_out["text"],
-                    cognitive_load=self.metacognition.cognitive_load,
-                    attachment_system=self.attachment_system,
+            if refused_input:
+                # Keep only a minimal, non-content-bearing audit marker.  The
+                # rejected text itself must not enter working memory.
+                self.working_memory.push(
+                    content=f"[边界] 已拒绝来自 {thalamus_out['source']} 的输入（原因: {boundary_reason}）",
+                    source="boundary",
+                    base_salience=0.25,
                 )
-                if not boundary_accepted:
-                    self.working_memory.push(
-                        content=f"[边界] 拒绝了来自 {thalamus_out['source']} 的输入: {boundary_reason}",
-                        source="boundary",
-                        base_salience=0.4,
-                    )
+            else:
+                # Do not touch long-term memory until the input boundary has
+                # accepted the message.  Retrieval can update access counters
+                # and expose hit counts, so doing it first leaked side effects
+                # from a request the subject had already refused.
+                hippocampus_out = await self.hippocampus.retrieve(
+                    query=thalamus_out["text"],
+                    top_k=5,
+                )
+                self.state.last_retrieved = [
+                    str(item.get("id", item.get("title", "")))
+                    for item in hippocampus_out.get("results", [])
+                    if isinstance(item, dict)
+                ][-20:]
 
-            # ── Apply self-model attention bias ──
-            attn_boost = self.state.self_model.attention_weight(thalamus_out["text"])
-            attn_importance = min(0.5 + attn_boost * 0.1, 1.0)
+                # Gate check: should we process this?
+                attn_boost = self.state.self_model.attention_weight(thalamus_out["text"])
+                attn_importance = min(0.5 + attn_boost * 0.1, 1.0)
 
-            gate = gate_check(
-                text=thalamus_out["text"],
-                importance=attn_importance,
-                novelty=0.5,
-                goal_relevance=GATE_GOAL_RELEVANCE_WITH_GOAL if self.state.current_goal else GATE_GOAL_RELEVANCE_DEFAULT,
-                explicit_mark=amygdala_out.get("salience", 0) > 0.7,
-            )
+                gate = gate_check(
+                    text=thalamus_out["text"],
+                    importance=attn_importance,
+                    novelty=0.5,
+                    goal_relevance=GATE_GOAL_RELEVANCE_WITH_GOAL if self.state.current_goal else GATE_GOAL_RELEVANCE_DEFAULT,
+                    explicit_mark=amygdala_out.get("salience", 0) > 0.7,
+                )
 
-            # V10: 边界拒绝 → 强制 gated
-            if not boundary_accepted:
-                gate["passed"] = False
-
-            # Track gate result for API response (v5.0)
+            # Track gate result for API response (v5.0).  Refused input stays
+            # gated without invoking the regular attention gate.
             self.state.last_input_gated = not gate["passed"]
             self.state.last_input_accepted = gate["passed"]
             self.state.last_error = ""
@@ -612,7 +1277,7 @@ class BrainStem:
                     encoded_memory = mem
 
                     # ── Self-model: ingest this experience ──
-                    if is_external and mem.get("importance", 0) > 0:
+                    if is_subject_input and mem.get("importance", 0) > 0:
                         shift = self.state.self_model.ingest_experience(
                             text=thalamus_out["text"][:500],
                             emotion={
@@ -669,7 +1334,7 @@ class BrainStem:
                         self.state.curiosity.update_exploration_topics(entities)
 
                         # ── V10 Social Self: 互动社会情感评估 ──
-                        if self.social_emotion and self.attachment_system:
+                        if self.social_emotion and self.attachment_system and is_subject_input:
                             source = thalamus_out["source"]
                             other = self.attachment_system.get_or_create(source)
                             sentiment = amygdala_out.get("emotion_vector", {}).get("valence", 0.5)
@@ -689,7 +1354,7 @@ class BrainStem:
                             )
 
                         # ── V10 Autobiographical: 转折点检测 ──
-                        if self.autobiography and mem.get("importance", 0) > 0:
+                        if self.autobiography and is_subject_input and mem.get("importance", 0) > 0:
                             tp = self.autobiography.detect_turning_point(
                                 experience={
                                     "significance": shift.get("significance", 0) if shift else 0,
@@ -857,11 +1522,11 @@ class BrainStem:
                 self.procedural_memory.decay_skills()
 
             # ── v5.4 Time Sense: record important events ──
-            if input_data and is_external:
+            if input_data and is_subject_input and not refused_input:
                 self.time_sense.record_event("input", thalamus_out.get("text", "")[:80])
 
         # ── v5.2: detect tool result inputs (agent feedback loop) and feed outcomes ──
-        if input_data and input_data.get("source", "").startswith("agent/tool/"):
+        if input_data and not refused_input and input_data.get("source", "").startswith("agent/tool/"):
             # Tool result came back — if text doesn't contain error, treat as success
             text_lower = (input_data.get("text", "") or "").lower()
             is_error = any(kw in text_lower for kw in ["失败", "error", "错误", "exception", "traceback"])
@@ -883,7 +1548,7 @@ class BrainStem:
         self.emotional_spectrum.tick()
 
         # ── v5.4: 时间感 tick ──
-        has_recent_activity = input_data is not None or self.state.ticks_since_input < 10
+        has_recent_activity = (input_data is not None and not refused_input) or self.state.ticks_since_input < 10
         self.time_sense.tick(has_recent_activity, self.state.total_ticks, self.state.uptime_seconds)
 
         # ── V9 Boredom Engine: 无聊评估 + 行为触发 ──
@@ -917,9 +1582,13 @@ class BrainStem:
             )
 
         # ── v5.2: update cognitive load ──
-        has_external_input = input_data is not None and not (input_data.get("source", "") or "").startswith("agent/")
+        has_external_input = (
+            input_data is not None
+            and not refused_input
+            and not (input_data.get("source", "") or "").startswith("agent/")
+        )
         self.metacognition.update_cognitive_load(
-            llm_called=(is_external and thalamus_out.get("has_input") and not thalamus_out.get("discarded", True)),
+            llm_called=(is_external and not refused_input and thalamus_out.get("has_input") and not thalamus_out.get("discarded", True)),
             input_processed=has_external_input,
             recent_input_count=min(10, self.state.intent_count),
             activation=activation,  # V6: 同步 fatigue/uncertainty/confidence 到 ActivationField
@@ -927,19 +1596,29 @@ class BrainStem:
 
         # ── Step 6: Basal Ganglia — habit match ──
         habit_out = None
-        if thalamus_out["has_input"]:
+        if thalamus_out["has_input"] and not refused_input:
             habit_out = self.basal_ganglia.match(thalamus_out["text"])
             if habit_out and habit_out.get("matched"):
                 self.state.active_habit = habit_out["habit"]["id"]
                 self.state.habit_confidence = habit_out["confidence"]
 
         # ── Step 7: Cingulate — conflict monitor ──
-        cingulate_out = self.cingulate.monitor(
-            input_text=thalamus_out.get("text", ""),
-            emotion=amygdala_out,
-            hippocampus_result=hippocampus_out,
-            previous_state={"current_emotion": self.state.current_emotion},
-        )
+        if refused_input:
+            # A refused message is not evidence of an internal conflict.  Do
+            # not let hostile text weaken habits or overwrite prior conflict
+            # state through the normal cingulate path.
+            cingulate_out = {
+                "conflict_detected": False,
+                "conflicts": [],
+                "error_count": self.state.error_count,
+            }
+        else:
+            cingulate_out = self.cingulate.monitor(
+                input_text=thalamus_out.get("text", ""),
+                emotion=amygdala_out,
+                hippocampus_result=hippocampus_out,
+                previous_state={"current_emotion": self.state.current_emotion},
+            )
         if cingulate_out.get("conflict_detected"):
             self.state.conflict_detected = True
             self.state.conflict_detail = str(cingulate_out.get("conflicts", [])[:2])
@@ -948,7 +1627,7 @@ class BrainStem:
                 self.basal_ganglia.weaken(self.state.active_habit, delta=0.1)
 
         # ── Working Memory — update ──
-        if thalamus_out["has_input"] and not thalamus_out["discarded"]:
+        if thalamus_out["has_input"] and not thalamus_out["discarded"] and not refused_input:
             wm_content = thalamus_out["text"][:500]
             if encoded_memory and is_external:
                 wm_content = "[记忆: {0}] {1}".format(encoded_memory.get("title", ""), wm_content[:400])
@@ -956,10 +1635,18 @@ class BrainStem:
         if self.state.inner_monologue:
             self.working_memory.push(content=self.state.inner_monologue, source="inner_monologue", base_salience=0.3)
         self.working_memory.tick(activation=activation)  # V6: SalienceScore竞争保留
-        self.state.current_context = self.working_memory.get_context()
+        self.state.current_context = self.working_memory.get_context() or self.working_memory.context_text
+        self.state.active_thoughts = [dict(item) for item in self.working_memory.items]
+        self.state.goal_stack = [
+            goal.description[:200] for goal in self.goal_system.get_active()
+        ][-20:]
+        if input_data and not refused_input:
+            self.state.attention_span_ticks = 0
+        else:
+            self.state.attention_span_ticks += 1
 
         # ── Session sync: save per-source state ──
-        if input_data:
+        if input_data and not refused_input:
             source_id = input_data.get("source", "default")
             session = self.state.session_manager.get(source_id)
             session.current_emotion = self.state.current_emotion
@@ -969,8 +1656,12 @@ class BrainStem:
             session.current_context = self.state.current_context
             # Save working memory by copying items (v5.0 fix: copy, not reference swap)
             session.working_memory.items = [dict(it) for it in self.working_memory.items]
+            session.working_memory.context_text = self.working_memory.context_text
         
-        # Signal input processed (always, even if discarded)
+        # Signal input processed (always, even if discarded).  Keep the old
+        # event for compatibility with legacy callers, but resolve the
+        # correlated future as the authoritative completion signal.
+        self._complete_input_waiter(input_data)
         self._input_processed.set()
         self._input_processed.clear()
 
@@ -1032,7 +1723,7 @@ class BrainStem:
         # ── V7 Goal Generation: via DriveEngine + GoalGenerator + GoalScheduler ──
         if (self.state.total_ticks > 0 and
                 self.state.total_ticks % (DEEP_REFLECTION_INTERVAL_TICKS // 2) == 0):
-            self._tick_drive_engine(activation)
+            self._tick_drive_engine(self.state.activation)
 
         # Push reflection event
         try:
@@ -1183,14 +1874,44 @@ Rules:
     async def _snapshot_state(self):
         """Persist brain state. V6: includes ActivationField."""
         if self.state_store:
+            # Keep the compact BrainState fields and the lossless working
+            # memory view in sync immediately before journaling.
+            self.state.sleep_state = self.sleep_state
+            self.state.active_thoughts = [dict(item) for item in self.working_memory.items]
+            self.state.current_context = self.working_memory.get_context()
             snap = self.state.snapshot()  # State.snapshot() already includes activation
+            snap["working_memory"] = self.working_memory.snapshot()
+            snap["last_archived_count"] = self._last_archived_count
+            snap["maintenance"] = {
+                "last_dream_time": self.last_dream_time,
+                "last_consolidation_time": self.last_consolidation_time,
+                "last_reflection": self.last_reflection,
+                "last_snapshot": self.last_snapshot,
+                "last_decay": self.last_decay,
+            }
             snap["goal_system"] = self.goal_system.snapshot()
             snap["metacognition"] = self.metacognition.snapshot()
             snap["emotional_spectrum"] = self.emotional_spectrum.snapshot()
             snap["procedural_memory"] = self.procedural_memory.snapshot()
             snap["time_sense"] = self.time_sense.snapshot()
             snap["exploration_queue"] = self.exploration_queue.snapshot()
+            snap["exploration_executor"] = {
+                "cycles_completed": self.exploration_executor.cycles_completed,
+                "total_issues_found": self.exploration_executor.total_issues_found,
+            }
             snap["reflection_engine"] = self.reflection_engine.snapshot()
+            snap["drive_engine"] = self.drive_engine.snapshot()
+            snap["thalamus"] = {
+                "last_input": self.thalamus.last_input,
+                "noise_discarded": self.thalamus.noise_discarded,
+                "total_relayed": self.thalamus.total_relayed,
+            }
+            snap["amygdala"] = {
+                "valence": self.amygdala.valence,
+                "arousal": self.amygdala.arousal,
+                "dominance": self.amygdala.dominance,
+                "salience": self.amygdala.salience,
+            }
             if self.predictive_layer:
                 snap["predictive_layer"] = self.predictive_layer.snapshot()
             if self.cognitive_dispatch:
@@ -1207,9 +1928,14 @@ Rules:
                 snap["autobiography"] = self.autobiography.snapshot()
             if self.boundary:
                 snap["boundary"] = self.boundary.snapshot()
-            self.state_store.save(snap)
+            saved = self.state_store.save(snap)
+            if saved is False:
+                self._record_loop_error("snapshot_persist", "state store rejected snapshot")
+                return False
             logger.debug("brain-stem: state snapshot saved (V6 activation: %d dims)",
                          len(snap.get("activation", {}).get("values", {})))
+            return True
+        return False
 
 
     def _update_sleep_state(self):
@@ -1225,6 +1951,7 @@ Rules:
                 self.sleep_state = "drowsy"
             else:
                 self.sleep_state = "awake"
+            self.state.sleep_state = self.sleep_state
             return
 
         if t >= DEEP_SLEEP_THRESHOLD_TICKS:
@@ -1235,6 +1962,7 @@ Rules:
             self.sleep_state = "drowsy"
         else:
             self.sleep_state = "awake"
+        self.state.sleep_state = self.sleep_state
 
     async def _dream_tick(self):
         """Generate a dream during sleep."""

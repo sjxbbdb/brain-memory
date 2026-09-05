@@ -631,3 +631,14 @@ class CognitiveDispatch:
 
     def snapshot(self) -> dict:
         return dict(self.stats)
+
+    @classmethod
+    def from_snapshot(cls, data: dict | None) -> "CognitiveDispatch":
+        dispatch = cls()
+        if not isinstance(data, dict):
+            return dispatch
+        for key in dispatch.stats:
+            value = data.get(key, dispatch.stats[key])
+            if isinstance(value, (int, float)):
+                dispatch.stats[key] = int(value)
+        return dispatch

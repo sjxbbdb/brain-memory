@@ -384,4 +384,24 @@ class BoredomEngine:
         return {
             "boredom": self.state.to_dict(),
             "total_actions": self.total_actions_triggered,
+            "action_cooldown": self._action_cooldown,
+            "recent_memory_ids": list(self._last_random_memory_ids),
         }
+
+    @classmethod
+    def from_snapshot(cls, data: dict | None) -> "BoredomEngine":
+        engine = cls()
+        if not isinstance(data, dict):
+            return engine
+        state = data.get("boredom", {})
+        if isinstance(state, dict):
+            engine.state.score = float(state.get("score", 0.0))
+            engine.state.level = str(state.get("level", "content"))
+            engine.state.ticks_in_this_level = int(state.get("ticks_in_level", 0))
+            engine.state.dominant_cause = str(state.get("cause", "none"))
+        engine.total_actions_triggered = int(data.get("total_actions", 0))
+        engine._action_cooldown = int(data.get("action_cooldown", 0))
+        recent = data.get("recent_memory_ids", [])
+        if isinstance(recent, list):
+            engine._last_random_memory_ids.extend(str(v) for v in recent)
+        return engine

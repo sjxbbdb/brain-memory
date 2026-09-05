@@ -32,6 +32,7 @@ StateDiffusionEngine:
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -250,14 +251,29 @@ class StateDiffusionEngine:
 
     @classmethod
     def from_snapshot(cls, data: dict) -> "StateDiffusionEngine":
+        if not isinstance(data, dict):
+            return cls()
         rules = []
-        for rd in data.get("rules", []):
-            rules.append(DiffusionRule(
-                src=rd["src"], dst=rd["dst"],
-                weight=rd.get("weight", 0.0),
-                description=rd.get("desc", ""),
-                calibratable=rd.get("calibratable", True),
-            ))
+        raw_rules = data.get("rules", [])
+        if isinstance(raw_rules, list):
+            for rd in raw_rules:
+                if not isinstance(rd, dict):
+                    continue
+                src, dst = rd.get("src"), rd.get("dst")
+                if src not in DIMENSIONS or dst not in DIMENSIONS:
+                    continue
+                try:
+                    weight = float(rd.get("weight", 0.0))
+                except (TypeError, ValueError, OverflowError):
+                    weight = 0.0
+                if not math.isfinite(weight):
+                    weight = 0.0
+                rules.append(DiffusionRule(
+                    src=src, dst=dst,
+                    weight=max(-1.0, min(1.0, weight)),
+                    description=str(rd.get("desc", "")),
+                    calibratable=bool(rd.get("calibratable", True)),
+                ))
         engine = cls(rules)
         return engine
 
@@ -470,20 +486,55 @@ class ActivationField:
     @classmethod
     def from_snapshot(cls, data: dict) -> "ActivationField":
         field = cls()
-        if not data:
+        if not isinstance(data, dict):
             return field
+
+        def _number(value, default):
+            try:
+                result = float(value)
+                return result if math.isfinite(result) else default
+            except (TypeError, ValueError, OverflowError):
+                return default
+
         vals = data.get("values", {})
-        for name, v in vals.items():
-            if name in DIMENSIONS:
-                field._values[name] = v
+        if isinstance(vals, dict):
+            for name, value in vals.items():
+                if name in DIMENSIONS:
+                    _default, minimum, maximum, _label = DIMENSIONS[name]
+                    field._values[name] = max(
+                        minimum, min(maximum, _number(value, _default))
+                    )
         baselines = data.get("baselines", {})
-        for name, b in baselines.items():
-            if name in DIMENSIONS:
-                field._baselines[name] = b
-        field.total_ticks = data.get("total_ticks", 0)
-        field.external_events = data.get("external_events", 0)
-        if data.get("diffusion"):
-            field.diffusion = StateDiffusionEngine.from_snapshot(data["diffusion"])
+        if isinstance(baselines, dict):
+            for name, value in baselines.items():
+                if name in DIMENSIONS:
+                    _default, minimum, maximum, _label = DIMENSIONS[name]
+                    field._baselines[name] = max(
+                        minimum, min(maximum, _number(value, _default))
+                    )
+        try:
+            field.total_ticks = max(0, int(data.get("total_ticks", 0)))
+            field.external_events = max(0, int(data.get("external_events", 0)))
+        except (TypeError, ValueError, OverflowError):
+            pass
+        try:
+            if isinstance(data.get("diffusion"), dict):
+                field.diffusion = StateDiffusionEngine.from_snapshot(data["diffusion"])
+        except Exception:
+            pass
+        raw_history = data.get("recent_trajectory", [])
+        if isinstance(raw_history, list):
+            for item in raw_history[-field.max_history:]:
+                if not isinstance(item, dict):
+                    continue
+                point = {}
+                for name, value in item.items():
+                    if name not in DIMENSIONS:
+                        continue
+                    _default, minimum, maximum, _label = DIMENSIONS[name]
+                    point[name] = max(minimum, min(maximum, _number(value, _default)))
+                if point:
+                    field.history.append(point)
         return field
 
     # ── 便捷查询 ──

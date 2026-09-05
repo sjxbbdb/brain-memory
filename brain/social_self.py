@@ -133,10 +133,45 @@ class OtherModel:
             "relationship": self.relationship,
             "trust": round(self.trust_level, 3),
             "attachment": round(self.attachment_level, 3),
+            "respect": round(self.respect_level, 3),
             "closeness": round(self.closeness, 3),
             "interactions": self.interaction_count,
+            "first_met": self.first_met,
+            "last_interaction": self.last_interaction,
+            "positive_interactions": self.positive_interactions,
+            "negative_interactions": self.negative_interactions,
+            "betrayals": self.betrayals,
             "traits": self.perceived_traits,
+            "mood": self.perceived_mood,
+            "intention": self.perceived_intention,
+            "last_impression": self.last_impression,
+            "expectation_of_next": self.expectation_of_next,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "OtherModel | None":
+        if not isinstance(data, dict):
+            return None
+        other = cls(
+            id=str(data.get("id", data.get("name", "unknown"))),
+            name=str(data.get("name", data.get("id", "unknown"))),
+            relationship=str(data.get("relationship", "stranger")),
+            perceived_traits=list(data.get("traits", [])),
+            perceived_mood=str(data.get("mood", "unknown")),
+            perceived_intention=str(data.get("intention", "unknown")),
+            trust_level=float(data.get("trust", 0.3)),
+            attachment_level=float(data.get("attachment", 0.1)),
+            respect_level=float(data.get("respect", 0.5)),
+            interaction_count=int(data.get("interactions", 0)),
+            first_met=str(data.get("first_met", "")),
+            last_interaction=str(data.get("last_interaction", "")),
+            positive_interactions=int(data.get("positive_interactions", 0)),
+            negative_interactions=int(data.get("negative_interactions", 0)),
+            betrayals=int(data.get("betrayals", 0)),
+            last_impression=str(data.get("last_impression", "")),
+            expectation_of_next=str(data.get("expectation_of_next", "")),
+        )
+        return other
 
 
 # ══════════════════════════════════════════════
@@ -272,7 +307,7 @@ class SocialEmotionEngine:
             self.emotions.get("loneliness", 0) * 0.4)
 
     def get_inner_voice(self) -> str:
-        """社会情感转化���内在独白片段。"""
+        """社会情感转化为内在独白片段。"""
         voices = []
         if self.emotions.get("shame", 0) > 0.4:
             voices.append("我刚才是不是表现得不够好...")
@@ -291,7 +326,23 @@ class SocialEmotionEngine:
             "social_emotions": dict(self.emotions),
             "dominant": self.dominant_social_emotion,
             "social_pain": round(self.social_pain, 3),
+            "history": list(self.history),
         }
+
+    @classmethod
+    def from_snapshot(cls, data: dict | None) -> "SocialEmotionEngine":
+        engine = cls()
+        if not isinstance(data, dict):
+            return engine
+        emotions = data.get("social_emotions", {})
+        if isinstance(emotions, dict):
+            for key in engine.emotions:
+                if isinstance(emotions.get(key), (int, float)):
+                    engine.emotions[key] = float(emotions[key])
+        history = data.get("history", [])
+        if isinstance(history, list):
+            engine.history.extend(item for item in history if isinstance(item, dict))
+        return engine
 
 
 # ══════════════════════════════════════════════
@@ -360,8 +411,25 @@ class AttachmentSystem:
     def snapshot(self) -> dict:
         return {
             "others_count": len(self.others),
+            "others": [o.to_dict() for o in self.others.values()],
             "attachment_figures": [
                 o.to_dict() for o in self.get_attachment_figures()
             ],
             "most_attached": self.most_attached.name if self.most_attached else None,
         }
+
+    @classmethod
+    def from_snapshot(cls, data: dict | None) -> "AttachmentSystem":
+        system = cls()
+        if not isinstance(data, dict):
+            return system
+        others = data.get("others")
+        if not isinstance(others, list):
+            # Backward compatibility with v10 snapshots that only retained
+            # attachment figures.
+            others = data.get("attachment_figures", [])
+        for raw in others:
+            other = OtherModel.from_dict(raw)
+            if other:
+                system.others[other.id] = other
+        return system

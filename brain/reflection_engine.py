@@ -117,6 +117,20 @@ class ReflectionEngine:
     def snapshot(self) -> dict:
         return {
             "total_reflections": self.total_reflections,
+            "last_reflection_tick": self.last_reflection_tick,
             "invalid_goals_cancelled": self._invalid_goals_cancelled,
             "wrong_conclusions_marked": self._wrong_conclusions_marked,
+            "last_identity_version": getattr(self, "_last_identity_version", 0),
         }
+
+    @classmethod
+    def from_snapshot(cls, data: dict | None) -> "ReflectionEngine":
+        engine = cls()
+        if not isinstance(data, dict):
+            return engine
+        engine.total_reflections = int(data.get("total_reflections", 0))
+        engine.last_reflection_tick = int(data.get("last_reflection_tick", 0))
+        engine._invalid_goals_cancelled = int(data.get("invalid_goals_cancelled", 0))
+        engine._wrong_conclusions_marked = int(data.get("wrong_conclusions_marked", 0))
+        engine._last_identity_version = int(data.get("last_identity_version", 0))
+        return engine
