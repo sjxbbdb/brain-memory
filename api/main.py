@@ -1,4 +1,4 @@
-"""Brain Memory v10.0 API — FastAPI + WebSocket.
+"""Brain Memory v0.1 API — FastAPI + WebSocket.
 
 REST:
   GET  /api/v4/state        — 当前脑状态
@@ -44,6 +44,7 @@ from config import (
     AGENT_BRIDGE_ENABLED,
     AGENT_BRIDGE_ALLOW_WRITE_TOOLS,
 )
+from version import PRODUCT_VERSION, PRODUCT_VERSION_LABEL
 
 logger = logging.getLogger("brain-v5.api")
 
@@ -398,7 +399,8 @@ async def lifespan(app: FastAPI):
         # startup failure leaves an orphan background task behind.
         broadcaster = asyncio.create_task(_broadcast_loop())
         logger.info(
-            "Brain v10.0 API + V11 autonomy started (tools=%s, bridge=%s)",
+            "Brain %s API + bounded autonomy started (tools=%s, bridge=%s)",
+            PRODUCT_VERSION_LABEL,
             discovered_tools,
             bool(bridge),
         )
@@ -425,7 +427,7 @@ async def lifespan(app: FastAPI):
                 # Shutdown should remain best-effort even when a storage
                 # handle or optional subsystem failed during startup.
                 logger.warning("brain shutdown encountered an error: %s", str(exc)[:120])
-        logger.info("Brain v10.0 API + V11 autonomy stopped")
+        logger.info("Brain %s API + bounded autonomy stopped", PRODUCT_VERSION_LABEL)
 
 
 async def _broadcast_loop():
@@ -439,7 +441,11 @@ async def _broadcast_loop():
 
 # ── App ──
 
-app = FastAPI(title="Brain Memory v10.0", version="10.0.0", lifespan=lifespan)
+app = FastAPI(
+    title=f"Brain Memory {PRODUCT_VERSION_LABEL}",
+    version=PRODUCT_VERSION,
+    lifespan=lifespan,
+)
 
 _cors_origins = [
     origin.strip()
@@ -652,7 +658,9 @@ async def health():
             else "degraded" if brain.is_awake
             else "asleep"
         ),
-        "version": "10.0.0",
+        "version": PRODUCT_VERSION,
+        "product_version": PRODUCT_VERSION,
+        "version_label": PRODUCT_VERSION_LABEL,
         "loop_running": loop_running,
         "total_ticks": state.get("total_ticks", 0),
         "uptime_seconds": state.get("uptime_seconds", 0.0),

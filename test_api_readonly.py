@@ -10,6 +10,7 @@ import unittest
 from brain.goal_system import Goal, GoalSystem
 from brain.task_execution import TaskExecutionLedger
 from brain.task_scheduler import LongTermTaskScheduler
+from version import PRODUCT_VERSION, PRODUCT_VERSION_LABEL
 
 try:  # The core test suite can run without the optional HTTP dependencies.
     import api.main as api_main
@@ -85,6 +86,57 @@ class V13ReadOnlyApiTests(unittest.TestCase):
 
     def _call(self, coroutine):
         return asyncio.run(coroutine)
+
+    def test_api_metadata_uses_canonical_product_version(self):
+        self.assertEqual(PRODUCT_VERSION, "0.1.0")
+        self.assertEqual(PRODUCT_VERSION_LABEL, "v0.1")
+        self.assertEqual(api_main.app.version, PRODUCT_VERSION)
+        self.assertEqual(
+            api_main.app.title,
+            f"Brain Memory {PRODUCT_VERSION_LABEL}",
+        )
+
+    def test_health_reports_canonical_product_version(self):
+        class _Memory:
+            def count(self):
+                return 0
+
+            def get_identity_memories(self, _limit):
+                return []
+
+        async def _state():
+            return {"total_ticks": 0, "uptime_seconds": 0.0}
+
+        stem = types.SimpleNamespace(
+            _task=None,
+            state=types.SimpleNamespace(
+                session_manager=types.SimpleNamespace(
+                    get_session_count=lambda: 0,
+                )
+            ),
+            task_scheduler=None,
+            sleep_state="awake",
+            boundary=None,
+            task_execution=None,
+            learning_feedback=None,
+            drive_engine=None,
+        )
+        fake_brain = types.SimpleNamespace(
+            get_state=_state,
+            is_awake=False,
+            memory_store=_Memory(),
+            brain_stem=stem,
+        )
+        previous_brain = api_main._brain
+        api_main._brain = fake_brain
+        try:
+            result = self._call(api_main.health())
+        finally:
+            api_main._brain = previous_brain
+
+        self.assertEqual(result["version"], PRODUCT_VERSION)
+        self.assertEqual(result["product_version"], PRODUCT_VERSION)
+        self.assertEqual(result["version_label"], PRODUCT_VERSION_LABEL)
 
     def test_v13_get_routes_do_not_mutate_scheduler_or_goal_state(self):
         goal_before = copy.deepcopy(self.goal.to_dict())

@@ -1,6 +1,13 @@
-"""Brain Memory v10.0 — Configuration."""
+"""Brain Memory v0.1 — runtime configuration.
+
+Historical V4–V13 labels in this file identify capability generations, not
+the product release number.  The canonical release value lives in
+``version.py``.
+"""
 
 import os
+
+from version import PRODUCT_VERSION, PRODUCT_VERSION_LABEL
 
 
 def _env_int(

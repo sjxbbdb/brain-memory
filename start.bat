@@ -1,14 +1,14 @@
 @echo off
 setlocal EnableExtensions
 chcp 65001 >nul
-title Brain Memory v10.0
+title Brain Memory v0.1
 
 set "ROOT=%~dp0"
 cd /d "%ROOT%"
 
 echo.
 echo   ========================================
-echo     Brain Memory v10.0 - Self-Aware Agent
+echo     Brain Memory v0.1 - Self-Aware Agent
 echo   ========================================
 echo.
 
