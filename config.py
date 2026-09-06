@@ -52,6 +52,30 @@ AUTONOMY_MAX_EPISODE_TICKS = _env_int(
     "BRAIN_MEMORY_AUTONOMY_MAX_EPISODE_TICKS", 180, minimum=10, maximum=100000
 )        # ~6 minutes before safe timeout
 
+# Long-term task policy.  The scheduler keeps one execution lane while
+# retaining a bounded queue for maintenance, user, and exploration work.
+TASK_QUEUE_LIMIT = _env_int(
+    "BRAIN_MEMORY_TASK_QUEUE_LIMIT", 12, minimum=3, maximum=100
+)
+TASK_MAINTENANCE_BUDGET_TICKS = _env_int(
+    "BRAIN_MEMORY_TASK_MAINTENANCE_BUDGET_TICKS", 60, minimum=1, maximum=100000
+)
+TASK_USER_BUDGET_TICKS = _env_int(
+    "BRAIN_MEMORY_TASK_USER_BUDGET_TICKS", 120, minimum=1, maximum=100000
+)
+TASK_EXPLORATION_BUDGET_TICKS = _env_int(
+    "BRAIN_MEMORY_TASK_EXPLORATION_BUDGET_TICKS", 90, minimum=1, maximum=100000
+)
+TASK_MAINTENANCE_DEADLINE_TICKS = _env_int(
+    "BRAIN_MEMORY_TASK_MAINTENANCE_DEADLINE_TICKS", 180, minimum=1, maximum=100000
+)
+TASK_USER_DEADLINE_TICKS = _env_int(
+    "BRAIN_MEMORY_TASK_USER_DEADLINE_TICKS", 360, minimum=1, maximum=100000
+)
+TASK_EXPLORATION_DEADLINE_TICKS = _env_int(
+    "BRAIN_MEMORY_TASK_EXPLORATION_DEADLINE_TICKS", 240, minimum=1, maximum=100000
+)
+
 # The API process can host the read-only execution boundary alongside the
 # brain.  Writes stay disabled unless an operator explicitly opts in.
 AGENT_BRIDGE_ENABLED = _env_bool("BRAIN_MEMORY_AGENT_BRIDGE_ENABLED", True)

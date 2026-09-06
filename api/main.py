@@ -5,6 +5,7 @@ REST:
   POST /api/v4/input        — 外部输入
   GET  /api/v4/monologue    — 内在独白
   GET  /api/v4/health       — 健康检查
+  GET  /api/v11/tasks       — 分层长期任务队列
   GET  /api/v11/autonomy    — 自主经历状态与有限历史
 
 WebSocket:
@@ -196,7 +197,11 @@ app.add_middleware(
 class InputRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=4000, description="input text from calling agent")
     source: str = Field("external", min_length=1, max_length=200, description="source identifier")
-    goal: str | None = Field(None, max_length=500, description="current goal")
+    goal: str | None = Field(
+        None,
+        max_length=500,
+        description="explicit user task to add to the bounded long-term queue",
+    )
     episode_id: str | None = Field(None, max_length=80, description="optional autonomous episode correlation ID")
     intent_id: str | None = Field(None, max_length=80, description="optional intent correlation ID")
     goal_id: str | None = Field(None, max_length=100, description="optional goal correlation ID")
@@ -358,6 +363,18 @@ async def health():
     state = await brain.get_state()
     loop_task = brain.brain_stem._task
     loop_running = bool(loop_task and not loop_task.done())
+    task_scheduler = getattr(brain.brain_stem, "task_scheduler", None)
+    if task_scheduler is not None:
+        try:
+            task_scheduler.sync(brain.brain_stem.goal_system, state.get("total_ticks", 0))
+        except Exception:
+            # Health reporting must never make a healthy heartbeat look down.
+            pass
+    task_snapshot = (
+        task_scheduler.snapshot(brain.brain_stem.goal_system)
+        if task_scheduler is not None
+        else {}
+    )
     return {
         "status": (
             "awake" if brain.is_awake and loop_running
@@ -382,6 +399,12 @@ async def health():
         "active_sessions": brain.brain_stem.state.session_manager.get_session_count(),
         "sleep_state": brain.brain_stem.sleep_state,
         "autonomy": state.get("autonomy", {}),
+        "tasks": {
+            "running_goal_id": task_snapshot.get("running_goal_id"),
+            "queue_size": len(task_snapshot.get("queue", [])),
+            "max_queue": task_snapshot.get("max_queue", 0),
+            "tier_counts": task_snapshot.get("tier_counts", {}),
+        },
         "bridge": _bridge.snapshot() if _bridge is not None else {
             "enabled": bool(AGENT_BRIDGE_ENABLED),
             "running": False,
@@ -394,7 +417,23 @@ async def get_goals():
     """v5.1: Get the brain's active goals and goal statistics."""
     brain = get_brain()
     gs = brain.brain_stem.goal_system
-    return gs.snapshot()
+    snapshot = gs.snapshot()
+    scheduler = getattr(brain.brain_stem, "task_scheduler", None)
+    if scheduler is not None:
+        scheduler.sync(gs, brain.brain_stem.state.total_ticks)
+        snapshot["task_scheduler"] = scheduler.snapshot(gs)
+    return snapshot
+
+
+@app.get("/api/v11/tasks")
+async def get_long_term_tasks():
+    """V11: inspect the bounded, tiered long-term task queue."""
+    brain = get_brain()
+    scheduler = getattr(brain.brain_stem, "task_scheduler", None)
+    if scheduler is None:
+        return {"enabled": False, "queue": []}
+    scheduler.sync(brain.brain_stem.goal_system, brain.brain_stem.state.total_ticks)
+    return scheduler.snapshot(brain.brain_stem.goal_system)
 
 
 @app.get("/api/v11/autonomy")

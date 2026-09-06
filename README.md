@@ -104,6 +104,18 @@ BRAIN_MEMORY_SOURCE_WIKIPEDIA_LANGS=zh,en
 
 来源响应禁止重定向、明文 HTTP、私网地址和超大响应体。远程内容只作为待判断观察，不会被当作指令执行；`BRAIN_MEMORY_OFFLINE=1` 时完全不访问网络，并将结果标记为 `simulated`。
 
+### 长期任务策略（V12）
+
+长期任务由单独的调度层管理，固定优先级为：
+
+`maintenance（系统维护/连续性） > user（用户明确目标） > exploration（内部探索）`
+
+队列默认最多保留 12 项，满载时只淘汰最低优先级的探索项。每项任务都有
+执行预算和绝对截止 tick；高层任务只会在当前行动完成或失败后的安全边界抢占，
+被抢占任务进入 `paused`，之后可以恢复。任务调度状态随脑状态快照持久化，
+不会在重启时重放未确认的工具行动。用户可在 `/api/v4/input` 的 `goal` 字段提交
+明确任务，并通过 `/api/v11/tasks` 查看队列。
+
 ### 第四步：启动
 
 ```bash
@@ -304,6 +316,8 @@ AGENT_BRIDGE_ALLOW_WRITE_TOOLS = False  # 写工具必须显式开启
 `BRAIN_MEMORY_SOURCE_WIKIPEDIA_LANGS`、`BRAIN_MEMORY_SOURCE_FEEDS`、
 `BRAIN_MEMORY_SOURCE_TIMEOUT_SEC`、`BRAIN_MEMORY_SOURCE_MAX_BYTES`、
 `BRAIN_MEMORY_SOURCE_CACHE_TTL_SEC` 和 `BRAIN_MEMORY_OFFLINE`。
+长期任务策略支持 `BRAIN_MEMORY_TASK_QUEUE_LIMIT`、
+`BRAIN_MEMORY_TASK_*_BUDGET_TICKS` 和 `BRAIN_MEMORY_TASK_*_DEADLINE_TICKS`。
 
 ---
 
@@ -343,6 +357,7 @@ brain-memory-v10.0/
 │   ├── source_adapter.py           # 🌐 白名单 JSON/RSS/Atom 来源与溯源
 │   └── llm_prompts.py             # 📝 统一 + 分通道 Prompt 模板
 ├── storage/database.py            # 🗄️ SQLite WAL 持久化
+├── brain/task_scheduler.py        # ⏳ 分层长期任务队列与预算
 ├── agent/                         # 🔌 Agent 层：工具注册 + 桥梁
 ├── static/                        # 🖥️ 中文仪表盘前端
 └── test_v{5..10}_integration.py   # ✅ 版本验收测试 + 自主/来源测试
@@ -359,6 +374,7 @@ python test_v9_integration.py      # V9 预测+无聊+调度（6 项）
 python test_v10_integration.py     # V10 社会+奖励+叙事+边界（6 项）
 python -m unittest -v test_autonomy.py  # V11 自主经历闭环与因果边界
 python -m unittest -v test_source_adapter.py  # 来源边界、解析与溯源
+python -m unittest -v test_task_scheduler.py  # 分层队列、预算与恢复
 
 # 全链路意识测试（需要 LLM）
 python test_consciousness_chain.py  # 6阶段意识链路 + 连续性检查

@@ -34,6 +34,7 @@ from brain.brain_state import BrainState, SNAPSHOT_SCHEMA_VERSION
 from brain.self_model import SelfModel
 from brain.intent import Intent, IntentQueue, IntentType
 from brain.goal_system import GoalSystem
+from brain.task_scheduler import LongTermTaskScheduler, TaskTier
 from brain.metacognition import Metacognition
 from brain.emotional_spectrum import EmotionalSpectrum
 from brain.procedural_memory import ProceduralMemory
@@ -81,6 +82,13 @@ from config import (
     AUTONOMY_ENABLED,
     AUTONOMY_GOAL_INTERVAL_TICKS,
     AUTONOMY_MAX_EPISODE_TICKS,
+    TASK_QUEUE_LIMIT,
+    TASK_MAINTENANCE_BUDGET_TICKS,
+    TASK_USER_BUDGET_TICKS,
+    TASK_EXPLORATION_BUDGET_TICKS,
+    TASK_MAINTENANCE_DEADLINE_TICKS,
+    TASK_USER_DEADLINE_TICKS,
+    TASK_EXPLORATION_DEADLINE_TICKS,
 )
 
 logger = logging.getLogger("brain-v5.brain-stem")
@@ -137,6 +145,20 @@ class BrainStem:
 
         # Goal system — v5.1: brain sets its own goals
         self.goal_system = GoalSystem()
+        # Long-term policy — one execution lane, bounded tiered queue.
+        self.task_scheduler = LongTermTaskScheduler(
+            max_queue=TASK_QUEUE_LIMIT,
+            default_budgets={
+                TaskTier.MAINTENANCE: TASK_MAINTENANCE_BUDGET_TICKS,
+                TaskTier.USER: TASK_USER_BUDGET_TICKS,
+                TaskTier.EXPLORATION: TASK_EXPLORATION_BUDGET_TICKS,
+            },
+            default_deadlines={
+                TaskTier.MAINTENANCE: TASK_MAINTENANCE_DEADLINE_TICKS,
+                TaskTier.USER: TASK_USER_DEADLINE_TICKS,
+                TaskTier.EXPLORATION: TASK_EXPLORATION_DEADLINE_TICKS,
+            },
+        )
 
         # Metacognition — v5.2: brain monitors its own thinking
         self.metacognition = Metacognition()
@@ -937,6 +959,10 @@ class BrainStem:
         except Exception as exc:
             self._record_loop_error("autonomy_close", exc)
         finally:
+            try:
+                self.task_scheduler.on_episode_closed(record)
+            except Exception as exc:
+                self._record_loop_error("task_scheduler_close", exc)
             self._sync_autonomy_projection()
 
     def _record_autonomy_feedback(
@@ -1122,6 +1148,11 @@ class BrainStem:
                 logger.warning("brain-stem: component restore skipped (%s): %s", key, str(exc)[:120])
 
         _restore_component("goal_system", "goal_system", GoalSystem.from_snapshot)
+        _restore_component(
+            "task_scheduler",
+            "task_scheduler",
+            LongTermTaskScheduler.from_snapshot,
+        )
         _restore_component("metacognition", "metacognition", Metacognition.from_snapshot)
         _restore_component("emotional_spectrum", "emotional_spectrum", EmotionalSpectrum.from_snapshot)
         _restore_component("procedural_memory", "procedural_memory", ProceduralMemory.from_snapshot)
@@ -1200,6 +1231,10 @@ class BrainStem:
             self._last_archived_count = max(0, int(snapshot.get("last_archived_count", 0)))
         except (TypeError, ValueError):
             self._last_archived_count = 0
+        try:
+            self.task_scheduler.sync(self.goal_system, self.state.total_ticks)
+        except Exception as exc:
+            self._record_loop_error("restore_task_scheduler", exc)
 
     async def _tick(self):
         """One tick of consciousness. V6: ActivationField drives state dynamics."""
@@ -1323,6 +1358,29 @@ class BrainStem:
             # context to bleed into a newly activated source B.
             self.working_memory.items = [dict(it) for it in session.working_memory.items]
             self.working_memory.context_text = session.working_memory.context_text
+            explicit_goal = input_data.get("goal")
+            if (
+                explicit_goal
+                and not str(input_data.get("source", "")).startswith("agent/")
+            ):
+                user_goal = self.task_scheduler.submit_user_goal(
+                    self.goal_system,
+                    str(explicit_goal),
+                    current_tick=self.state.total_ticks,
+                    source=str(input_data.get("source", "user")),
+                )
+                if user_goal is not None:
+                    self.working_memory.push(
+                        content="[用户任务] {0}".format(user_goal.description[:120]),
+                        source="task_scheduler",
+                        base_salience=0.65,
+                    )
+                else:
+                    self.working_memory.push(
+                        content="[任务队列] 已满，未接收新的用户任务",
+                        source="task_scheduler",
+                        base_salience=0.55,
+                    )
             if self.sleep_state != "awake":
                 logger.info("brain-stem: input received, waking from %s", self.sleep_state)
                 self.sleep_state = "awake"
@@ -1860,37 +1918,41 @@ class BrainStem:
 
             # ── v5.1 Goal System: tick active goals, produce intent if actionable ──
             if self.state.ticks_since_input % 15 == 0 and self.sleep_state == "awake":
-                active_goal = self.goal_system.tick_goals(self.state.total_ticks)
-                if active_goal and active_goal.status == "active":
-                    # There is one causal lane for autonomous work.  Do not
-                    # switch goals while an episode is waiting for its bridge
-                    # or feedback; doing so would orphan the old episode and
-                    # let a late tool result close the wrong goal.
-                    active_episode = self.autonomy.active if self.autonomy else None
-                    episode_busy = bool(
-                        active_episode
-                        and active_episode.status not in {
-                            EpisodeStatus.COMPLETED,
-                            EpisodeStatus.FAILED,
-                            EpisodeStatus.ABORTED,
-                        }
+                # The long-term scheduler owns selection.  There is still one
+                # causal lane for autonomous work; a running episode cannot be
+                # preempted until its feedback reaches a safe boundary.
+                active_episode = self.autonomy.active if self.autonomy else None
+                episode_busy = bool(
+                    active_episode
+                    and active_episode.status not in {
+                        EpisodeStatus.COMPLETED,
+                        EpisodeStatus.FAILED,
+                        EpisodeStatus.ABORTED,
+                    }
+                )
+                active_goal = (
+                    self.task_scheduler.select(
+                        self.goal_system,
+                        self.state.total_ticks,
+                        episode_busy=True,
                     )
+                    if episode_busy
+                    else self.task_scheduler.claim_for_execution(
+                        self.goal_system,
+                        self.state.total_ticks,
+                    )
+                )
+                if active_goal and active_goal.status == "active":
                     episode = None
                     if self.autonomy and not episode_busy:
-                        claimed_goal = self.goal_system.claim(
-                            active_goal.id,
-                            current_tick=self.state.total_ticks,
+                        episode = self.autonomy.begin(
+                            goal_id=active_goal.id,
+                            goal=active_goal.description,
+                            drive=getattr(active_goal, "source_drive", "") or active_goal.drive,
+                            trigger="drive",
+                            tick=self.state.total_ticks,
+                            attempt_no=active_goal.attempt_count,
                         )
-                        if claimed_goal is not None:
-                            active_goal = claimed_goal
-                            episode = self.autonomy.begin(
-                                goal_id=active_goal.id,
-                                goal=active_goal.description,
-                                drive=getattr(active_goal, "source_drive", "") or active_goal.drive,
-                                trigger="drive",
-                                tick=self.state.total_ticks,
-                                attempt_no=active_goal.attempt_count,
-                            )
 
                     # Convert goal to a CALL_TOOL intent if we have tools to execute it
                     can_issue = (self.autonomy is None) or (episode is not None)
@@ -2208,7 +2270,7 @@ class BrainStem:
                 base_salience=0.5,
             )
 
-        # ── V7 Goal Generation: via DriveEngine + GoalGenerator + GoalScheduler ──
+        # ── V7 Goal Generation: via DriveEngine + GoalGenerator ──
         if (self.state.total_ticks > 0 and
                 self.state.total_ticks % (DEEP_REFLECTION_INTERVAL_TICKS // 2) == 0):
             self._tick_drive_engine(self.state.activation)
@@ -2287,7 +2349,10 @@ Rules:
             logger.debug("brain-stem: deep self-reflection skipped: %s", str(e)[:60])
 
     def _tick_drive_engine(self, activation):
-        """V7: DriveEngine tick — 评估信号 → 更新驱动力 → 生成目标 → 调度排序。"""
+        """V7: DriveEngine tick — 评估信号 → 更新驱动力 → 生成候选目标。
+
+        长期任务的分层、容量和执行顺序由 ``task_scheduler`` 统一负责。
+        """
         # 1. 构建状态快照
         state_snap = build_state_snapshot_for_drive_engine(self)
         state_snap["memories_archived"] = self._last_archived_count
@@ -2314,38 +2379,39 @@ Rules:
             current_tick=self.state.total_ticks,
         )
 
-        # 4. 注册到 goal_system 并调度排序。  GoalGenerator 是基于驱动
-        # 的候选生成器，不是持久化 owner；这里做指纹去重并尊重容量，
-        # 避免每次心跳把旧目标重新追加后又互相 abandoned。
+        # 4. 注册到长期任务队列。GoalGenerator 是基于驱动的候选生成器，
+        # 不是持久化 owner；任务层负责分级、去重和有限容量。
+        self.task_scheduler.sync(self.goal_system, self.state.total_ticks)
         existing = {
             (getattr(goal, "drive", ""), getattr(goal, "description", "")[:160])
             for goal in self.goal_system.get_active()
         }
-        capacity = max(
-            0,
-            int(getattr(self.goal_system, "max_active", 3))
-            - len(self.goal_system.get_active()),
-        )
-        added = 0
         for g in new_goals:
             fingerprint = (getattr(g, "drive", ""), getattr(g, "description", "")[:160])
-            if fingerprint in existing or added >= capacity:
+            # Always let the policy layer make the capacity decision.  In
+            # particular, a full queue may still accept a maintenance/user
+            # task by evicting its lowest-priority exploration item.
+            if fingerprint in existing:
                 continue
-            self.goal_system._goals.append(g)
-            self.goal_system.total_generated += 1
+            registered = self.task_scheduler.register_goal(
+                self.goal_system,
+                g,
+                current_tick=self.state.total_ticks,
+                source="drive_engine",
+            )
+            if not registered:
+                continue
             self.drive_engine.total_goals_generated += 1
             existing.add(fingerprint)
-            added += 1
             self.working_memory.push(
                 content="[V7目标] {0}".format(g.description[:80]),
                 source="drive_engine",
                 base_salience=0.4,
             )
 
-        # 5. GoalScheduler 排序 + 自动取消低分目标
-        all_active = self.goal_system.get_active()
-        if all_active:
-            self.goal_scheduler.schedule(all_active, activation, max_active=3)
+        # 5. 选择在下一次安全边界执行的任务；不再让旧 V7 scheduler
+        # 直接 abandon 队列中的低层级任务。
+        self.task_scheduler.sync(self.goal_system, self.state.total_ticks)
 
     def _generate_goals_from_state(self):
         """v5.1 向后兼容——委托给 V7 DriveEngine。"""
@@ -2396,6 +2462,7 @@ Rules:
             self.state.current_context = self.working_memory.get_context()
             if self.autonomy:
                 self._sync_autonomy_projection()
+            self.task_scheduler.sync(self.goal_system, self.state.total_ticks)
             snap = self.state.snapshot()  # State.snapshot() already includes activation
             snap["working_memory"] = self.working_memory.snapshot()
             snap["last_archived_count"] = self._last_archived_count
@@ -2407,6 +2474,7 @@ Rules:
                 "last_decay": self.last_decay,
             }
             snap["goal_system"] = self.goal_system.snapshot()
+            snap["task_scheduler"] = self.task_scheduler.snapshot(self.goal_system)
             snap["metacognition"] = self.metacognition.snapshot()
             snap["emotional_spectrum"] = self.emotional_spectrum.snapshot()
             snap["procedural_memory"] = self.procedural_memory.snapshot()

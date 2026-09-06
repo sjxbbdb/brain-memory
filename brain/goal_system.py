@@ -5,7 +5,8 @@ v5.0 有驱动力但没有目标——好奇、想成长、要一致，但从不
 
 原则:
 - 驱动力是"为什么"，目标是"做什么"
-- 最多 3 个活跃目标，防止注意分散
+- 传统接口仍保留最多 3 个直接活跃目标的兼容上限；长期任务调度器
+  在其上维护一个更大的有界等待队列，并保证同一时刻只有一个执行通道
 - 目标有时限，逾期自动失败
 - 完成/失败的目标写入自我叙事，微调驱动力权重
 - 闲置时大脑可以自主推进目标，不依赖外部输入
@@ -60,6 +61,7 @@ DRIVE_GOAL_TEMPLATES = {
 class GoalStatus:
     PENDING = "pending"
     ACTIVE = "active"
+    PAUSED = "paused"
     DONE = "done"
     FAILED = "failed"
     ABANDONED = "abandoned"
@@ -86,6 +88,17 @@ class Goal:
     growth_gain: float = 0.0     # 对 growth 的贡献
     identity_gain: float = 0.0   # 对身份稳定的贡献
     source_drive: str = ""       # 来源驱动力名称(e.g. "curiosity_drive")
+    # Long-term task policy metadata.  Defaults keep legacy Goal constructors
+    # and snapshots valid; the task scheduler fills these fields on first use.
+    task_tier: str = "exploration"
+    budget_ticks: int = 0
+    deadline_tick: int = 0
+    consumed_ticks: int = 0
+    created_tick: int = 0
+    last_run_tick: int = 0
+    paused_reason: str = ""
+    preemption_count: int = 0
+    task_source: str = ""
 
     def __post_init__(self):
         if not self.created_at:
@@ -123,6 +136,15 @@ class Goal:
             "growth_gain": self.growth_gain,
             "identity_gain": self.identity_gain,
             "source_drive": self.source_drive,
+            "task_tier": self.task_tier,
+            "budget_ticks": self.budget_ticks,
+            "deadline_tick": self.deadline_tick,
+            "consumed_ticks": self.consumed_ticks,
+            "created_tick": self.created_tick,
+            "last_run_tick": self.last_run_tick,
+            "paused_reason": self.paused_reason,
+            "preemption_count": self.preemption_count,
+            "task_source": self.task_source,
             "urgency": round(self.urgency, 2),
         }
 
@@ -303,7 +325,11 @@ class GoalSystem:
     def mark_progress(self, goal_id: str, delta: float = 0.2):
         """标记目标进展。"""
         for g in self._goals:
-            if g.id == goal_id:
+            if g.id == goal_id and g.status in (
+                GoalStatus.PENDING,
+                GoalStatus.ACTIVE,
+                GoalStatus.PAUSED,
+            ):
                 g.progress = min(1.0, g.progress + delta)
                 if g.progress >= 0.95:
                     self._complete(g)
@@ -312,7 +338,11 @@ class GoalSystem:
     def mark_done(self, goal_id: str, note: str = ""):
         """手动标记目标完成。"""
         for g in self._goals:
-            if g.id == goal_id and g.status == GoalStatus.ACTIVE:
+            if g.id == goal_id and g.status in (
+                GoalStatus.PENDING,
+                GoalStatus.ACTIVE,
+                GoalStatus.PAUSED,
+            ):
                 g.result_note = note
                 self._complete(g)
                 return
@@ -320,7 +350,11 @@ class GoalSystem:
     def mark_failed(self, goal_id: str, note: str = ""):
         """手动标记目标失败。"""
         for g in self._goals:
-            if g.id == goal_id and g.status == GoalStatus.ACTIVE:
+            if g.id == goal_id and g.status in (
+                GoalStatus.PENDING,
+                GoalStatus.ACTIVE,
+                GoalStatus.PAUSED,
+            ):
                 g.status = GoalStatus.FAILED
                 g.result_note = note
                 g.completed_at = datetime.now(timezone.utc).isoformat()
@@ -345,8 +379,46 @@ class GoalSystem:
 
     # ── 查询 ──
 
+    def add_goal(self, goal: Goal) -> bool:
+        """Add one non-terminal goal through the GoalSystem owner."""
+        if not isinstance(goal, Goal):
+            return False
+        if not goal.id or self.get_by_id(goal.id, include_history=True) is not None:
+            return False
+        if goal.status not in (
+            GoalStatus.PENDING,
+            GoalStatus.ACTIVE,
+            GoalStatus.PAUSED,
+        ):
+            return False
+        self._goals.append(goal)
+        self.total_generated += 1
+        return True
+
+    def abandon(self, goal_id: str, note: str = "") -> bool:
+        """Abandon a queued goal and retain it in bounded history."""
+        for goal in self._goals:
+            if goal.id == goal_id and goal.status in (
+                GoalStatus.PENDING,
+                GoalStatus.ACTIVE,
+                GoalStatus.PAUSED,
+            ):
+                goal.status = GoalStatus.ABANDONED
+                goal.result_note = note
+                goal.completed_at = datetime.now(timezone.utc).isoformat()
+                self._archive(goal)
+                return True
+        return False
+
     def get_active(self) -> list[Goal]:
-        return [g for g in self._goals if g.status in (GoalStatus.ACTIVE, GoalStatus.PENDING)]
+        return [
+            g for g in self._goals
+            if g.status in (
+                GoalStatus.ACTIVE,
+                GoalStatus.PENDING,
+                GoalStatus.PAUSED,
+            )
+        ]
 
     def get_by_id(self, goal_id: str, include_history: bool = False) -> Goal | None:
         """Return one goal without exposing the internal list to callers."""
@@ -360,13 +432,19 @@ class GoalSystem:
         return None
 
     def claim(self, goal_id: str, current_tick: int = 0) -> Goal | None:
-        """Atomically claim a pending goal for one execution attempt."""
+        """Atomically claim a queued goal for one execution attempt."""
         goal = self.get_by_id(goal_id)
-        if goal is None or goal.status not in (GoalStatus.PENDING, GoalStatus.ACTIVE):
+        if goal is None or goal.status not in (
+            GoalStatus.PENDING,
+            GoalStatus.ACTIVE,
+            GoalStatus.PAUSED,
+        ):
             return None
-        if goal.status == GoalStatus.PENDING:
+        if goal.status in (GoalStatus.PENDING, GoalStatus.PAUSED):
             goal.status = GoalStatus.ACTIVE
-            goal.started_at = datetime.now(timezone.utc).isoformat()
+            if not goal.started_at:
+                goal.started_at = datetime.now(timezone.utc).isoformat()
+            goal.paused_reason = ""
         goal.attempt_count = max(0, int(goal.attempt_count)) + 1
         return goal
 
@@ -383,6 +461,10 @@ class GoalSystem:
     @property
     def pending_count(self) -> int:
         return sum(1 for g in self._goals if g.status == GoalStatus.PENDING)
+
+    @property
+    def paused_count(self) -> int:
+        return sum(1 for g in self._goals if g.status == GoalStatus.PAUSED)
 
     # ── 快照 ──
 
@@ -405,6 +487,7 @@ class GoalSystem:
             "stats": {
                 "active": self.active_count,
                 "pending": self.pending_count,
+                "paused": self.paused_count,
                 "total_generated": self.total_generated,
                 "total_completed": self.total_completed,
                 "total_failed": self.total_failed,
@@ -459,6 +542,15 @@ class GoalSystem:
                 growth_gain=_safe_float(gd.get("growth_gain", 0.0)),
                 identity_gain=_safe_float(gd.get("identity_gain", 0.0)),
                 source_drive=_text(gd.get("source_drive", "")),
+                task_tier=_text(gd.get("task_tier", "exploration"), "exploration"),
+                budget_ticks=max(0, _safe_int(gd.get("budget_ticks", 0), 0)),
+                deadline_tick=max(0, _safe_int(gd.get("deadline_tick", 0), 0)),
+                consumed_ticks=max(0, _safe_int(gd.get("consumed_ticks", 0), 0)),
+                created_tick=max(0, _safe_int(gd.get("created_tick", 0), 0)),
+                last_run_tick=max(0, _safe_int(gd.get("last_run_tick", 0), 0)),
+                paused_reason=_text(gd.get("paused_reason", "")),
+                preemption_count=max(0, _safe_int(gd.get("preemption_count", 0), 0)),
+                task_source=_text(gd.get("task_source", "")),
             )
 
         active_goals = data.get("active_goals", [])
