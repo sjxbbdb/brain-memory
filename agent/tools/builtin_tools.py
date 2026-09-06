@@ -76,6 +76,29 @@ async def _memory_search(args: dict, context: dict) -> str:
     # 通过大脑 API 搜索（agent_bridge 会注入 brain_client）
     brain = context.get("brain_client")
     if brain:
+        # In the normal in-process topology, query the shared store directly.
+        # A self-HTTP round trip can deadlock an event loop and makes an
+        # otherwise healthy autonomous episode depend on a second server.
+        stem = getattr(brain, "brain_stem", None)
+        memory_store = getattr(stem, "memory_store", None)
+        if memory_store is not None:
+            try:
+                memories = memory_store.search(query, limit=limit)
+                boundary = getattr(stem, "boundary", None)
+                if boundary is not None:
+                    memories = [
+                        memory for memory in memories
+                        if isinstance(memory, dict)
+                        and boundary.should_share_memory(
+                            str(memory.get("id", "")), "agent"
+                        )
+                    ]
+                return json.dumps({
+                    "count": len(memories),
+                    "memories": memories,
+                }, ensure_ascii=False)
+            except Exception as e:
+                logger.debug("memory search direct path failed: %s", str(e)[:120])
         try:
             base_url = getattr(brain, "brain_api_url", None) or context.get(
                 "brain_api_url"

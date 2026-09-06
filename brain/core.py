@@ -22,7 +22,7 @@ import json
 import logging
 
 from brain.brain_stem import BrainStem
-from config import INPUT_TIMEOUT_SEC
+from config import DB_PATH, INPUT_TIMEOUT_SEC
 from storage.database import init_db, StateStore, MemoryStore
 
 logger = logging.getLogger("brain-v5.core")
@@ -31,7 +31,7 @@ logger = logging.getLogger("brain-v5.core")
 class Brain:
     """Brain Memory v5.0 — a conscious memory agent."""
 
-    def __init__(self, db_path: str = "brain_v4.db"):
+    def __init__(self, db_path: str = DB_PATH):
         self.state_store = StateStore(db_path)
         self.memory_store = MemoryStore(db_path)
         self.brain_stem = BrainStem(
@@ -121,6 +121,9 @@ class Brain:
         text: str,
         source: str = "external",
         goal: str | None = None,
+        episode_id: str | None = None,
+        intent_id: str | None = None,
+        goal_id: str | None = None,
     ) -> dict:
         """Process input and return context for the calling agent.
 
@@ -155,6 +158,9 @@ class Brain:
             text=text,
             source=source,
             goal=goal,
+            episode_id=episode_id,
+            intent_id=intent_id,
+            goal_id=goal_id,
         )
         try:
             return await asyncio.wait_for(

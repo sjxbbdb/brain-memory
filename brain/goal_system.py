@@ -145,6 +145,9 @@ class GoalSystem:
         self.total_completed: int = 0
         self.total_failed: int = 0
         self.last_generation_tick: int = 0
+        # Prevent the same terminal goal from modifying self-model drives on
+        # every deep-reflection pass.
+        self._feedback_applied_ids: set[str] = set()
 
     # ── 目标生成 ──
 
@@ -345,6 +348,28 @@ class GoalSystem:
     def get_active(self) -> list[Goal]:
         return [g for g in self._goals if g.status in (GoalStatus.ACTIVE, GoalStatus.PENDING)]
 
+    def get_by_id(self, goal_id: str, include_history: bool = False) -> Goal | None:
+        """Return one goal without exposing the internal list to callers."""
+        for goal in self._goals:
+            if goal.id == goal_id:
+                return goal
+        if include_history:
+            for goal in self._history:
+                if goal.id == goal_id:
+                    return goal
+        return None
+
+    def claim(self, goal_id: str, current_tick: int = 0) -> Goal | None:
+        """Atomically claim a pending goal for one execution attempt."""
+        goal = self.get_by_id(goal_id)
+        if goal is None or goal.status not in (GoalStatus.PENDING, GoalStatus.ACTIVE):
+            return None
+        if goal.status == GoalStatus.PENDING:
+            goal.status = GoalStatus.ACTIVE
+            goal.started_at = datetime.now(timezone.utc).isoformat()
+        goal.attempt_count = max(0, int(goal.attempt_count)) + 1
+        return goal
+
     def get_recently_completed(self, n: int = 5) -> list[Goal]:
         return [g for g in self._history if g.status == GoalStatus.DONE][-n:]
 
@@ -376,6 +401,7 @@ class GoalSystem:
             "max_active": self.max_active,
             "default_deadline_ticks": self.default_deadline_ticks,
             "last_generation_tick": self.last_generation_tick,
+            "feedback_applied_ids": list(self._feedback_applied_ids)[-100:],
             "stats": {
                 "active": self.active_count,
                 "pending": self.pending_count,
@@ -468,6 +494,11 @@ class GoalSystem:
         gs.total_completed = _nonnegative_int(stats.get("total_completed", 0))
         gs.total_failed = _nonnegative_int(stats.get("total_failed", 0))
         gs.last_generation_tick = _nonnegative_int(data.get("last_generation_tick", 0))
+        raw_feedback_ids = data.get("feedback_applied_ids", [])
+        if isinstance(raw_feedback_ids, list):
+            gs._feedback_applied_ids = {
+                str(item)[:100] for item in raw_feedback_ids if item
+            }
         return gs
 
     # ── 自我叙事反馈 ──
@@ -483,11 +514,14 @@ class GoalSystem:
             return None
 
         for goal in recent:
+            if goal.id in self._feedback_applied_ids:
+                continue
             if goal.status == GoalStatus.DONE:
                 # 成功 → 该驱动力增强
                 feedback[goal.drive] = feedback.get(goal.drive, 0) + 0.02
             elif goal.status == GoalStatus.FAILED:
                 # 失败 → 该驱动力减弱（但不过度）
                 feedback[goal.drive] = feedback.get(goal.drive, 0) - 0.01
+            self._feedback_applied_ids.add(goal.id)
 
         return feedback if feedback else None

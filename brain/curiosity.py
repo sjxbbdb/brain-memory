@@ -122,7 +122,10 @@ class CuriosityEngine:
                     question = question.replace("{entity_a}", entity).replace("{entity_b}", "相关概念")
 
                 # 去重：检查是否已存在相同问题
-                if any(q["question"] == question for q in self.open_questions):
+                if any(
+                    isinstance(q, dict) and q.get("question") == question
+                    for q in self.open_questions
+                ):
                     continue
 
                 q = {
@@ -178,7 +181,12 @@ class CuriosityEngine:
         remaining = []
 
         for q in self.open_questions:
-            question_lower = q["question"].lower()
+            if not isinstance(q, dict):
+                continue
+            question = str(q.get("question", ""))
+            if not question:
+                continue
+            question_lower = question.lower()
             # 简单规则：如果新文本和问题有关键词重叠
             q_words = set(question_lower.replace("？", "").replace("?", "").split())
             t_words = set(tl.split())
@@ -215,7 +223,12 @@ class CuriosityEngine:
         # 优先从待解问题中选一个
         if self.open_questions and random.random() < 0.6:
             q = random.choice(self.open_questions)
-            thought = "[{0}] {1}".format(q["drive_label"], q["question"])
+            if not isinstance(q, dict):
+                return None
+            thought = "[{0}] {1}".format(
+                q.get("drive_label") or q.get("drive") or "好奇心",
+                q.get("question", ""),
+            )
             self.spontaneous_thoughts.append(thought)
             if len(self.spontaneous_thoughts) > self.max_spontaneous:
                 self.spontaneous_thoughts = self.spontaneous_thoughts[-self.max_spontaneous:]
@@ -261,12 +274,44 @@ class CuriosityEngine:
 
     # ── 快照 ──
 
+    @staticmethod
+    def _normalize_question(value: Any) -> dict | None:
+        """Decode a question from an older or partially damaged snapshot."""
+        if not isinstance(value, dict):
+            return None
+        question = str(value.get("question", ""))[:300]
+        if not question:
+            return None
+        drive = str(value.get("drive", "curiosity"))[:60] or "curiosity"
+        label = str(value.get("drive_label") or drive)[:80]
+        normalized = {
+            "id": str(value.get("id", ""))[:80],
+            "question": question,
+            "drive": drive,
+            "drive_label": label,
+            "created": str(value.get("created", ""))[:80],
+            "resolved_at": value.get("resolved_at"),
+        }
+        if value.get("resolved_by") is not None:
+            normalized["resolved_by"] = str(value.get("resolved_by"))[:200]
+        return normalized
+
     def snapshot(self) -> dict:
+        open_questions = [
+            question for question in
+            (self._normalize_question(item) for item in self.open_questions)
+            if question is not None
+        ][-self.max_open_questions:]
+        resolved_questions = [
+            question for question in
+            (self._normalize_question(item) for item in self.resolved_questions)
+            if question is not None
+        ][-20:]
         return {
-            "open_questions": self.open_questions,
-            "resolved_questions": self.resolved_questions[-20:],
-            "exploration_topics": self.exploration_topics,
-            "spontaneous_thoughts": self.spontaneous_thoughts[-10:],
+            "open_questions": open_questions,
+            "resolved_questions": resolved_questions,
+            "exploration_topics": [str(item)[:100] for item in self.exploration_topics[-10:]],
+            "spontaneous_thoughts": [str(item)[:300] for item in self.spontaneous_thoughts[-10:]],
             "total_generated": self.total_questions_generated,
             "total_resolved": self.total_questions_resolved,
         }
@@ -274,14 +319,33 @@ class CuriosityEngine:
     @classmethod
     def from_snapshot(cls, data: dict) -> "CuriosityEngine":
         ce = cls()
-        if not data:
+        if not isinstance(data, dict) or not data:
             return ce
-        ce.open_questions = data.get("open_questions", [])
-        ce.resolved_questions = data.get("resolved_questions", [])
-        ce.exploration_topics = data.get("exploration_topics", [])
-        ce.spontaneous_thoughts = data.get("spontaneous_thoughts", [])
-        ce.total_questions_generated = data.get("total_generated", 0)
-        ce.total_questions_resolved = data.get("total_resolved", 0)
+        raw_open = data.get("open_questions", [])
+        raw_resolved = data.get("resolved_questions", [])
+        if isinstance(raw_open, list):
+            ce.open_questions = [
+                question for question in
+                (ce._normalize_question(item) for item in raw_open)
+                if question is not None
+            ][-ce.max_open_questions:]
+        if isinstance(raw_resolved, list):
+            ce.resolved_questions = [
+                question for question in
+                (ce._normalize_question(item) for item in raw_resolved)
+                if question is not None
+            ][-ce.max_resolved:]
+        raw_topics = data.get("exploration_topics", [])
+        if isinstance(raw_topics, list):
+            ce.exploration_topics = [str(item)[:100] for item in raw_topics[-10:]]
+        raw_thoughts = data.get("spontaneous_thoughts", [])
+        if isinstance(raw_thoughts, list):
+            ce.spontaneous_thoughts = [str(item)[:300] for item in raw_thoughts[-ce.max_spontaneous:]]
+        try:
+            ce.total_questions_generated = max(0, int(data.get("total_generated", 0)))
+            ce.total_questions_resolved = max(0, int(data.get("total_resolved", 0)))
+        except (TypeError, ValueError, OverflowError):
+            pass
         return ce
 
     @property

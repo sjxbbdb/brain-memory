@@ -1,8 +1,35 @@
 """Brain Memory v10.0 — Configuration."""
 
+import os
+
+
+def _env_int(
+    name: str,
+    default: int,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    """Read a bounded integer override without making startup fragile."""
+    try:
+        result = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError, OverflowError):
+        result = default
+    if minimum is not None and result < minimum:
+        result = default
+    if maximum is not None and result > maximum:
+        result = default
+    return result
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 # ── Server ──
-HOST = "127.0.0.1"
-PORT = 8001
+HOST = os.getenv("BRAIN_MEMORY_HOST", "127.0.0.1") or "127.0.0.1"
+PORT = _env_int("BRAIN_MEMORY_PORT", 8001, minimum=1, maximum=65535)
 INPUT_TIMEOUT_SEC = 15           # 等待大脑处理输入的秒数
 LOG_LEVEL = "INFO"               # 日志级别: DEBUG|INFO|WARNING|ERROR
 
@@ -12,6 +39,25 @@ REFLECTION_INTERVAL_SEC = 60    # 没外部输入时，多久自己反思一次
 STATE_SNAPSHOT_INTERVAL_SEC = 60  # 状态快照持久化间隔
 DEEP_REFLECTION_INTERVAL_TICKS = 600  # 深度自我反思间隔（tick数，600≈20min）
 DEEP_REFLECTION_ENABLED = True  # 是否启用深度反思（关闭可大幅省token）
+
+# ── Autonomous Episode ──
+# The episode layer turns existing drives/goals/tools into one bounded,
+# observable action cycle.  It is deliberately conservative by default:
+# one episode at a time and a finite wait before safe failure.
+AUTONOMY_ENABLED = _env_bool("BRAIN_MEMORY_AUTONOMY_ENABLED", True)
+AUTONOMY_GOAL_INTERVAL_TICKS = _env_int(
+    "BRAIN_MEMORY_AUTONOMY_GOAL_INTERVAL_TICKS", 30, minimum=1, maximum=100000
+)       # ~60s at the default 2s heartbeat
+AUTONOMY_MAX_EPISODE_TICKS = _env_int(
+    "BRAIN_MEMORY_AUTONOMY_MAX_EPISODE_TICKS", 180, minimum=10, maximum=100000
+)        # ~6 minutes before safe timeout
+
+# The API process can host the read-only execution boundary alongside the
+# brain.  Writes stay disabled unless an operator explicitly opts in.
+AGENT_BRIDGE_ENABLED = _env_bool("BRAIN_MEMORY_AGENT_BRIDGE_ENABLED", True)
+AGENT_BRIDGE_ALLOW_WRITE_TOOLS = _env_bool(
+    "BRAIN_MEMORY_AGENT_BRIDGE_ALLOW_WRITE_TOOLS", False
+)
 
 # ── LLM ──
 LLM_DEFAULT_PROVIDER = "deepseek"
@@ -46,7 +92,7 @@ EMOTION_DECAY_RATE = 0.95        # 每个 tick 情绪衰减系数
 SALIENCE_THRESHOLD = 0.5         # 突显度超过此值触发注意力聚焦
 
 # ── Database ──
-DB_PATH = "brain_v4.db"
+DB_PATH = os.getenv("BRAIN_MEMORY_DB_PATH", "brain_v4.db") or "brain_v4.db"
 
 # ── Goal System (v5.1) ──
 GOAL_MAX_ACTIVE = 3               # 最多活跃目标数

@@ -5,6 +5,7 @@ REST:
   POST /api/v4/input        — 外部输入
   GET  /api/v4/monologue    — 内在独白
   GET  /api/v4/health       — 健康检查
+  GET  /api/v11/autonomy    — 自主经历状态与有限历史
 
 WebSocket:
   ws://host:8001/ws         — 实时脑状态推送
@@ -30,13 +31,20 @@ from pydantic import BaseModel, Field
 
 from brain.core import Brain
 from brain.core_purpose import core_purpose  # V8
-from agent.tool_registry import discover_tools
-from config import HOST, PORT
+from agent.tool_registry import discover_tools, registry
+from agent_bridge import AgentBridge
+from config import (
+    HOST,
+    PORT,
+    AGENT_BRIDGE_ENABLED,
+    AGENT_BRIDGE_ALLOW_WRITE_TOOLS,
+)
 
 logger = logging.getLogger("brain-v5.api")
 
 # ── Global brain instance ──
 _brain: Brain | None = None
+_bridge: AgentBridge | None = None
 _API_RESERVED_SOURCES = {"creator", "self"}
 _API_REQUESTOR = "api"
 
@@ -87,9 +95,11 @@ def _bounded_limit(value: int, default: int = 20, maximum: int = 100) -> int:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _brain
+    global _brain, _bridge
     _brain = Brain()
+    _bridge = None
     broadcaster = None
+    bridge = None
     try:
         # Registration is safe at startup; actual execution remains behind the
         # explicit AgentBridge boundary.  A broken optional module should not
@@ -101,10 +111,31 @@ async def lifespan(app: FastAPI):
             logger.warning("tool discovery failed: %s", str(exc)[:120])
 
         await _brain.wake_up()
+        if AGENT_BRIDGE_ENABLED:
+            try:
+                # Keep the execution boundary in the same event loop as the
+                # heartbeat.  The bridge defaults to read-only tools; any
+                # write-capable tool requires an explicit operator flag.
+                bridge = AgentBridge(
+                    _brain.brain_stem,
+                    registry,
+                    workspace_root=_sys_path_root,
+                    allow_write_tools=AGENT_BRIDGE_ALLOW_WRITE_TOOLS,
+                )
+                await bridge.start()
+                _bridge = bridge
+            except Exception as exc:
+                bridge = None
+                _bridge = None
+                logger.warning("agent bridge failed to start: %s", str(exc)[:120])
         # Start broadcasting only after the heartbeat is live.  Otherwise a
         # startup failure leaves an orphan background task behind.
         broadcaster = asyncio.create_task(_broadcast_loop())
-        logger.info("Brain v10.0 API started (tools=%s)", discovered_tools)
+        logger.info(
+            "Brain v10.0 API + V11 autonomy started (tools=%s, bridge=%s)",
+            discovered_tools,
+            bool(bridge),
+        )
         yield
     finally:
         if broadcaster is not None:
@@ -115,6 +146,12 @@ async def lifespan(app: FastAPI):
                 pass
             except Exception as exc:
                 logger.warning("state broadcaster stopped with an error: %s", str(exc)[:120])
+        if bridge is not None:
+            try:
+                await bridge.stop()
+            except Exception as exc:
+                logger.warning("agent bridge shutdown encountered an error: %s", str(exc)[:120])
+        _bridge = None
         if _brain is not None:
             try:
                 await _brain.sleep()
@@ -122,7 +159,7 @@ async def lifespan(app: FastAPI):
                 # Shutdown should remain best-effort even when a storage
                 # handle or optional subsystem failed during startup.
                 logger.warning("brain shutdown encountered an error: %s", str(exc)[:120])
-        logger.info("Brain v10.0 API stopped")
+        logger.info("Brain v10.0 API + V11 autonomy stopped")
 
 
 async def _broadcast_loop():
@@ -160,6 +197,9 @@ class InputRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=4000, description="input text from calling agent")
     source: str = Field("external", min_length=1, max_length=200, description="source identifier")
     goal: str | None = Field(None, max_length=500, description="current goal")
+    episode_id: str | None = Field(None, max_length=80, description="optional autonomous episode correlation ID")
+    intent_id: str | None = Field(None, max_length=80, description="optional intent correlation ID")
+    goal_id: str | None = Field(None, max_length=100, description="optional goal correlation ID")
 
 
 @app.get("/api/v4/state")
@@ -179,6 +219,9 @@ async def post_input(req: InputRequest):
         text=req.text,
         source=_sanitize_api_source(req.source),
         goal=req.goal,
+        episode_id=req.episode_id,
+        intent_id=req.intent_id,
+        goal_id=req.goal_id,
     )
     # 立即推送最新状态给所有 WebSocket 客户端
     await brain.broadcast_state()
@@ -338,6 +381,11 @@ async def health():
         "last_heartbeat_at": state.get("last_heartbeat_at", ""),
         "active_sessions": brain.brain_stem.state.session_manager.get_session_count(),
         "sleep_state": brain.brain_stem.sleep_state,
+        "autonomy": state.get("autonomy", {}),
+        "bridge": _bridge.snapshot() if _bridge is not None else {
+            "enabled": bool(AGENT_BRIDGE_ENABLED),
+            "running": False,
+        },
     }
 
 
@@ -347,6 +395,23 @@ async def get_goals():
     brain = get_brain()
     gs = brain.brain_stem.goal_system
     return gs.snapshot()
+
+
+@app.get("/api/v11/autonomy")
+async def get_autonomy():
+    """V11: inspect the bounded autonomous episode ledger."""
+    brain = get_brain()
+    manager = getattr(brain.brain_stem, "autonomy", None)
+    if manager is None:
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "active": None,
+            "history": [],
+        }
+    snapshot = manager.snapshot()
+    snapshot["enabled"] = True
+    return snapshot
 
 
 @app.get("/api/v4/metacognition")

@@ -32,7 +32,7 @@ from brain.pipeline import gate_check, compute_emotion_weight, compute_strength,
 from brain.working_memory import WorkingMemory
 from brain.brain_state import BrainState, SNAPSHOT_SCHEMA_VERSION
 from brain.self_model import SelfModel
-from brain.intent import Intent, IntentQueue
+from brain.intent import Intent, IntentQueue, IntentType
 from brain.goal_system import GoalSystem
 from brain.metacognition import Metacognition
 from brain.emotional_spectrum import EmotionalSpectrum
@@ -49,6 +49,7 @@ from brain.social_self import SocialEmotionEngine, AttachmentSystem  # V10
 from brain.reward_system import RewardSystem  # V10
 from brain.autobiographical import AutobiographicalNarrative  # V10
 from brain.boundary import BoundaryEngine  # V10
+from brain.autonomy import AutonomyEpisode, EpisodeStatus  # V11
 from config import (
     TICK_INTERVAL_SEC,
     MEMORY_DECAY_RATE,
@@ -77,6 +78,9 @@ from config import (
     REWARD_SYSTEM_ENABLED,
     AUTOBIO_ENABLED,
     BOUNDARY_ENABLED,
+    AUTONOMY_ENABLED,
+    AUTONOMY_GOAL_INTERVAL_TICKS,
+    AUTONOMY_MAX_EPISODE_TICKS,
 )
 
 logger = logging.getLogger("brain-v5.brain-stem")
@@ -169,12 +173,22 @@ class BrainStem:
         self.autobiography = AutobiographicalNarrative() if AUTOBIO_ENABLED else None
         self.boundary = BoundaryEngine() if BOUNDARY_ENABLED else None
 
+        # V11: a bounded causal record for internally generated action cycles.
+        # The manager never executes a tool; it only coordinates state,
+        # feedback and recovery across BrainStem and AgentBridge.
+        self.autonomy = (
+            AutonomyEpisode(max_ticks=AUTONOMY_MAX_EPISODE_TICKS)
+            if AUTONOMY_ENABLED else None
+        )
+
         # Stats
         self.start_time = datetime.now(timezone.utc)
         self.state.total_ticks = 0
         self.last_reflection = 0.0
         self.last_snapshot = 0.0
         self.last_decay = 0.0
+        if self.autonomy:
+            self.state.autonomy = self.autonomy.summary()
 
     # ── Public API ──
 
@@ -296,6 +310,38 @@ class BrainStem:
                     self._record_loop_error("state_restore", exc)
                     logger.warning("brain-stem: ignoring invalid snapshot: %s", str(exc)[:120])
 
+        # Tool execution is intentionally not replayed from a snapshot: a
+        # crash may have happened after an external side effect but before its
+        # feedback was journaled.  Close an in-flight action as interrupted so
+        # the next heartbeat can make a fresh, policy-checked decision.  If
+        # feedback was already durable, preserve that outcome without running
+        # the tool a second time.
+        if self.autonomy and self.autonomy.is_active:
+            active = self.autonomy.active
+            if active and active.status == EpisodeStatus.FEEDBACK_RECEIVED:
+                recovered_success = active.success is not False
+                recovered_outcome = "重启前已收到反馈，结果已恢复"
+                recovered = (
+                    self.autonomy.complete(recovered_outcome, self.state.total_ticks)
+                    if recovered_success
+                    else self.autonomy.fail(recovered_outcome, self.state.total_ticks)
+                )
+                self._finish_autonomy_episode(
+                    recovered,
+                    recovered_success,
+                    recovered_outcome,
+                )
+            else:
+                interrupted = self.autonomy.abort(
+                    "进程重启，未重放未确认行动",
+                    self.state.total_ticks,
+                )
+                self._finish_autonomy_episode(
+                    interrupted,
+                    False,
+                    "进程重启，未重放未确认行动",
+                )
+
         self.state.awake = True
         self._restored_uptime_seconds = max(0.0, float(self.state.uptime_seconds or 0.0))
         # ``wake_up`` means the process is available, but preserve the
@@ -410,7 +456,15 @@ class BrainStem:
             logger.info("brain-stem: discarded %d queued input(s) during shutdown", discarded)
         return discarded
 
-    async def receive_input(self, text: str, source: str = "external", goal: str | None = None):
+    async def receive_input(
+        self,
+        text: str,
+        source: str = "external",
+        goal: str | None = None,
+        episode_id: str | None = None,
+        intent_id: str | None = None,
+        goal_id: str | None = None,
+    ):
         """Receive input from an external agent. Pushes to input queue."""
         self._ensure_loop_primitives()
         # This legacy one-way API does not need a completion future.  Avoid
@@ -419,6 +473,9 @@ class BrainStem:
             text=text,
             source=source,
             goal=goal,
+            episode_id=episode_id,
+            intent_id=intent_id,
+            goal_id=goal_id,
             track=False,
             _raise_on_reject=True,
         )
@@ -430,6 +487,9 @@ class BrainStem:
         text: str,
         source: str = "external",
         goal: str | None = None,
+        episode_id: str | None = None,
+        intent_id: str | None = None,
+        goal_id: str | None = None,
         track: bool = True,
         _raise_on_reject: bool = False,
     ) -> tuple[str, asyncio.Future | None]:
@@ -443,6 +503,9 @@ class BrainStem:
         source = str(source or "external")[:200]
         text = str(text or "")[:4000]
         goal = str(goal)[:500] if goal is not None else None
+        episode_id = str(episode_id)[:80] if episode_id else None
+        intent_id = str(intent_id)[:80] if intent_id else None
+        goal_id = str(goal_id)[:100] if goal_id else None
         future = None
         # ``submit_input`` is also used by the legacy pre-start path.  A first
         # request may be buffered before ``start()``, but after an instance has
@@ -471,6 +534,9 @@ class BrainStem:
             "text": text,
             "source": source,
             "goal": goal,
+            "episode_id": episode_id,
+            "intent_id": intent_id,
+            "goal_id": goal_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         if track:
@@ -738,6 +804,259 @@ class BrainStem:
             "pending": pending,
         }
 
+    # ── V11: Autonomous episode coordination ──
+
+    def _sync_autonomy_projection(self) -> None:
+        """Keep the API/snapshot projection aligned with the live manager."""
+        if self.autonomy is not None:
+            self.state.autonomy = self.autonomy.summary()
+
+    def _find_goal(self, goal_id: str | None):
+        if not goal_id:
+            return None
+        return self.goal_system.get_by_id(str(goal_id))
+
+    def _finish_autonomy_episode(
+        self,
+        record,
+        success: bool,
+        outcome: str,
+    ) -> None:
+        """Apply one closed episode to goals, reward and self-narrative.
+
+        All integrations are best-effort and synchronous.  A bookkeeping
+        failure must never take down the heartbeat that just completed the
+        action.
+        """
+        if record is None:
+            return
+        try:
+            goal = self._find_goal(getattr(record, "goal_id", ""))
+            status = getattr(record, "status", "")
+            episode_success = bool(
+                status == EpisodeStatus.COMPLETED
+                and getattr(record, "success", None) is not False
+                and success
+            )
+            if status == EpisodeStatus.COMPLETED and goal is not None:
+                was_actionable = getattr(goal, "status", "") in {"active", "pending"}
+                if getattr(goal, "status", "") in {"active", "pending"}:
+                    self.goal_system.mark_done(goal.id, outcome[:240])
+                if was_actionable and getattr(goal, "status", "") == "done":
+                    self.drive_engine.notify_goal_completed()
+            elif status == EpisodeStatus.FAILED and goal is not None:
+                if getattr(goal, "status", "") == "active":
+                    self.goal_system.mark_failed(goal.id, outcome[:240])
+
+            if self.reward_system and status in {
+                EpisodeStatus.COMPLETED,
+                EpisodeStatus.FAILED,
+            }:
+                quality = getattr(record, "result_quality", "unknown")
+                actual_reward = (
+                    0.8 if quality == "verified" and episode_success
+                    else 0.55 if quality == "simulated" and episode_success
+                    else 0.2
+                )
+                reward_event = self.reward_system.deliver_reward(
+                    channel="achievement",
+                    actual_reward=actual_reward,
+                    context=f"autonomy:{getattr(record, 'tool_name', '') or 'episode'}",
+                )
+                # Keep the reward and its local prediction error attached to
+                # the episode so a snapshot explains why a goal changed.
+                record.reward = actual_reward
+                record.prediction_error = reward_event.prediction_error
+            elif status in {EpisodeStatus.COMPLETED, EpisodeStatus.FAILED}:
+                record.reward = (
+                    0.55
+                    if episode_success and getattr(record, "result_quality", "") == "simulated"
+                    else 0.8 if episode_success
+                    else 0.2
+                )
+
+            description = getattr(record, "goal", "自主经历")[:180]
+            result_text = "完成" if episode_success else (
+                "中止" if status == EpisodeStatus.ABORTED else "失败"
+            )
+            quality_note = (
+                "（模拟结果，未作为外部事实确认）"
+                if getattr(record, "result_quality", "") == "simulated"
+                else ""
+            )
+            marker = f"[自主经历] {result_text}{quality_note}：{description}"
+            self.working_memory.push(
+                marker[:240], "autonomy", 0.55 if episode_success else 0.35
+            )
+            self.state.last_narrative = marker[:500]
+
+            # A compact episodic memory preserves the causal outcome without
+            # copying a potentially sensitive tool response into the ledger.
+            if self.memory_store and status in {
+                EpisodeStatus.COMPLETED,
+                EpisodeStatus.FAILED,
+            }:
+                memory_id = self.memory_store.save({
+                    "type": "episodic",
+                    "title": f"自主经历：{description[:60]}",
+                    "content": marker,
+                    "summary": marker,
+                    "source": "autonomy",
+                    "importance": (
+                        0.65
+                        if episode_success and getattr(record, "result_quality", "") != "simulated"
+                        else 0.45 if episode_success
+                        else 0.4
+                    ),
+                    "emotion_label": "breakthrough" if episode_success else "confused",
+                    "emotion_vector": dict(self.state.emotion_vector),
+                    "is_identity_forming": False,
+                })
+                record.memory_ids = [memory_id]
+            if status in {EpisodeStatus.COMPLETED, EpisodeStatus.FAILED}:
+                self.state.self_model.ingest_experience(
+                    text=marker,
+                    emotion={
+                        "emotion_label": "breakthrough" if episode_success else "failure",
+                        "emotion_vector": dict(self.state.emotion_vector),
+                        "salience": (
+                            0.65
+                            if episode_success and getattr(record, "result_quality", "") != "simulated"
+                            else 0.45 if episode_success
+                            else 0.35
+                        ),
+                    },
+                    importance=(
+                        0.65
+                        if episode_success and getattr(record, "result_quality", "") != "simulated"
+                        else 0.45 if episode_success
+                        else 0.4
+                    ),
+                    memory_count=self.memory_store.count() if self.memory_store else 0,
+                )
+        except Exception as exc:
+            self._record_loop_error("autonomy_close", exc)
+        finally:
+            self._sync_autonomy_projection()
+
+    def _record_autonomy_feedback(
+        self,
+        input_data: dict,
+        success: bool,
+        tool_name: str,
+    ) -> bool:
+        if self.autonomy is None:
+            return False
+        episode_id = input_data.get("episode_id")
+        if not episode_id:
+            # Legacy bridges did not send correlation IDs.  Only use the
+            # single-lane fallback when the returned tool name also matches
+            # the action we are waiting for; otherwise unrelated external
+            # tool traffic must remain an orphan rather than close this run.
+            active = self.autonomy.active
+            if (
+                active is not None
+                and active.status in {
+                    EpisodeStatus.AWAITING_ACTION,
+                    EpisodeStatus.AWAITING_FEEDBACK,
+                }
+                and active.tool_name == tool_name
+            ):
+                episode_id = active.id
+        if not episode_id:
+            # ``AutonomyEpisode`` deliberately requires explicit correlation.
+            # Account for the unmatched observation without letting it mutate
+            # whichever episode happens to be active.
+            self.autonomy.total_orphan_feedback += 1
+            self._sync_autonomy_projection()
+            return False
+        accepted = self.autonomy.record_feedback(
+            episode_id=episode_id,
+            success=success,
+            tool_name=tool_name,
+            tick=self.state.total_ticks,
+            intent_id=input_data.get("intent_id") or "",
+            result_summary="success" if success else "failure",
+            result_quality=self._classify_autonomy_feedback(
+                input_data.get("text", ""), success
+            ),
+        )
+        self._sync_autonomy_projection()
+        return accepted
+
+    @staticmethod
+    def _classify_autonomy_feedback(text: str, success: bool) -> str:
+        """Classify execution feedback without treating placeholders as facts."""
+        if not success:
+            return "failed"
+        normalized = str(text or "").lower()
+        if any(
+            marker in normalized
+            for marker in ("模拟", "simulated", "dry-run", "需配置搜索引擎")
+        ):
+            return "simulated"
+        return "verified"
+
+    def _observe_autonomy_intent(self, intent: Intent) -> bool:
+        """Attach a follow-up intent to the active episode.
+
+        Returns True when the correlated follow-up was consumed, whether it
+        schedules another action or closes the episode.
+        """
+        if self.autonomy is None or not self.autonomy.is_active:
+            return False
+        active = self.autonomy.active
+        if active is None:
+            return False
+        if intent.episode_id and intent.episode_id != active.id:
+            # A follow-up produced for another causal lane must never mutate
+            # the currently active episode.
+            return False
+        if intent.goal_id and intent.goal_id != active.goal_id:
+            return False
+        # Tool feedback may come from an older bridge that did not carry the
+        # correlation field.  In that case the single active episode is the
+        # only safe fallback.
+        if not intent.episode_id:
+            intent.episode_id = active.id
+        if not intent.goal_id:
+            intent.goal_id = active.goal_id
+        if not intent.origin or intent.origin == "external":
+            intent.origin = active.origin or "autonomous"
+        if intent.type == IntentType.CALL_TOOL:
+            planned = self.autonomy.plan(
+                episode_id=active.id,
+                action_type=intent.type.value,
+                tool_name=intent.tool_name or "",
+                tick=self.state.total_ticks,
+                reason=intent.reason,
+                intent_id=intent.intent_id,
+                expected=intent.reason[:240],
+                attempt_no=intent.attempt_no,
+            )
+            self._sync_autonomy_projection()
+            return planned
+        if intent.type in {
+            IntentType.RESPOND,
+            IntentType.THINK,
+            IntentType.ASK_QUESTION,
+        } and active.status == EpisodeStatus.FEEDBACK_RECEIVED:
+            outcome = (
+                intent.response_text
+                or intent.thought
+                or intent.question
+                or "反馈已吸收"
+            )
+            success = active.success is not False
+            record = (
+                self.autonomy.complete(outcome[:300], self.state.total_ticks)
+                if success
+                else self.autonomy.fail(outcome[:300], self.state.total_ticks)
+            )
+            self._finish_autonomy_episode(record, success, outcome)
+            return True
+        return False
+
     def _restore_snapshot(self, snapshot: dict) -> None:
         """Restore the durable parts of the consciousness runtime.
 
@@ -802,6 +1121,9 @@ class BrainStem:
         _restore_component("exploration_queue", "exploration_queue", ExplorationQueue.from_snapshot)
         _restore_component("reflection_engine", "reflection_engine", ReflectionEngine.from_snapshot)
         _restore_component("drive_engine", "drive_engine", DriveEngine.from_snapshot)
+        if self.autonomy is not None and isinstance(snapshot.get("autonomy"), dict):
+            _restore_component("autonomy", "autonomy", AutonomyEpisode.from_snapshot)
+            self._sync_autonomy_projection()
 
         raw_thalamus = snapshot.get("thalamus", {})
         if isinstance(raw_thalamus, dict):
@@ -878,6 +1200,19 @@ class BrainStem:
         # per-request future so an exception can be reported to the correct
         # caller instead of waking every caller at once.
         self._active_input_id = None
+        autonomy_feedback_seen = False
+        autonomy_followup_intent = False
+        autonomy_feedback_success = False
+        autonomy_feedback_tool = ""
+
+        if self.autonomy:
+            expired = self.autonomy.tick(self.state.total_ticks)
+            if expired:
+                self._finish_autonomy_episode(
+                    expired,
+                    False,
+                    expired.outcome or "自主经历超时",
+                )
 
         # ── V6: ActivationField tick — 状态扩散 + 基线回归 ──
         activation = self.state.activation
@@ -944,6 +1279,21 @@ class BrainStem:
             input_data and thalamus_out.get("has_input") and not boundary_accepted
         )
 
+        # A new accepted subject input preempts an in-flight autonomous action;
+        # a rejected message does not get to rewrite the episode timeline.
+        if (
+            input_data
+            and not refused_input
+            and self.autonomy
+            and self.autonomy.is_active
+            and not str(input_data.get("source", "")).startswith("agent/")
+        ):
+            interrupted = self.autonomy.abort(
+                "外部输入打断自主经历",
+                self.state.total_ticks,
+            )
+            self._finish_autonomy_episode(interrupted, False, "外部输入打断")
+
         # Commit per-source context only after the input boundary has passed.
         # Rejected traffic remains observable as a boundary event, but cannot
         # switch the active session, wake the subject, or reset its idle clock.
@@ -973,6 +1323,23 @@ class BrainStem:
             self.state.ticks_since_input = previous_ticks_since_input + 1
             self.sleep_state = previous_sleep_state
             self.state.sleep_state = self.sleep_state
+
+        # Register tool feedback before cognitive dispatch so a follow-up
+        # intent can advance the same episode instead of racing its status.
+        if input_data and not refused_input and str(
+            input_data.get("source", "")
+        ).startswith("agent/tool/"):
+            feedback_text = (input_data.get("text", "") or "").lower()
+            autonomy_feedback_success = not any(
+                keyword in feedback_text
+                for keyword in ["失败", "error", "错误", "exception", "traceback"]
+            )
+            autonomy_feedback_tool = str(input_data.get("source", ""))[len("agent/tool/"):]
+            autonomy_feedback_seen = self._record_autonomy_feedback(
+                input_data,
+                autonomy_feedback_success,
+                autonomy_feedback_tool,
+            )
 
         # ── V9 Predictive Layer: 在感知之前生成预测 ──
         # Build an expectation only for an accepted message.  A rejected
@@ -1392,6 +1759,13 @@ class BrainStem:
                         source_input=thalamus_out["text"][:200],
                     )
                     if intent:
+                        if (
+                            input_data
+                            and str(input_data.get("source", "")).startswith("agent/tool/")
+                            and self.autonomy
+                            and self.autonomy.is_active
+                        ):
+                            autonomy_followup_intent = self._observe_autonomy_intent(intent)
                         # V8: 行为倾向特质调制 intent 置信度
                         intent.confidence = self.state.self_model.modulate_intent(
                             intent.type.value, intent.confidence)
@@ -1463,16 +1837,98 @@ class BrainStem:
                     first_q = new_qs[0]["question"]
                     self.state.inner_monologue = "[好奇] {0}".format(first_q[:150])
 
+            # V11: periodically turn persistent internal signals into a
+            # bounded candidate goal.  Generation is throttled and deduped in
+            # _tick_drive_engine; it no longer waits for a 10-minute deep
+            # reflection before the subject can initiate an action.
+            if (
+                AUTONOMY_ENABLED
+                and self.sleep_state == "awake"
+                and AUTONOMY_GOAL_INTERVAL_TICKS > 0
+                and self.state.total_ticks > 0
+                and self.state.total_ticks % AUTONOMY_GOAL_INTERVAL_TICKS == 0
+            ):
+                self._tick_drive_engine(activation)
+
             # ── v5.1 Goal System: tick active goals, produce intent if actionable ──
             if self.state.ticks_since_input % 15 == 0 and self.sleep_state == "awake":
                 active_goal = self.goal_system.tick_goals(self.state.total_ticks)
                 if active_goal and active_goal.status == "active":
+                    # There is one causal lane for autonomous work.  Do not
+                    # switch goals while an episode is waiting for its bridge
+                    # or feedback; doing so would orphan the old episode and
+                    # let a late tool result close the wrong goal.
+                    active_episode = self.autonomy.active if self.autonomy else None
+                    episode_busy = bool(
+                        active_episode
+                        and active_episode.status not in {
+                            EpisodeStatus.COMPLETED,
+                            EpisodeStatus.FAILED,
+                            EpisodeStatus.ABORTED,
+                        }
+                    )
+                    episode = None
+                    if self.autonomy and not episode_busy:
+                        claimed_goal = self.goal_system.claim(
+                            active_goal.id,
+                            current_tick=self.state.total_ticks,
+                        )
+                        if claimed_goal is not None:
+                            active_goal = claimed_goal
+                            episode = self.autonomy.begin(
+                                goal_id=active_goal.id,
+                                goal=active_goal.description,
+                                drive=getattr(active_goal, "source_drive", "") or active_goal.drive,
+                                trigger="drive",
+                                tick=self.state.total_ticks,
+                                attempt_no=active_goal.attempt_count,
+                            )
+
                     # Convert goal to a CALL_TOOL intent if we have tools to execute it
-                    goal_intent = self._goal_to_intent(active_goal)
+                    can_issue = (self.autonomy is None) or (episode is not None)
+                    goal_intent = (
+                        self._goal_to_intent(
+                            active_goal,
+                            episode_id=episode.id if episode else (
+                                active_episode.id if episode_busy else None
+                            ),
+                            attempt_no=getattr(active_goal, "attempt_count", 0),
+                        )
+                        if can_issue and not episode_busy else None
+                    )
                     if goal_intent:
+                        if episode:
+                            self.autonomy.plan(
+                                episode.id,
+                                goal_intent.type.value,
+                                goal_intent.tool_name or "",
+                                self.state.total_ticks,
+                                goal_intent.reason,
+                                intent_id=goal_intent.intent_id,
+                                expected=f"完成目标：{active_goal.description[:180]}",
+                                attempt_no=goal_intent.attempt_no,
+                            )
+                            if self.reward_system:
+                                self.reward_system.anticipate(
+                                    channel="achievement",
+                                    expectation=max(
+                                        0.0,
+                                        min(1.0, float(getattr(active_goal, "priority", 0.5))),
+                                    ),
+                                )
                         self.state.last_intent = goal_intent.to_dict()
                         self.state.intent_count += 1
-                        await self.intent_queue.put(goal_intent)
+                        queued = await self.intent_queue.put(goal_intent)
+                        if not queued and episode:
+                            failed = self.autonomy.fail(
+                                "意图队列已满，行动未交付",
+                                self.state.total_ticks,
+                            )
+                            self._finish_autonomy_episode(
+                                failed,
+                                False,
+                                "意图队列已满，行动未交付",
+                            )
                         self.working_memory.push(
                             content="[目标驱动] {0}".format(active_goal.description[:100]),
                             source="goal_system",
@@ -1528,20 +1984,44 @@ class BrainStem:
         # ── v5.2: detect tool result inputs (agent feedback loop) and feed outcomes ──
         if input_data and not refused_input and input_data.get("source", "").startswith("agent/tool/"):
             # Tool result came back — if text doesn't contain error, treat as success
-            text_lower = (input_data.get("text", "") or "").lower()
-            is_error = any(kw in text_lower for kw in ["失败", "error", "错误", "exception", "traceback"])
-            success = not is_error
+            success = autonomy_feedback_success
+            tool = autonomy_feedback_tool or input_data.get("source", "").replace("agent/tool/", "")
             self.metacognition.feed_outcome(success, 0.6)
             # v5.4: record experience for procedural memory
-            tool = input_data.get("source", "").replace("agent/tool/", "")
             self.procedural_memory.record_experience("call_tool", tool, success, input_data.get("text", "")[:200])
             # V10: 工具结果 → 奖励交付
-            if self.reward_system:
+            # Autonomous episodes receive one richer, correlated reward in
+            # ``_finish_autonomy_episode``.  Avoid double-counting the same
+            # tool result here; external tool traffic keeps the legacy path.
+            if self.reward_system and not autonomy_feedback_seen:
                 actual_reward = 0.7 if success else 0.2
                 self.reward_system.deliver_reward(
                     channel="achievement",
                     actual_reward=actual_reward,
                     context=f"tool:{tool}",
+                )
+
+            # In offline/rule-only mode no follow-up LLM intent may be
+            # produced.  A successfully observed tool result is still a
+            # complete one-step episode; close it here rather than leaving a
+            # goal permanently in ``feedback_received``.
+            if (
+                autonomy_feedback_seen
+                and self.autonomy
+                and self.autonomy.is_active
+                and not autonomy_followup_intent
+            ):
+                active = self.autonomy.active
+                outcome = f"工具 {tool} {'执行成功' if success else '返回失败'}"
+                record = (
+                    self.autonomy.complete(outcome, self.state.total_ticks)
+                    if success
+                    else self.autonomy.fail(outcome, self.state.total_ticks)
+                )
+                self._finish_autonomy_episode(
+                    record,
+                    success,
+                    outcome,
                 )
 
         # ── v5.3: 情感光谱 tick（每个 tick 漂移一步）──
@@ -1826,11 +2306,28 @@ Rules:
             current_tick=self.state.total_ticks,
         )
 
-        # 4. 注册到 goal_system 并调度排序
+        # 4. 注册到 goal_system 并调度排序。  GoalGenerator 是基于驱动
+        # 的候选生成器，不是持久化 owner；这里做指纹去重并尊重容量，
+        # 避免每次心跳把旧目标重新追加后又互相 abandoned。
+        existing = {
+            (getattr(goal, "drive", ""), getattr(goal, "description", "")[:160])
+            for goal in self.goal_system.get_active()
+        }
+        capacity = max(
+            0,
+            int(getattr(self.goal_system, "max_active", 3))
+            - len(self.goal_system.get_active()),
+        )
+        added = 0
         for g in new_goals:
+            fingerprint = (getattr(g, "drive", ""), getattr(g, "description", "")[:160])
+            if fingerprint in existing or added >= capacity:
+                continue
             self.goal_system._goals.append(g)
             self.goal_system.total_generated += 1
             self.drive_engine.total_goals_generated += 1
+            existing.add(fingerprint)
+            added += 1
             self.working_memory.push(
                 content="[V7目标] {0}".format(g.description[:80]),
                 source="drive_engine",
@@ -1847,7 +2344,12 @@ Rules:
         activation = self.state.activation
         self._tick_drive_engine(activation)
 
-    def _goal_to_intent(self, goal) -> Intent | None:
+    def _goal_to_intent(
+        self,
+        goal,
+        episode_id: str | None = None,
+        attempt_no: int = 0,
+    ) -> Intent | None:
         """v5.1: Convert a goal into a CALL_TOOL intent."""
         from brain.intent import IntentType
 
@@ -1869,6 +2371,11 @@ Rules:
             confidence=goal.priority * 0.8,
             reason="goal-driven: {0}".format(goal.description[:60]),
             source_input=goal.description[:200],
+            episode_id=episode_id,
+            goal_id=getattr(goal, "id", None),
+            attempt_no=max(0, int(attempt_no or 0)),
+            origin="autonomous",
+            created_tick=self.state.total_ticks,
         )
 
     async def _snapshot_state(self):
@@ -1879,6 +2386,8 @@ Rules:
             self.state.sleep_state = self.sleep_state
             self.state.active_thoughts = [dict(item) for item in self.working_memory.items]
             self.state.current_context = self.working_memory.get_context()
+            if self.autonomy:
+                self._sync_autonomy_projection()
             snap = self.state.snapshot()  # State.snapshot() already includes activation
             snap["working_memory"] = self.working_memory.snapshot()
             snap["last_archived_count"] = self._last_archived_count
@@ -1901,6 +2410,8 @@ Rules:
             }
             snap["reflection_engine"] = self.reflection_engine.snapshot()
             snap["drive_engine"] = self.drive_engine.snapshot()
+            if self.autonomy:
+                snap["autonomy"] = self.autonomy.snapshot()
             snap["thalamus"] = {
                 "last_input": self.thalamus.last_input,
                 "noise_discarded": self.thalamus.noise_discarded,

@@ -1,50 +1,75 @@
 @echo off
+setlocal EnableExtensions
 chcp 65001 >nul
-title Brain Memory v5.0
+title Brain Memory v10.0
+
+set "ROOT=%~dp0"
+cd /d "%ROOT%"
 
 echo.
 echo   ========================================
-echo     Brain Memory v5.0 — Self-Aware Agent
+echo     Brain Memory v10.0 - Self-Aware Agent
 echo   ========================================
 echo.
 
-:: Check Python
-python --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo   [ERROR] Python not found. Install Python 3.12+
+:: Check the system Python only as the venv bootstrap runtime.
+where python >nul 2>&1
+if errorlevel 1 (
+    echo   [ERROR] Python not found. Install Python 3.12+.
+    pause
+    exit /b 1
+)
+for /f "tokens=2" %%v in ('python --version 2^>^&1') do set "SYSTEM_PYVER=%%v"
+echo   Bootstrap Python: %SYSTEM_PYVER%
+
+:: Keep all project packages inside the repository-local virtual environment.
+if not exist ".venv\Scripts\python.exe" (
+    echo   Creating project virtual environment...
+    python -m venv .venv
+    if errorlevel 1 (
+        echo   [ERROR] Could not create .venv.
+        pause
+        exit /b 1
+    )
+)
+set "PYTHON=%ROOT%.venv\Scripts\python.exe"
+set "LOCKFILE=%ROOT%requirements.lock"
+if not exist "%LOCKFILE%" set "LOCKFILE=%ROOT%requirements.txt"
+
+echo   Checking project dependencies in .venv...
+"%PYTHON%" -m pip install --disable-pip-version-check --no-input -r "%LOCKFILE%"
+if errorlevel 1 (
+    echo   [ERROR] Dependency installation failed.
     pause
     exit /b 1
 )
 
-:: Get Python version
-for /f "tokens=2" %%v in ('python --version 2^>^&1') do set PYVER=%%v
-echo   Python: %PYVER%
-
-:: Check/fix dependencies
-echo   Checking dependencies...
-pip install fastapi uvicorn aiohttp pydantic python-multipart 2>nul
-if %errorlevel% neq 0 (
-    echo   [WARN] Some packages may need manual install:
-    echo     pip install fastapi uvicorn aiohttp pydantic
+"%PYTHON%" -c "import fastapi, uvicorn, aiohttp, pydantic"
+if errorlevel 1 (
+    echo   [ERROR] Runtime dependency check failed.
+    pause
+    exit /b 1
 )
 
-:: Kill existing brain on port 8001
-echo   Checking port 8001...
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8001 ^| findstr LISTENING 2^>nul') do (
-    echo   Killing old process on port 8001 (PID %%a)...
-    taskkill /F /PID %%a 2>nul
+:: Never terminate an unrelated process that already owns the API port.
+netstat -ano | findstr ":8001" | findstr "LISTENING" >nul
+if not errorlevel 1 (
+    echo   [ERROR] Port 8001 is already in use. Stop the owning process or choose another port.
+    pause
+    exit /b 1
 )
 
-:: Start brain
 echo.
-echo   Starting Brain Memory v5.0...
+echo   Starting Brain Memory on http://127.0.0.1:8001
 echo   Dashboard: http://127.0.0.1:8001/dashboard
 echo   API Docs:  http://127.0.0.1:8001/docs
 echo   Press Ctrl+C to stop
 echo   ========================================
 echo.
 
-cd /d "%~dp0"
-python -m uvicorn api.main:app --host 127.0.0.1 --port 8001 --reload
-
+"%PYTHON%" -m uvicorn api.main:app --host 127.0.0.1 --port 8001
+set "EXIT_CODE=%ERRORLEVEL%"
+echo.
+echo   Brain Memory stopped (exit code %EXIT_CODE%).
 pause
+exit /b %EXIT_CODE%

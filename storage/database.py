@@ -3,8 +3,9 @@
 import json, logging, sqlite3, uuid
 from datetime import datetime, timezone
 
+from config import DB_PATH
+
 logger = logging.getLogger("brain-v5.storage")
-DB_PATH = "brain_v4.db"
 DB_TIMEOUT = 10.0
 STATE_SNAPSHOT_RETENTION = 200
 

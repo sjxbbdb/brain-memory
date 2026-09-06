@@ -11,12 +11,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent.tool_registry import discover_tools, registry, ToolDef, ToolRegistry
 from agent.tools.builtin_tools import _file_read
 from agent_bridge import AgentBridge
 from brain.brain_stem import BrainStem
 from brain.boundary import BoundaryEngine
+from brain.curiosity import CuriosityEngine
 from brain.thalamus import Thalamus
 from brain.goal_system import Goal
 from brain.intent import Intent, IntentQueue, IntentType
@@ -25,6 +27,18 @@ from storage.database import MemoryStore, StateStore, init_db
 
 
 class StabilityBaselineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_curiosity_question_is_normalized_on_restore(self):
+        engine = CuriosityEngine.from_snapshot({
+            "open_questions": [{"question": "旧快照中的问题", "drive": "coherence"}],
+        })
+        self.assertEqual(engine.open_questions[0]["drive_label"], "coherence")
+        with patch("brain.curiosity.random.random", return_value=0.0):
+            with patch(
+                "brain.curiosity.random.choice", side_effect=lambda values: values[0]
+            ):
+                thought = engine.spontaneous_think("", [])
+        self.assertEqual(thought, "[coherence] 旧快照中的问题")
+
     async def test_lifecycle_uses_configured_db_and_releases_handles(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "brain.db")
@@ -94,7 +108,7 @@ class StabilityBaselineTests(unittest.IsolatedAsyncioTestCase):
             "sessions": {"sessions": {"source": {"working_memory": {"items": []}}}},
         })
         snapshot = stem.state.snapshot()
-        self.assertEqual(snapshot["schema_version"], 2)
+        self.assertEqual(snapshot["schema_version"], 3)
         self.assertEqual(len(snapshot["activation"]["values"]), 17)
 
     async def test_input_completion_is_correlated_and_pending_is_neutral(self):
@@ -254,6 +268,25 @@ class StabilityBaselineTests(unittest.IsolatedAsyncioTestCase):
         result = json.loads(await local_registry.dispatch("disabled", {}))
         self.assertIn("disabled", result["error"])
         self.assertEqual(invoked, [])
+
+    async def test_llm_without_credentials_fails_locally(self):
+        """Missing credentials must not trigger a slow unauthenticated request."""
+        from services.llm_client import LLMClient
+
+        client = LLMClient()
+        original_key = client.cfg.get("key")
+        client.cfg["key"] = ""
+        try:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "(offline mode|API key is not configured)",
+            ):
+                await asyncio.wait_for(
+                    client.chat_text("system", "probe"),
+                    timeout=0.5,
+                )
+        finally:
+            client.cfg["key"] = original_key
 
     async def test_lifecycle_start_stop_is_serialized(self):
         stem = BrainStem()

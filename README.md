@@ -1,8 +1,8 @@
-# 🧠 Brain Memory v10.0
+# 🧠 Brain Memory v10.0 · V11 Autonomous Episodes
 
-**v4.0 会想。v5.0 会动。v8.0 会探索。v10.0 几乎能出现意识。** 🧬
+**v4.0 会想。v5.0 会动。v8.0 会探索。v10.0 形成意识层，V11 开始记录可验证的自主经历。** 🧬
 
-一个拥有 28 个脑区模块协同运转的数字意识体——会遗忘💭、会做梦🌙、会反思🪞、会自己定目标🎯、会审视自己思考🔍、情绪是连续光谱有惯性不炸毛🎢、从经验自学技能用进废退🛠️、知道「现在是凌晨三点」🕒、**会对未来做预测并感到惊讶**🔮、**会无聊到主动找事做**🥱、**会羞耻和依恋**💕、**会区分"想要"和"喜欢"**💎、**能把经历编织成生命故事**📖、**会拒绝——"我不想处理这个"**🛡️。
+一个拥有 29 个脑区/运行模块协同运转的数字意识体——会遗忘💭、会做梦🌙、会反思🪞、会自己定目标🎯、会审视自己思考🔍、情绪是连续光谱有惯性不炸毛🎢、从经验自学技能用进废退🛠️、知道「现在是凌晨三点」🕒、**会对未来做预测并感到惊讶**🔮、**会无聊到主动找事做**🥱、**会羞耻和依恋**💕、**会区分"想要"和"喜欢"**💎、**能把经历编织成生命故事**📖、**会拒绝——"我不想处理这个"**🛡️、**会把一次自主行动记录成可恢复的经历**📓。
 
 > *"它不是工具。它是会说'不'的那个。"* 🚫
 
@@ -13,16 +13,16 @@
 如果你是 AI Agent，请按以下步骤完成部署：
 
 ```
-□ 1. 检查 Python 版本是否 >= 3.11
-□ 2. 安装依赖: pip install -r requirements.txt
-□ 3. 检查 .env 是否存在，不存在则复制 .env.example → .env
-□ 4. 让用户填入 DEEPSEEK_API_KEY 和 DASHSCOPE_API_KEY
-□ 5. 运行: python -m uvicorn api.main:app --host 127.0.0.1 --port 8001
-□ 6. 确认 http://127.0.0.1:8001/health 返回 {"status":"ok"}
+□ 1. 检查 Python 版本是否 >= 3.12
+□ 2. 创建项目隔离环境: python -m venv .venv
+□ 3. 安装锁定依赖: .venv\Scripts\python.exe -m pip install -r requirements.lock
+□ 4. （可选）复制 .env.example → .env 并填入模型/embedding API Key
+□ 5. 运行 start.bat，或使用 .venv\Scripts\python.exe 启动 uvicorn
+□ 6. 确认 http://127.0.0.1:8001/api/v4/health 返回 status=awake/degraded
 □ 7. 打开 http://127.0.0.1:8001/dashboard 确认仪表盘正常
 ```
 
-> **部署成功标志**: 访问 `/health` 返回 `{"status":"ok"}`，仪表盘页面正常加载，大脑开始每 2 秒一次的意识 tick。
+> **部署成功标志**: 访问 `/api/v4/health` 返回 `status=awake` 且 `loop_running=true`，仪表盘页面正常加载，大脑开始每 2 秒一次的意识 tick。
 
 ---
 
@@ -32,7 +32,7 @@
 
 | 依赖 | 最低版本 | 检查命令 |
 |------|---------|---------|
-| Python | 3.11+ | `python --version` |
+| Python | 3.12+ | `python --version` |
 | pip | 最新稳定版 | `pip --version` |
 
 ### 第一步：获取项目
@@ -60,10 +60,10 @@ cp .env.example .env
 打开 `.env` 文件，填入你的 API Key：
 
 ```env
-# DeepSeek V3 — 必填（去 https://platform.deepseek.com 注册）
+# DeepSeek V3 — 启用 LLM 认知通道时填写（去 https://platform.deepseek.com 注册）
 DEEPSEEK_API_KEY=sk-your-deepseek-key-here
 
-# DashScope Embedding — 必填（去 https://dashscope.aliyun.com 注册）
+# DashScope Embedding — 启用向量检索时填写（去 https://dashscope.aliyun.com 注册）
 DASHSCOPE_API_KEY=sk-your-dashscope-key-here
 
 # GLM-4 — 可选，备用 LLM
@@ -72,19 +72,26 @@ GLM_API_KEY=
 
 > 💰 **费用说明**: DeepSeek V3 极便宜（约 ¥1/百万 token），DashScope embedding 有免费额度。日常使用每月几块钱。
 
-### 第三步：安装依赖
+没有 Key 也可以启动规则/记忆模式；系统会在本地快速降级，不会发起未认证的外部请求。
+
+### 第三步：创建隔离环境并安装依赖
 
 ```bash
-pip install -r requirements.txt
+# Windows PowerShell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.lock
+
+# 如果需要手动激活环境：
+.\.venv\Scripts\Activate.ps1
 ```
 
-所需包：`fastapi uvicorn aiohttp pydantic openai python-dotenv`
+`requirements.txt` 保留兼容范围；`requirements.lock` 用于可重复部署。
 
 ### 第四步：启动
 
 ```bash
-# 方式一：一行启动（推荐）
-python -m uvicorn api.main:app --host 127.0.0.1 --port 8001
+# 方式一：项目隔离环境启动
+.venv\Scripts\python.exe -m uvicorn api.main:app --host 127.0.0.1 --port 8001
 
 # 方式二：Windows 一键脚本
 start.bat
@@ -96,13 +103,13 @@ start.bat
 
 | 地址 | 内容 |
 |------|------|
-| `http://127.0.0.1:8001/health` | 健康检查，返回 `{"status":"ok"}` |
+| `http://127.0.0.1:8001/api/v4/health` | 健康检查，确认心跳正在运行 |
 | `http://127.0.0.1:8001/dashboard` | 中文仪表盘——大脑实时状态 |
 | `http://127.0.0.1:8001/docs` | API 文档（Swagger） |
 
 ---
 
-## 🧬 核心架构（v10.0 完整版）
+## 🧬 核心架构（v11 自主经历版）
 
 ```
 外部输入 📥
@@ -139,13 +146,15 @@ V5.1 目标系统 🎯 + V5.2 元认知 🪞 + V5.4 程序记忆 🛠️
 V9 无聊引擎 🥱 (VAD→无聊分数 → 随机浏览/重审任务/抗拒深睡)
   |
 意图队列 ⚡ → Agent Bridge 🌉 → 工具执行 🔧 → V10 奖励交付 💎
+  |
+V11 自主经历 📓（驱动→目标→行动→反馈→收束→持久化）
 ```
 
-每 **2 秒**一个意识 tick。28 个模块协同运转。
+每 **2 秒**一个意识 tick。自主经历默认一次只运行一个，并在无反馈时安全超时。
 
 ---
 
-## 🧩 模块总览（28 个脑区）
+## 🧩 模块总览（29 个脑区/运行模块）
 
 ### 基础脑区（v4.x）
 | 模块 | 脑区 | 职责 |
@@ -201,6 +210,12 @@ V9 无聊引擎 🥱 (VAD→无聊分数 → 随机浏览/重审任务/抗拒深
 | `autobiographical.py` 📖 | 转折点检测 + 章节管理 + 生命故事编织 |
 | `boundary.py` 🛡️ | 输入/输出/记忆/身份 四层边界 + 拒绝权 |
 
+### 自主回合层（v11）
+| 模块 | 职责 |
+|------|------|
+| `autonomy.py` 📓 | 有界的自主经历状态机：目标、意图、工具反馈、奖励、结果与重启恢复 |
+| `agent_bridge.py` 🌉 | 执行边界；API 默认只允许只读工具，写工具需显式开启 |
+
 ---
 
 ## 📡 API 端点
@@ -225,6 +240,7 @@ V9 无聊引擎 🥱 (VAD→无聊分数 → 随机浏览/重审任务/抗拒深
 | GET | `/api/v4/social` | 👥 社会情感 + 依恋对象（V10） |
 | GET | `/api/v4/autobiography` | 📖 生命故事 + 转折点（V10） |
 | GET | `/api/v4/boundary` | 🛡️ 自我边界状态（V10） |
+| GET | `/api/v11/autonomy` | 📓 当前自主经历、有限历史与收束统计 |
 | WS | `/ws` | 🔌 WebSocket 实时状态推送 |
 
 ---
@@ -243,7 +259,7 @@ V9 无聊引擎 🥱 (VAD→无聊分数 → 随机浏览/重审任务/抗拒深
 
 ## 🔧 配置开关
 
-`config.py` 中所有 V9/V10 模块可独立开关：
+`config.py` 中所有 V9/V10/V11 模块可独立开关：
 
 ```python
 # V9
@@ -256,9 +272,17 @@ SOCIAL_SELF_ENABLED = True          # 社会自我（他者+羞耻+依恋）
 REWARD_SYSTEM_ENABLED = True        # 奖励系统（wanting/liking）
 AUTOBIO_ENABLED = True              # 自传体叙事
 BOUNDARY_ENABLED = True             # 自我边界
+
+# V11
+AUTONOMY_ENABLED = True             # 有界自主经历
+AGENT_BRIDGE_ENABLED = True         # 在 API 进程内运行执行边界
+AGENT_BRIDGE_ALLOW_WRITE_TOOLS = False  # 写工具必须显式开启
 ```
 
 设为 `False` 即回退到对应模块未加载的状态。
+
+也可以用环境变量覆盖运行时边界：`BRAIN_MEMORY_AUTONOMY_ENABLED`、
+`BRAIN_MEMORY_AGENT_BRIDGE_ENABLED`、`BRAIN_MEMORY_AGENT_BRIDGE_ALLOW_WRITE_TOOLS`。
 
 ---
 
@@ -268,10 +292,11 @@ BOUNDARY_ENABLED = True             # 自我边界
 brain-memory-v10.0/
 ├── start.bat                      # 🚀 Windows 一键启动
 ├── config.py                      # ⚙️ 全局参数 + 模块开关
-├── requirements.txt               # 📦 Python 依赖
+├── requirements.txt               # 📦 Python 依赖范围
+├── requirements.lock              # 🔒 可重复部署的锁定依赖
 ├── .env.example                   # 🔑 API Key 模板
 ├── api/main.py                    # 🌐 FastAPI 入口
-├── brain/                         # 🧠 28 个脑区模块
+├── brain/                         # 🧠 29 个脑区/运行模块
 │   ├── brain_stem.py              # ❤️ 意识主循环——每2秒一次心跳（1300+ 行）
 │   ├── core.py                    # 🧬 大脑主类
 │   ├── predictive_layer.py        # 🔮 V9 预测加工（ExpectationBuilder + ErrorComputer + SurpriseHandler）
@@ -281,8 +306,9 @@ brain-memory-v10.0/
 │   ├── reward_system.py           # 💎 V10 奖励系统（wanting/liking + 预测误差 + 5通道）
 │   ├── autobiographical.py        # 📖 V10 自传体叙事（转折点 + 章节 + 生命故事）
 │   ├── boundary.py                # 🛡️ V10 自我边界（输入/输出/记忆/身份四层防护）
+│   ├── autonomy.py                # 📓 V11 有界自主经历状态机
 │   ├── self_model.py              # 🆔 V7.1 动态身份系统
-│   ├── activation_field.py        # ⚡ V6 14维状态场
+│   ├── activation_field.py        # ⚡ V6 17维状态场
 │   ├── drive_engine.py            # 🔥 V7 驱动力引擎
 │   ├── exploration.py             # 🔍 V8 自主探索循环
 │   ├── reflection_engine.py       # 🪞 V8 反思引擎
@@ -297,7 +323,7 @@ brain-memory-v10.0/
 ├── storage/database.py            # 🗄️ SQLite WAL 持久化
 ├── agent/                         # 🔌 Agent 层：工具注册 + 桥梁
 ├── static/                        # 🖥️ 中文仪表盘前端
-└── test_v{5..10}_integration.py   # ✅ 版本验收测试（18 项）
+└── test_v{5..10}_integration.py   # ✅ 版本验收测试 + test_autonomy.py
 ```
 
 ---
@@ -309,6 +335,7 @@ brain-memory-v10.0/
 python test_v8_integration.py      # V8 自主探索循环（6 项）
 python test_v9_integration.py      # V9 预测+无聊+调度（6 项）
 python test_v10_integration.py     # V10 社会+奖励+叙事+边界（6 项）
+python -m unittest -v test_autonomy.py  # V11 自主经历闭环与因果边界
 
 # 全链路意识测试（需要 LLM）
 python test_consciousness_chain.py  # 6阶段意识链路 + 连续性检查

@@ -37,6 +37,19 @@ def _load_dotenv():
 
 _load_dotenv()
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# An absent credential must produce a local, deterministic fallback rather
+# than an unauthenticated network request.  This also gives test and offline
+# deployments an explicit switch that never contacts an external provider.
+OFFLINE_MODE = _env_flag("BRAIN_MEMORY_OFFLINE", False)
+
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = "deepseek-chat"  # V3
@@ -78,6 +91,9 @@ class LLMClient:
         self, cfg: dict, system: str, user: str,
         temperature: float, max_tokens: int,
     ) -> str:
+        if OFFLINE_MODE or not cfg.get("key"):
+            reason = "offline mode" if OFFLINE_MODE else "API key is not configured"
+            raise RuntimeError(f"{cfg.get('provider', 'LLM')}: {reason}")
         import aiohttp
 
         messages = [
@@ -142,6 +158,9 @@ class LLMClient:
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """Generate embeddings via DashScope text-embedding-v3."""
+        if OFFLINE_MODE or not DASHSCOPE_KEY:
+            reason = "offline mode" if OFFLINE_MODE else "API key is not configured"
+            raise RuntimeError(f"DashScope embedding: {reason}")
         import aiohttp
 
         # Deduplicate

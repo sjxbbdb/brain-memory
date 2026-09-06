@@ -17,12 +17,29 @@ Agent 层消费 intent 队列：大脑产出意图 → Agent 执行工具 → �
 import asyncio
 import json
 import logging
+import math
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
 logger = logging.getLogger("brain-v5.intent")
+
+
+def _safe_float(value: Any, default: float = 0.5) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return result if math.isfinite(result) else default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return max(0, default)
 
 
 class IntentType(str, Enum):
@@ -55,13 +72,63 @@ class Intent:
     reason: str = ""          # 为什么产生这条意图（来自 LLM 的 reasoning）
     timestamp: str = ""
     source_input: str = ""    # 触发这条意图的原始输入
+    # 自主经历关联信息。外部输入通常为空；它只用于因果追踪，不授予
+    # 调用者额外权限。
+    episode_id: str | None = None
+    goal_id: str | None = None
+    intent_id: str = field(default_factory=lambda: f"intent-{uuid.uuid4().hex[:12]}")
+    attempt_no: int = 0
+    origin: str = "external"
+    created_tick: int | None = None
 
     def __post_init__(self):
+        if not isinstance(self.type, IntentType):
+            try:
+                self.type = IntentType(self.type)
+            except (TypeError, ValueError):
+                self.type = IntentType.THINK
+        self.confidence = min(1.0, max(0.0, _safe_float(self.confidence)))
+        self.reason = str(self.reason or "")[:200]
+        self.source_input = str(self.source_input or "")[:400]
+        self.intent_id = str(self.intent_id or f"intent-{uuid.uuid4().hex[:12]}")[:80]
+        self.attempt_no = _safe_int(self.attempt_no)
+        self.origin = str(self.origin or "external")[:40]
+        if self.episode_id:
+            self.episode_id = str(self.episode_id)[:80]
+        else:
+            self.episode_id = None
+        if self.goal_id:
+            self.goal_id = str(self.goal_id)[:100]
+        else:
+            self.goal_id = None
+        if self.created_tick is not None:
+            self.created_tick = _safe_int(self.created_tick)
+        if not isinstance(self.tool_args, dict):
+            self.tool_args = {}
         if not self.timestamp:
             self.timestamp = datetime.now(timezone.utc).isoformat()
+        else:
+            self.timestamp = str(self.timestamp)[:80]
 
     def to_dict(self) -> dict:
-        d = {"type": self.type.value, "confidence": self.confidence, "reason": self.reason[:200], "timestamp": self.timestamp}
+        d = {
+            "type": self.type.value,
+            "confidence": self.confidence,
+            "reason": self.reason[:200],
+            "timestamp": self.timestamp,
+            "intent_id": str(self.intent_id)[:80],
+            "attempt_no": _safe_int(self.attempt_no),
+            "origin": str(self.origin or "external")[:40],
+        }
+        if self.created_tick is not None:
+            try:
+                d["created_tick"] = max(0, int(self.created_tick))
+            except (TypeError, ValueError, OverflowError):
+                pass
+        if self.episode_id:
+            d["episode_id"] = str(self.episode_id)[:80]
+        if self.goal_id:
+            d["goal_id"] = str(self.goal_id)[:100]
         if self.type == IntentType.CALL_TOOL:
             d["tool_name"] = self.tool_name
             d["tool_args"] = self.tool_args
@@ -75,6 +142,8 @@ class Intent:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Intent":
+        if not isinstance(data, dict):
+            data = {}
         t = data.get("type", "think")
         try:
             it = IntentType(t)
@@ -87,10 +156,19 @@ class Intent:
             response_text=data.get("response_text"),
             thought=data.get("thought"),
             question=data.get("question"),
-            confidence=float(data.get("confidence", 0.5)),
+            confidence=_safe_float(data.get("confidence", 0.5)),
             reason=data.get("reason", ""),
             timestamp=data.get("timestamp", ""),
             source_input=data.get("source_input", ""),
+            episode_id=(str(data.get("episode_id"))[:80] if data.get("episode_id") else None),
+            goal_id=(str(data.get("goal_id"))[:100] if data.get("goal_id") else None),
+            intent_id=str(data.get("intent_id") or f"intent-{uuid.uuid4().hex[:12]}")[:80],
+            attempt_no=_safe_int(data.get("attempt_no", 0) or 0),
+            origin=str(data.get("origin") or "external")[:40],
+            created_tick=(
+                _safe_int(data.get("created_tick"))
+                if data.get("created_tick") is not None else None
+            ),
         )
 
     @classmethod
@@ -157,7 +235,7 @@ class IntentQueue:
                 "start BrainStem and AgentBridge on the same loop"
             )
 
-    async def put(self, intent: Intent) -> None:
+    async def put(self, intent: Intent) -> bool:
         """大脑产出一条意图。"""
         self._assert_current_loop()
         try:
@@ -167,8 +245,10 @@ class IntentQueue:
             self._queue.put_nowait(intent)
             self.total_produced += 1
             logger.debug("intent: produced %s (total=%d)", intent.type.value, self.total_produced)
+            return True
         except asyncio.QueueFull:
             logger.warning("intent: queue full (%d), dropping intent", self._queue.maxsize)
+            return False
 
     async def get(self, timeout: float = 1.0) -> Intent | None:
         """Agent 层读取一条意图（非阻塞）。"""
