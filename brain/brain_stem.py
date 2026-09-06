@@ -33,7 +33,7 @@ from brain.working_memory import WorkingMemory
 from brain.brain_state import BrainState, SNAPSHOT_SCHEMA_VERSION
 from brain.self_model import SelfModel
 from brain.intent import Intent, IntentQueue, IntentType
-from brain.goal_system import GoalSystem
+from brain.goal_system import GoalSystem, GoalStatus
 from brain.task_scheduler import LongTermTaskScheduler, TaskTier
 from brain.metacognition import Metacognition
 from brain.emotional_spectrum import EmotionalSpectrum
@@ -51,8 +51,17 @@ from brain.reward_system import RewardSystem  # V10
 from brain.autobiographical import AutobiographicalNarrative  # V10
 from brain.boundary import BoundaryEngine  # V10
 from brain.autonomy import AutonomyEpisode, EpisodeStatus  # V11
+from brain.task_execution import (
+    TaskExecutionLedger,
+    PlanStatus,
+    StepStatus,
+    ActionStatus,
+    OutcomeQuality,
+)
+from brain.learning_feedback import VerifiedLearningFeedback
 from config import (
     TICK_INTERVAL_SEC,
+    COGNITIVE_TIMEOUT_SEC,
     MEMORY_DECAY_RATE,
     MEMORY_DECAY_INTERVAL_TICKS,
     MEMORY_ARCHIVE_THRESHOLD,
@@ -89,6 +98,17 @@ from config import (
     TASK_MAINTENANCE_DEADLINE_TICKS,
     TASK_USER_DEADLINE_TICKS,
     TASK_EXPLORATION_DEADLINE_TICKS,
+    TASK_EXECUTION_ENABLED,
+    TASK_EXECUTION_MAX_PLANS,
+    TASK_EXECUTION_MAX_STEPS,
+    TASK_EXECUTION_MAX_DEPTH,
+    TASK_EXECUTION_MAX_RETRIES,
+    TASK_EXECUTION_MAX_ACTIONS,
+    TASK_EXECUTION_MAX_OBSERVATIONS,
+    TASK_EXECUTION_MAX_OUTCOMES,
+    TASK_EXECUTION_MAX_EVENTS,
+    TASK_EXECUTION_AUTO_REPLAN,
+    TASK_EXECUTION_REQUIRE_VERIFIED_COMPLETION,
 )
 
 logger = logging.getLogger("brain-v5.brain-stem")
@@ -136,6 +156,12 @@ class BrainStem:
         self._input_sources: dict[str, str] = {}
         self._active_input_id: str | None = None
         self._restored_uptime_seconds: float = 0.0
+        self.cognitive_timeout_sec = max(1, min(120, int(COGNITIVE_TIMEOUT_SEC)))
+        # A private capability shared with the in-process AgentBridge.  Tool
+        # observations are evidence, not ordinary user input; callers that
+        # can reach ``receive_input`` directly must not be able to forge a
+        # verified result by supplying a look-alike dictionary.
+        self._tool_observation_capability = object()
 
         # Output feed — external agents consume this
         self._output_feed: asyncio.Queue = asyncio.Queue(maxsize=100)
@@ -202,6 +228,35 @@ class BrainStem:
             AutonomyEpisode(max_ticks=AUTONOMY_MAX_EPISODE_TICKS)
             if AUTONOMY_ENABLED else None
         )
+
+        # V13: a separate causal ledger for plans, actions, observations and
+        # deterministic outcomes.  It never executes tools; AgentBridge stays
+        # the only execution boundary.
+        self.task_execution_enabled = bool(TASK_EXECUTION_ENABLED)
+        self.task_execution = (
+            TaskExecutionLedger(
+                max_plans=TASK_EXECUTION_MAX_PLANS,
+                max_steps_per_plan=TASK_EXECUTION_MAX_STEPS,
+                max_depth=TASK_EXECUTION_MAX_DEPTH,
+                default_max_retries=TASK_EXECUTION_MAX_RETRIES,
+                max_actions=TASK_EXECUTION_MAX_ACTIONS,
+                max_observations=TASK_EXECUTION_MAX_OBSERVATIONS,
+                max_outcomes=TASK_EXECUTION_MAX_OUTCOMES,
+                max_events=TASK_EXECUTION_MAX_EVENTS,
+            )
+            if self.task_execution_enabled else None
+        )
+        if self.task_execution is not None:
+            # Keep the operator's explicit policy visible without granting any
+            # write capability to the ledger itself.
+            self.task_execution.require_verified_completion = bool(
+                TASK_EXECUTION_REQUIRE_VERIFIED_COMPLETION
+            )
+            self.task_execution.auto_replan = bool(TASK_EXECUTION_AUTO_REPLAN)
+        self.learning_feedback = (
+            VerifiedLearningFeedback() if self.task_execution_enabled else None
+        )
+        self._last_execution_outcome = None
 
         # Stats
         self.start_time = datetime.now(timezone.utc)
@@ -486,6 +541,11 @@ class BrainStem:
         episode_id: str | None = None,
         intent_id: str | None = None,
         goal_id: str | None = None,
+        plan_id: str | None = None,
+        step_id: str | None = None,
+        action_id: str | None = None,
+        tool_observation: dict[str, Any] | None = None,
+        observation_token: object | None = None,
     ):
         """Receive input from an external agent. Pushes to input queue."""
         self._ensure_loop_primitives()
@@ -498,6 +558,11 @@ class BrainStem:
             episode_id=episode_id,
             intent_id=intent_id,
             goal_id=goal_id,
+            plan_id=plan_id,
+            step_id=step_id,
+            action_id=action_id,
+            tool_observation=tool_observation,
+            observation_token=observation_token,
             track=False,
             _raise_on_reject=True,
         )
@@ -512,6 +577,11 @@ class BrainStem:
         episode_id: str | None = None,
         intent_id: str | None = None,
         goal_id: str | None = None,
+        plan_id: str | None = None,
+        step_id: str | None = None,
+        action_id: str | None = None,
+        tool_observation: dict[str, Any] | None = None,
+        observation_token: object | None = None,
         track: bool = True,
         _raise_on_reject: bool = False,
     ) -> tuple[str, asyncio.Future | None]:
@@ -528,6 +598,57 @@ class BrainStem:
         episode_id = str(episode_id)[:80] if episode_id else None
         intent_id = str(intent_id)[:80] if intent_id else None
         goal_id = str(goal_id)[:100] if goal_id else None
+        plan_id = str(plan_id)[:100] if plan_id else None
+        step_id = str(step_id)[:100] if step_id else None
+        action_id = str(action_id)[:100] if action_id else None
+        # Structured tool observations are an in-process bridge contract.  Do
+        # not accept arbitrary objects or unbounded payloads into the pending
+        # queue; the bridge already removes response bodies and credentials.
+        # The private token is checked by identity, not by a caller-controlled
+        # boolean/string, so a normal API client can only submit text and will
+        # receive an ``unknown`` result rather than self-authored proof.
+        observation_trusted = observation_token is self._tool_observation_capability
+        if isinstance(tool_observation, dict) and observation_trusted:
+            def _bound_observation(value: Any, depth: int = 0):
+                if depth > 3:
+                    return "<depth-limit>"
+                if value is None or isinstance(value, (bool, int, float)):
+                    return value
+                if isinstance(value, dict):
+                    bounded: dict[str, Any] = {}
+                    for raw_key, raw_value in list(value.items())[:24]:
+                        key = str(raw_key)[:60]
+                        if not key:
+                            continue
+                        lowered = key.casefold().replace("-", "_")
+                        if any(
+                            marker in lowered
+                            for marker in (
+                                "api_key", "access_token", "refresh_token",
+                                "password", "passwd", "secret", "authorization",
+                                "cookie", "credential", "private_key",
+                            )
+                        ):
+                            bounded[key] = "<redacted>"
+                        else:
+                            bounded[key] = _bound_observation(raw_value, depth + 1)
+                    return bounded
+                if isinstance(value, (list, tuple, set)):
+                    return [
+                        _bound_observation(item, depth + 1)
+                        for item in list(value)[:24]
+                    ]
+                return str(value).replace("\x00", " ")[:500]
+
+            safe_observation: dict[str, Any] = {}
+            for key, value in list(tool_observation.items())[:24]:
+                key = str(key)[:60]
+                if not key:
+                    continue
+                safe_observation[key] = _bound_observation(value, 1)
+            tool_observation = safe_observation
+        else:
+            tool_observation = None
         future = None
         # ``submit_input`` is also used by the legacy pre-start path.  A first
         # request may be buffered before ``start()``, but after an instance has
@@ -559,6 +680,13 @@ class BrainStem:
             "episode_id": episode_id,
             "intent_id": intent_id,
             "goal_id": goal_id,
+            "plan_id": plan_id,
+            "step_id": step_id,
+            "action_id": action_id,
+            "tool_observation": tool_observation,
+            "_observation_token": (
+                self._tool_observation_capability if observation_trusted else None
+            ),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         if track:
@@ -704,6 +832,51 @@ class BrainStem:
         else:
             logger.error("brain-stem: %s", message)
 
+    def _record_cognitive_timeout(self, phase: str) -> None:
+        """Record a bounded cognitive timeout without taking down the loop."""
+        label = str(phase or "cognitive")[:100]
+        message = f"{label}: timeout after {self.cognitive_timeout_sec}s"
+        self.state.llm_error_count += 1
+        self.state.last_error = message[:200]
+        self.state.recent_errors.append(message[:300])
+        self.state.recent_errors = self.state.recent_errors[-20:]
+        logger.warning("brain-stem: %s", message)
+
+    async def _bounded_cognitive_await(self, awaitable, phase: str, fallback):
+        """Await optional cognitive I/O with a hard heartbeat-local bound."""
+        try:
+            return await asyncio.wait_for(
+                awaitable,
+                timeout=self.cognitive_timeout_sec,
+            )
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            self._record_cognitive_timeout(phase)
+            return fallback
+
+    @staticmethod
+    def _cognitive_timeout_fallback(text: str = "") -> dict[str, Any]:
+        """Build a side-effect-light result when external cognition times out."""
+        snippet = str(text or "")[:80]
+        return {
+            "encoding": {
+                "type": "episodic",
+                "title": snippet or "timeout",
+                "summary": snippet,
+                "importance": 0.2,
+                "entities": [],
+            },
+            "emotion": {},
+            "focus": snippet,
+            "monologue": "",
+            "intent": {
+                "type": "think",
+                "confidence": 0.1,
+                "reason": "认知服务超时，暂不采取行动",
+            },
+        }
+
     def _fail_active_input(self, error: str):
         request_id = self._active_input_id
         if not request_id:
@@ -838,73 +1011,733 @@ class BrainStem:
             return None
         return self.goal_system.get_by_id(str(goal_id))
 
+    def _execution_plan_for_goal(self, goal_id: str = "", task_id: str = ""):
+        """Resolve the V13 plan owning a goal/episode without raising."""
+        execution = self.task_execution
+        if execution is None:
+            return None
+        try:
+            return execution.get_plan(
+                plan_id=str(task_id or ""),
+                goal_id=str(goal_id or ""),
+            )
+        except Exception as exc:
+            self._record_loop_error("task_execution_lookup", exc)
+            return None
+
+    def _execution_action_for_episode(
+        self,
+        episode_id: str = "",
+        action_id: str = "",
+        step_id: str = "",
+        plan_id: str = "",
+        include_terminal: bool = False,
+    ):
+        execution = self.task_execution
+        if execution is None:
+            return None
+        try:
+            action = execution.find_action(
+                action_id=action_id,
+                episode_id=episode_id,
+                step_id=step_id,
+                plan_id=plan_id,
+                include_terminal=include_terminal,
+            )
+            if action is None and include_terminal:
+                action = execution.find_action(
+                    action_id=action_id,
+                    episode_id=episode_id,
+                    step_id=step_id,
+                    plan_id=plan_id,
+                    include_terminal=True,
+                )
+            return action
+        except Exception as exc:
+            self._record_loop_error("task_execution_action_lookup", exc)
+            return None
+
+    def _plan_has_verified_success(self, plan) -> bool:
+        """Return whether every plan step has a durable verified success.
+
+        Plan/step status is derived state and may be torn in a snapshot or in
+        a partially completed cross-component hand-off.  Keep this predicate
+        deliberately strict: a completed step counts only when an evaluated
+        action points at an existing ``verified``/``success=True`` outcome
+        belonging to the same plan and step.
+        """
+        if plan is None or self.task_execution is None:
+            return False
+        steps = list(getattr(plan, "steps", []) or [])
+        if not steps:
+            return False
+        actions = getattr(self.task_execution, "actions", {})
+        outcomes = getattr(self.task_execution, "outcomes", {})
+        for step in steps:
+            if getattr(step, "status", "") != StepStatus.COMPLETED:
+                return False
+            proven = False
+            for action in getattr(actions, "values", lambda: ())():
+                if (
+                    getattr(action, "plan_id", "") != getattr(plan, "id", "")
+                    or getattr(action, "step_id", "") != getattr(step, "id", "")
+                    or getattr(action, "status", "") != ActionStatus.EVALUATED
+                ):
+                    continue
+                outcome = getattr(outcomes, "get", lambda _key: None)(
+                    getattr(action, "outcome_id", "")
+                )
+                if (
+                    outcome is not None
+                    and getattr(outcome, "plan_id", "") == getattr(plan, "id", "")
+                    and getattr(outcome, "step_id", "") == getattr(step, "id", "")
+                    and getattr(outcome, "status", "") == OutcomeQuality.VERIFIED
+                    and getattr(outcome, "success", None) is True
+                ):
+                    proven = True
+                    break
+            if not proven:
+                return False
+        return True
+
+    def _close_unqueued_execution_episode(self, goal, episode, plan) -> None:
+        """Safely close an episode when a selected plan has no next step.
+
+        ``next_step`` can return ``None`` after deriving a terminal/blocked
+        plan.  The episode is created just before that call, so leaving it in
+        ``planned`` would make the single autonomous lane permanently busy.
+        This helper resolves the exceptional hand-off without touching a
+        different episode and without claiming success from a bare plan flag.
+        """
+        autonomy = getattr(self, "autonomy", None)
+        if (
+            autonomy is None
+            or getattr(autonomy, "active", None) is not episode
+            or not getattr(autonomy, "is_active", False)
+        ):
+            return
+
+        execution = getattr(self, "task_execution", None)
+        status = str(getattr(plan, "status", "") or "")
+        if status == PlanStatus.COMPLETED and self._plan_has_verified_success(plan):
+            reason = "执行计划全部步骤已核验完成"
+            record = autonomy.complete(
+                reason,
+                self.state.total_ticks,
+                result_quality=OutcomeQuality.VERIFIED,
+            )
+            self._finish_autonomy_episode(record, True, reason)
+            return
+
+        if status == PlanStatus.FAILED:
+            reason = "执行计划已失败，未产生可继续交付的步骤"
+            record = autonomy.fail(
+                reason,
+                self.state.total_ticks,
+                result_quality=OutcomeQuality.FAILED,
+            )
+            self._finish_autonomy_episode(record, False, reason)
+            return
+
+        reason = (
+            "执行计划没有可安全交付的下一步骤，已暂停并等待显式恢复"
+        )
+        # A running action without a queued intent is an ambiguous boundary;
+        # cancel it rather than allowing a later tick to replay an external
+        # side effect.  ``pause_plan`` is bounded and skips already evaluated
+        # outcomes.
+        if execution is not None and status not in {
+            PlanStatus.PAUSED,
+            PlanStatus.BLOCKED,
+            PlanStatus.ABANDONED,
+        }:
+            try:
+                execution.pause_plan(
+                    plan.id,
+                    reason=reason,
+                    tick=self.state.total_ticks,
+                )
+            except Exception as exc:
+                self._record_loop_error("task_execution_empty_plan_pause", exc)
+        self._sync_goal_with_plan(goal, plan, reason)
+        record = autonomy.abort(reason, self.state.total_ticks)
+        self._finish_autonomy_episode(record, False, reason)
+
+    def _sync_goal_with_plan(self, goal, plan, note: str = "") -> None:
+        """Project deterministic plan state onto the legacy Goal owner.
+
+        GoalSystem remains the public lifecycle owner for compatibility.  A
+        plan may only mark a goal done after *all* of its steps are completed;
+        a single successful tool response never bypasses this boundary.
+        """
+        if goal is None or plan is None:
+            return
+        try:
+            steps = list(getattr(plan, "steps", []) or [])
+            completed = sum(
+                1 for step in steps if getattr(step, "status", "") == StepStatus.COMPLETED
+            )
+            if steps:
+                goal.progress = min(1.0, completed / len(steps))
+            if note:
+                goal.result_note = str(note)[:300]
+            status = getattr(plan, "status", "")
+            goal_status = getattr(goal, "status", "")
+            actionable = goal_status in {"pending", "active", "paused"}
+            if status == PlanStatus.COMPLETED:
+                # Treat the plan status as a hint only.  The durable
+                # action/observation/outcome chain is the final proof that
+                # every step really completed; this second guard protects
+                # against malformed snapshots or an embedder constructing a
+                # TaskPlan object by hand.
+                if self.task_execution is not None:
+                    if not self._plan_has_verified_success(plan):
+                        if goal_status in {"pending", "active"}:
+                            goal.status = "paused"
+                            goal.paused_reason = "execution:完成状态缺少可验证结果"
+                        return
+                if actionable and not (
+                    goal_status == "paused"
+                    and str(getattr(goal, "paused_reason", "")).startswith("manual:")
+                ):
+                    self.goal_system.mark_done(goal.id, note[:240] or "执行计划全部步骤已核验完成")
+                if getattr(goal, "status", "") == "done":
+                    self.task_scheduler.on_goal_terminal(goal.id)
+                    if hasattr(self, "drive_engine"):
+                        self.drive_engine.notify_goal_completed()
+            elif status == PlanStatus.FAILED:
+                if actionable and not (
+                    goal_status == "paused"
+                    and str(getattr(goal, "paused_reason", "")).startswith("manual:")
+                ):
+                    self.goal_system.mark_failed(goal.id, note[:240] or "执行计划失败")
+                self.task_scheduler.on_goal_terminal(goal.id)
+            elif status in {PlanStatus.PAUSED, PlanStatus.BLOCKED}:
+                if goal_status in {"pending", "active"}:
+                    goal.status = "paused"
+                if goal.status == "paused" and not str(
+                    getattr(goal, "paused_reason", "")
+                ).startswith("manual:"):
+                    reason = getattr(plan, "active_step_id", "") or "结果等待核验"
+                    goal.paused_reason = f"execution:{str(reason)[:100]}"
+                if self.task_scheduler.running_goal_id == goal.id:
+                    self.task_scheduler.running_goal_id = None
+            elif goal_status == "paused" and str(
+                getattr(goal, "paused_reason", "")
+            ).startswith(("execution:", "restart:")):
+                goal.status = "pending"
+                goal.paused_reason = ""
+        except Exception as exc:
+            self._record_loop_error("task_execution_goal_projection", exc)
+
+    @staticmethod
+    def _capture_execution_claim_state(plan) -> dict[str, Any]:
+        """Capture the mutable plan/step fields touched by a claim.
+
+        ``TaskExecutionLedger.next_step`` is intentionally a small synchronous
+        mutation, but the following intent/action hand-off crosses several
+        components.  Keeping a before-image here lets the hand-off behave like
+        a transaction: if any later stage rejects the work, the claim can be
+        released without leaving a permanently ``running`` step behind.
+        """
+        plan_fields = (
+            "status",
+            "active_step_id",
+            "consumed_ticks",
+            "updated_tick",
+            "revision",
+        )
+        step_fields = (
+            "status",
+            "attempts",
+            "retries",
+            "replan_count",
+            "started_tick",
+            "completed_tick",
+            "last_action_id",
+            "result_quality",
+            "result_summary",
+            "blocked_reason",
+        )
+        return {
+            "plan": {
+                field: getattr(plan, field, None)
+                for field in plan_fields
+            },
+            "steps": [
+                (
+                    step,
+                    {
+                        field: getattr(step, field, None)
+                        for field in step_fields
+                    },
+                )
+                for step in list(getattr(plan, "steps", []) or [])
+            ],
+        }
+
+    @staticmethod
+    def _restore_execution_claim_state(plan, state: dict[str, Any]) -> None:
+        """Restore a claim before-image while preserving object identity."""
+        if not isinstance(state, dict):
+            return
+        plan_values = state.get("plan", {})
+        if isinstance(plan_values, dict):
+            for key, value in plan_values.items():
+                try:
+                    setattr(plan, key, value)
+                except Exception:
+                    pass
+        raw_steps = state.get("steps", [])
+        if not isinstance(raw_steps, (list, tuple)):
+            raw_steps = []
+        for step, values in raw_steps:
+            if not isinstance(values, dict):
+                continue
+            for key, value in values.items():
+                try:
+                    setattr(step, key, value)
+                except Exception:
+                    pass
+
+    def _rollback_execution_claim(
+        self,
+        execution,
+        plan,
+        claim_state: dict[str, Any],
+        action_ids_before: set[str],
+        *,
+        action=None,
+        step_id: str = "",
+        reason: str = "",
+    ) -> None:
+        """Undo a partially-delivered execution claim.
+
+        Newly persisted actions are retained as cancelled audit records (they
+        must never be replayed), while the plan and its steps are restored to
+        their exact pre-claim state.  This method is deliberately defensive:
+        it is also used when a mocked/embedded callback raises after inserting
+        an action but before returning it.
+        """
+        cancelled_ids: list[str] = []
+        action_store = getattr(execution, "actions", {})
+        before = set(action_ids_before or set())
+        candidate_ids: set[str] = set()
+        try:
+            candidate_ids.update(str(key) for key in action_store.keys() if str(key) not in before)
+        except Exception:
+            pass
+        returned_id = str(getattr(action, "id", "") or "") if action is not None else ""
+        if returned_id and returned_id not in before:
+            candidate_ids.add(returned_id)
+
+        for action_id in candidate_ids:
+            try:
+                candidate = action_store.get(action_id)
+            except Exception:
+                candidate = None
+            if candidate is None:
+                # A callback may return an action object without registering
+                # it in the ledger.  It is still unsafe to hand it to the
+                # bridge after rollback, so cancel the detached object too.
+                if action is not None and action_id == returned_id:
+                    candidate = action
+                else:
+                    continue
+            if getattr(candidate, "outcome_id", ""):
+                # Never rewrite an action that already has a durable outcome.
+                continue
+            try:
+                candidate.status = ActionStatus.CANCELLED
+                candidate.started_tick = None
+                candidate.observed_ids = []
+                candidate.outcome_id = ""
+                cancelled_ids.append(action_id)
+            except Exception as exc:
+                self._record_loop_error("task_execution_action_rollback", exc)
+
+        self._restore_execution_claim_state(plan, claim_state)
+        try:
+            event = getattr(execution, "_event", None)
+            if callable(event):
+                event(
+                    "claim_rolled_back",
+                    plan_id=getattr(plan, "id", ""),
+                    step_id=step_id or getattr(plan, "active_step_id", "") or "",
+                    tick=self.state.total_ticks,
+                    detail=(reason or "执行交接失败，已回滚")[:300],
+                    data={"cancelled_actions": len(cancelled_ids)},
+                )
+        except Exception as exc:
+            self._record_loop_error("task_execution_claim_event", exc)
+
+    def _release_failed_execution_episode(self, episode, reason: str) -> None:
+        """Close a failed hand-off so the scheduler can retry safely.
+
+        Leaving an ``AutonomyEpisode`` in ``planned``/``feedback_received``
+        makes ``episode_busy`` true forever, which prevents the scheduler from
+        claiming the restored pending step.  Abort only the matching active
+        episode, then release the scheduler pointer even if an embedded
+        autonomy implementation does not expose the full API.
+        """
+        goal_id = str(getattr(episode, "goal_id", "") or "")
+        record = None
+        try:
+            autonomy = getattr(self, "autonomy", None)
+            active = getattr(autonomy, "active", None) if autonomy is not None else None
+            same_lane = bool(
+                active is not None
+                and getattr(active, "id", "") == getattr(episode, "id", "")
+            )
+            if same_lane and getattr(autonomy, "is_active", False):
+                abort = getattr(autonomy, "abort", None)
+                if callable(abort):
+                    record = abort(reason[:240], self.state.total_ticks)
+                if record is not None:
+                    self._finish_autonomy_episode(record, False, reason)
+        except Exception as exc:
+            self._record_loop_error("task_execution_episode_rollback", exc)
+        finally:
+            try:
+                scheduler = getattr(self, "task_scheduler", None)
+                if scheduler is not None and getattr(scheduler, "running_goal_id", None) == goal_id:
+                    scheduler.running_goal_id = None
+            except Exception as exc:
+                self._record_loop_error("task_execution_scheduler_rollback", exc)
+            try:
+                self._sync_autonomy_projection()
+            except Exception as sync_exc:
+                self._record_loop_error("task_execution_projection_rollback", sync_exc)
+
+    def _queue_execution_step(self, goal, episode, plan):
+        """Claim one ready plan step and construct its correlated intent."""
+        execution = self.task_execution
+        if execution is None or goal is None or episode is None or plan is None:
+            return None, None
+
+        # The ledger claim and the autonomy/intent records form one hand-off
+        # transaction.  ``next_step`` changes the step and plan immediately;
+        # keep before-images so a later capacity/error boundary cannot leave a
+        # RUNNING step that no worker can ever service.
+        claim_state = self._capture_execution_claim_state(plan)
+        try:
+            action_ids_before = {
+                str(key) for key in getattr(execution, "actions", {}).keys()
+            }
+        except Exception:
+            action_ids_before = set()
+
+        claim_attempted = True
+        step = None
+        action = None
+
+        def rollback(reason: str) -> None:
+            try:
+                self._rollback_execution_claim(
+                    execution,
+                    plan,
+                    claim_state,
+                    action_ids_before,
+                    action=action,
+                    step_id=str(getattr(step, "id", "") or ""),
+                    reason=reason,
+                )
+            except Exception as exc:
+                self._record_loop_error("task_execution_claim_rollback", exc)
+            # An active episode with no queued intent blocks the scheduler's
+            # single causal lane.  Close just this lane so the restored pending
+            # step can be retried at the next safe boundary.
+            try:
+                self._release_failed_execution_episode(episode, reason)
+            except Exception as exc:
+                self._record_loop_error("task_execution_episode_rollback", exc)
+
+        try:
+            step = execution.next_step(plan_id=plan.id, current_tick=self.state.total_ticks)
+            if step is None:
+                self._sync_goal_with_plan(goal, plan)
+                return None, None
+            intent = self._goal_to_intent(
+                goal,
+                episode_id=episode.id,
+                attempt_no=getattr(goal, "attempt_count", 0),
+                step=step,
+                plan_id=plan.id,
+                step_id=step.id,
+            )
+            if intent is None:
+                rollback("无法构造工具意图，已回滚执行认领")
+                return None, None
+            action = execution.record_action(
+                plan.id,
+                step.id,
+                action_type=intent.type.value,
+                tool_name=intent.tool_name or step.tool_name,
+                args=intent.tool_args,
+                expected=step.expected,
+                tick=self.state.total_ticks,
+                episode_id=episode.id,
+                attempt_no=intent.attempt_no,
+            )
+            if action is None:
+                rollback("执行账本容量不足，已回滚执行认领")
+                return None, None
+            intent.action_id = action.id
+            intent.plan_id = plan.id
+            intent.step_id = step.id
+            try:
+                planned = self.autonomy.plan(
+                    episode.id,
+                    intent.type.value,
+                    intent.tool_name or "",
+                    self.state.total_ticks,
+                    intent.reason,
+                    intent_id=intent.intent_id,
+                    expected=step.expected or f"完成目标：{goal.description[:180]}",
+                    attempt_no=intent.attempt_no,
+                    plan_id=plan.id,
+                    step_id=step.id,
+                    action_id=action.id,
+                )
+            except Exception as exc:
+                self._record_loop_error("task_execution_autonomy_plan", exc)
+                planned = False
+            if not planned:
+                rollback("自主经历无法登记计划步骤，已回滚执行认领")
+                return None, None
+            # Keep the exact ledger identifiers on the episode as a durable
+            # interruption/restart anchor.  ``plan`` normally already stores
+            # them through the extended call above; the explicit bind also
+            # supports a compatible autonomy implementation that accepts the
+            # call but does not persist optional metadata.
+            binder = getattr(self.autonomy, "bind_action", None)
+            if callable(binder):
+                try:
+                    if not binder(
+                        episode.id,
+                        plan_id=plan.id,
+                        step_id=step.id,
+                        action_id=action.id,
+                        tick=self.state.total_ticks,
+                    ):
+                        rollback("自主经历无法绑定执行账本行动，已回滚执行认领")
+                        return None, None
+                except Exception as exc:
+                    self._record_loop_error("task_execution_autonomy_bind", exc)
+                    rollback("自主经历绑定执行账本异常，已回滚执行认领")
+                    return None, None
+            if self.reward_system:
+                # Reward anticipation is an auxiliary side effect.  It must
+                # not invalidate an already committed autonomy plan when a
+                # disabled/misconfigured reward backend raises.
+                try:
+                    self.reward_system.anticipate(
+                        channel="achievement",
+                        expectation=max(0.0, min(1.0, float(getattr(goal, "priority", 0.5)))),
+                    )
+                except Exception as exc:
+                    self._record_loop_error("task_execution_reward_anticipate", exc)
+            return intent, action
+        except Exception as exc:
+            self._record_loop_error("task_execution_step", exc)
+            if claim_attempted:
+                rollback("执行步骤交接异常，已回滚执行认领")
+            return None, None
+
     def _finish_autonomy_episode(
         self,
         record,
         success: bool,
         outcome: str,
     ) -> None:
-        """Apply one closed episode to goals, reward and self-narrative.
+        """Close one episode and pass only verified outcomes into learning.
 
-        All integrations are best-effort and synchronous.  A bookkeeping
-        failure must never take down the heartbeat that just completed the
-        action.
+        The legacy GoalSystem/RewardSystem/SelfModel APIs remain available,
+        but V13 routes terminal causal outcomes through
+        :class:`VerifiedLearningFeedback`.  A plan is projected to ``done``
+        only after every step has a deterministic verified result.
         """
         if record is None:
             return
         try:
             goal = self._find_goal(getattr(record, "goal_id", ""))
             status = getattr(record, "status", "")
+            plan = self._execution_plan_for_goal(
+                getattr(record, "goal_id", ""),
+                getattr(record, "plan_id", "") or getattr(record, "task_id", ""),
+            )
+            # Resolve the exact action before closing the episode.  A close
+            # can be triggered by timeout, user interruption, bridge failure,
+            # or process restart; in all of those cases an unconfirmed
+            # external side effect must be cancelled/quarantined, while an
+            # already evaluated outcome must remain immutable.
+            action = self._execution_action_for_episode(
+                getattr(record, "id", ""),
+                action_id=getattr(record, "action_id", "") or "",
+                step_id=getattr(record, "step_id", "") or "",
+                plan_id=getattr(plan, "id", "") if plan is not None else (
+                    getattr(record, "plan_id", "") or getattr(record, "task_id", "")
+                ),
+                include_terminal=True,
+            )
+            if (
+                self.task_execution is not None
+                and plan is not None
+                and status in {
+                    EpisodeStatus.ABORTED,
+                    EpisodeStatus.FAILED,
+                    EpisodeStatus.COMPLETED,
+                }
+            ):
+                execution = self.task_execution
+                # Narrow the cancellation to this causal lane.  The helper
+                # skips EVALUATED actions, so a verified result can never be
+                # downgraded by a late timeout/abort callback.
+                try:
+                    execution.cancel_for_episode(
+                        getattr(record, "id", ""),
+                        reason=(outcome or "自主经历已收束")[:240],
+                        plan_id=plan.id,
+                        action_id=getattr(record, "action_id", "") or "",
+                        step_id=getattr(record, "step_id", "") or "",
+                        tick=self.state.total_ticks,
+                    )
+                except Exception as exc:
+                    self._record_loop_error("task_execution_episode_cancel", exc)
+                # A crash/abort can happen after ``next_step`` but before
+                # ``record_action``.  There is no action to cancel in that
+                # window, so explicitly pause the plan instead of leaving a
+                # RUNNING step that the scheduler could accidentally replay.
+                current_step = None
+                if getattr(record, "step_id", ""):
+                    current_step = plan.get_step(record.step_id)
+                if current_step is None and getattr(plan, "active_step_id", ""):
+                    current_step = plan.get_step(plan.active_step_id)
+                if (
+                    current_step is not None
+                    and current_step.status == StepStatus.RUNNING
+                    and plan.status not in {
+                        PlanStatus.COMPLETED,
+                        PlanStatus.FAILED,
+                        PlanStatus.ABANDONED,
+                    }
+                ):
+                    try:
+                        execution.pause_plan(
+                            plan.id,
+                            reason=(outcome or "自主经历中止，等待显式恢复")[:240],
+                            tick=self.state.total_ticks,
+                        )
+                    except Exception as exc:
+                        self._record_loop_error("task_execution_episode_pause", exc)
+            ledger_outcome = None
+            if self.task_execution is not None and action is not None:
+                ledger_outcome = self.task_execution.outcomes.get(
+                    getattr(action, "outcome_id", ""),
+                )
+            quality = str(
+                getattr(ledger_outcome, "status", "")
+                or getattr(record, "result_quality", "unknown")
+                or "unknown"
+            ).lower()
             episode_success = bool(
                 status == EpisodeStatus.COMPLETED
                 and getattr(record, "success", None) is not False
                 and success
             )
-            if status == EpisodeStatus.COMPLETED and goal is not None:
-                was_actionable = getattr(goal, "status", "") in {"active", "pending"}
-                if getattr(goal, "status", "") in {"active", "pending"}:
-                    self.goal_system.mark_done(goal.id, outcome[:240])
-                if was_actionable and getattr(goal, "status", "") == "done":
-                    self.drive_engine.notify_goal_completed()
+            # A plan-backed episode may represent one verified step of a
+            # multi-step task.  Keep the episode's learning success local to
+            # that step, while _sync_goal_with_plan enforces all-step goal
+            # completion.
+            if self.task_execution is not None and plan is not None:
+                episode_success = episode_success and quality == OutcomeQuality.VERIFIED
+                self._sync_goal_with_plan(goal, plan, outcome)
+            elif status == EpisodeStatus.COMPLETED and goal is not None:
+                # Legacy episodes without a V13 plan retain the old one-step
+                # projection, subject to the verified completion policy.
+                if episode_success and (
+                    not getattr(self.task_execution, "require_verified_completion", True)
+                    or quality == OutcomeQuality.VERIFIED
+                ):
+                    was_actionable = getattr(goal, "status", "") in {"active", "pending"}
+                    if was_actionable:
+                        self.goal_system.mark_done(goal.id, outcome[:240])
+                    if was_actionable and getattr(goal, "status", "") == "done":
+                        self.drive_engine.notify_goal_completed()
+                elif getattr(goal, "status", "") == "active":
+                    # Unknown/simulated feedback is retained as a resumable
+                    # task rather than being silently marked failed.
+                    goal.status = "pending"
             elif status == EpisodeStatus.FAILED and goal is not None:
+                # A legacy explicit failure is terminal; an execution-backed
+                # retry/pause decision has already been made by the ledger.
                 if getattr(goal, "status", "") == "active":
                     self.goal_system.mark_failed(goal.id, outcome[:240])
 
-            if self.reward_system and status in {
+            # Learning is a single idempotent sink.  Unknown and simulated
+            # results are quarantined there and do not receive a reward or
+            # memory/self-model reinforcement.
+            receipt = None
+            if self.learning_feedback is not None and status in {
                 EpisodeStatus.COMPLETED,
                 EpisodeStatus.FAILED,
             }:
-                quality = getattr(record, "result_quality", "unknown")
-                actual_reward = (
-                    0.8 if quality == "verified" and episode_success
-                    else 0.55 if quality == "simulated" and episode_success
-                    else 0.2
+                learning_outcome = {
+                    "outcome_id": getattr(record, "id", ""),
+                    "episode_id": getattr(record, "id", ""),
+                    "task_id": getattr(record, "task_id", "") or getattr(plan, "id", ""),
+                    "step_id": getattr(action, "step_id", "") if action is not None else getattr(record, "intent_id", ""),
+                    "status": "completed" if status == EpisodeStatus.COMPLETED else "failed",
+                    "success": episode_success,
+                    "quality": quality,
+                    "goal": getattr(record, "goal", ""),
+                    "drive": (
+                        getattr(goal, "source_drive", "")
+                        or getattr(goal, "drive", "")
+                        or getattr(record, "drive", "")
+                    ),
+                    "intent_type": getattr(record, "action_type", "") or "call_tool",
+                    "tool_name": getattr(record, "tool_name", ""),
+                    "summary": getattr(record, "result_summary", "") or outcome,
+                    "verification_method": getattr(ledger_outcome, "evaluator", "") or (
+                        "deterministic" if self.task_execution is not None else "legacy_boundary"
+                    ),
+                    "confidence": getattr(ledger_outcome, "confidence", 1.0) if ledger_outcome is not None else 1.0,
+                    "channel": "achievement",
+                }
+                receipt = self.learning_feedback.apply(
+                    learning_outcome,
+                    procedural_memory=self.procedural_memory,
+                    reward_system=self.reward_system,
+                    self_model=self.state.self_model,
+                    memory_store=self.memory_store,
+                    reflection_engine=self.reflection_engine,
+                    drive_engine=self.drive_engine,
+                    activation=self.state.activation,
+                    current_tick=self.state.total_ticks,
                 )
-                reward_event = self.reward_system.deliver_reward(
-                    channel="achievement",
-                    actual_reward=actual_reward,
-                    context=f"autonomy:{getattr(record, 'tool_name', '') or 'episode'}",
-                )
-                # Keep the reward and its local prediction error attached to
-                # the episode so a snapshot explains why a goal changed.
-                record.reward = actual_reward
-                record.prediction_error = reward_event.prediction_error
+                if receipt.memory_ids:
+                    record.memory_ids = list(receipt.memory_ids)[-20:]
+                if receipt.disposition == "verified_success":
+                    record.reward = 0.8
+                elif receipt.disposition == "verified_failure":
+                    record.reward = 0.12
+                else:
+                    record.reward = None
             elif status in {EpisodeStatus.COMPLETED, EpisodeStatus.FAILED}:
-                record.reward = (
-                    0.55
-                    if episode_success and getattr(record, "result_quality", "") == "simulated"
-                    else 0.8 if episode_success
-                    else 0.2
-                )
+                # Configuration may disable V13 entirely. Preserve the old
+                # bounded scalar reward in that explicit compatibility mode.
+                record.reward = 0.8 if episode_success else 0.2
 
             description = getattr(record, "goal", "自主经历")[:180]
             result_text = "完成" if episode_success else (
                 "中止" if status == EpisodeStatus.ABORTED else "失败"
             )
             quality_note = (
-                "（模拟结果，未作为外部事实确认）"
-                if getattr(record, "result_quality", "") == "simulated"
-                else ""
+                "（结果未核验，未进入学习层）"
+                if quality in {OutcomeQuality.UNKNOWN, OutcomeQuality.SIMULATED}
+                else "（模拟结果，未作为外部事实确认）"
+                if quality == OutcomeQuality.SIMULATED else ""
             )
             marker = f"[自主经历] {result_text}{quality_note}：{description}"
             self.working_memory.push(
@@ -912,50 +1745,9 @@ class BrainStem:
             )
             self.state.last_narrative = marker[:500]
 
-            # A compact episodic memory preserves the causal outcome without
-            # copying a potentially sensitive tool response into the ledger.
-            if self.memory_store and status in {
-                EpisodeStatus.COMPLETED,
-                EpisodeStatus.FAILED,
-            }:
-                memory_id = self.memory_store.save({
-                    "type": "episodic",
-                    "title": f"自主经历：{description[:60]}",
-                    "content": marker,
-                    "summary": marker,
-                    "source": "autonomy",
-                    "importance": (
-                        0.65
-                        if episode_success and getattr(record, "result_quality", "") != "simulated"
-                        else 0.45 if episode_success
-                        else 0.4
-                    ),
-                    "emotion_label": "breakthrough" if episode_success else "confused",
-                    "emotion_vector": dict(self.state.emotion_vector),
-                    "is_identity_forming": False,
-                })
-                record.memory_ids = [memory_id]
-            if status in {EpisodeStatus.COMPLETED, EpisodeStatus.FAILED}:
-                self.state.self_model.ingest_experience(
-                    text=marker,
-                    emotion={
-                        "emotion_label": "breakthrough" if episode_success else "failure",
-                        "emotion_vector": dict(self.state.emotion_vector),
-                        "salience": (
-                            0.65
-                            if episode_success and getattr(record, "result_quality", "") != "simulated"
-                            else 0.45 if episode_success
-                            else 0.35
-                        ),
-                    },
-                    importance=(
-                        0.65
-                        if episode_success and getattr(record, "result_quality", "") != "simulated"
-                        else 0.45 if episode_success
-                        else 0.4
-                    ),
-                    memory_count=self.memory_store.count() if self.memory_store else 0,
-                )
+            # In V13 the learning sink above owns durable memory/self-model
+            # writes.  Keeping this marker only in working memory avoids
+            # duplicate reinforcement and preserves quarantine semantics.
         except Exception as exc:
             self._record_loop_error("autonomy_close", exc)
         finally:
@@ -973,13 +1765,19 @@ class BrainStem:
     ) -> bool:
         if self.autonomy is None:
             return False
+        # Resolve the active causal lane before touching the execution ledger.
+        # A late callback (after abort/timeout) must be an orphan; otherwise a
+        # valid-looking observation could complete an action whose episode no
+        # longer exists.  This check also gives plan-backed callbacks a single
+        # authoritative episode object against which all IDs are compared.
+        active_record = getattr(self.autonomy, "active", None)
         episode_id = input_data.get("episode_id")
         if not episode_id:
             # Legacy bridges did not send correlation IDs.  Only use the
             # single-lane fallback when the returned tool name also matches
             # the action we are waiting for; otherwise unrelated external
             # tool traffic must remain an orphan rather than close this run.
-            active = self.autonomy.active
+            active = active_record
             if (
                 active is not None
                 and active.status in {
@@ -996,6 +1794,244 @@ class BrainStem:
             self.autonomy.total_orphan_feedback += 1
             self._sync_autonomy_projection()
             return False
+        # An explicit episode ID is not enough by itself: it must still name
+        # the currently active, non-terminal episode.  In particular, do this
+        # *before* ``find_action``/``record_observation`` so delayed feedback
+        # cannot mutate a plan after an abort or timeout.
+        if (
+            active_record is None
+            or getattr(active_record, "id", "") != str(episode_id)
+            or getattr(active_record, "status", "") not in {
+                EpisodeStatus.AWAITING_ACTION,
+                EpisodeStatus.AWAITING_FEEDBACK,
+            }
+        ):
+            self.autonomy.total_orphan_feedback += 1
+            self._sync_autonomy_projection()
+            return False
+        # V13 path: evaluate the structured bridge observation first.  The
+        # text shown to the language model is deliberately not trusted as
+        # proof, and a missing observation becomes ``unknown``.
+        execution = self.task_execution
+        active_plan = None
+        plan_key = (
+            getattr(active_record, "plan_id", "")
+            or getattr(active_record, "task_id", "")
+            or input_data.get("plan_id")
+            or ""
+        )
+        plan_backed = bool(
+            execution is not None
+            and (
+                plan_key
+                or input_data.get("step_id")
+                or input_data.get("action_id")
+            )
+        )
+        if plan_backed:
+            # A plan-backed lane must never fall through to the legacy text
+            # classifier when its action correlation is missing or stale.
+            # Otherwise a caller could attach an unverified success message
+            # to an active plan simply by reusing the episode id.
+            active_plan = self._execution_plan_for_goal(
+                getattr(active_record, "goal_id", ""),
+                plan_key,
+            )
+            if active_plan is None:
+                self.autonomy.total_orphan_feedback += 1
+                self._sync_autonomy_projection()
+                return False
+
+            # Every plan-backed callback must carry the complete correlation
+            # tuple.  Falling back to "newest action for this episode" makes a
+            # missing action_id (or a stale step) indistinguishable from a
+            # valid delivery and permits forged feedback to advance a plan.
+            expected_ids = {
+                "goal_id": getattr(active_record, "goal_id", ""),
+                "plan_id": getattr(active_plan, "id", ""),
+                "step_id": getattr(active_record, "step_id", "") or "",
+                "action_id": getattr(active_record, "action_id", "") or "",
+                "intent_id": getattr(active_record, "intent_id", ""),
+            }
+            supplied_ids = {
+                "goal_id": input_data.get("goal_id") or "",
+                "plan_id": input_data.get("plan_id") or "",
+                "step_id": input_data.get("step_id") or "",
+                "action_id": input_data.get("action_id") or "",
+                "intent_id": input_data.get("intent_id") or "",
+            }
+            if (
+                any(not str(value) for value in supplied_ids.values())
+                or supplied_ids["goal_id"] != str(expected_ids["goal_id"])
+                or supplied_ids["plan_id"] != str(expected_ids["plan_id"])
+                or supplied_ids["step_id"] != str(expected_ids["step_id"])
+                or supplied_ids["action_id"] != str(expected_ids["action_id"])
+                or supplied_ids["intent_id"] != str(expected_ids["intent_id"])
+                or str(plan_key) != str(active_plan.id)
+                or (
+                    getattr(active_record, "task_id", "")
+                    and str(getattr(active_record, "task_id", "")) != str(active_plan.id)
+                )
+                or (
+                    getattr(active_record, "plan_id", "")
+                    and str(getattr(active_record, "plan_id", "")) != str(active_plan.id)
+                )
+            ):
+                self.autonomy.total_orphan_feedback += 1
+                self._sync_autonomy_projection()
+                return False
+        action = None
+        if plan_backed:
+            action = self._execution_action_for_episode(
+                str(episode_id),
+                action_id=input_data.get("action_id") or "",
+                step_id=input_data.get("step_id") or "",
+                plan_id=getattr(active_plan, "id", "") if active_plan is not None else "",
+                include_terminal=False,
+            )
+        if plan_backed:
+            # Validate the tool/step/action relationship before recording the
+            # observation.  Autonomy.record_feedback performs a similar check,
+            # but it runs after ledger evaluation; relying on it alone would
+            # let a mismatched callback mark the step completed even though
+            # the episode rejects the feedback.
+            if (
+                action is None
+                or action.episode_id != str(episode_id)
+                or action.plan_id != str(active_plan.id)
+                or action.step_id != str(input_data.get("step_id") or "")
+                or (
+                    getattr(action, "tool_name", "")
+                    and str(getattr(action, "tool_name", "")) != str(tool_name or "")
+                )
+                or (
+                    getattr(active_record, "tool_name", "")
+                    and str(getattr(active_record, "tool_name", "")) != str(tool_name or "")
+                )
+                or str(getattr(action, "status", "")) != ActionStatus.STARTED
+            ):
+                self.autonomy.total_orphan_feedback += 1
+                self._sync_autonomy_projection()
+                return False
+        elif execution is not None:
+            # A ledger action without a bound task/episode is not a safe
+            # legacy fallback.  Reject it rather than evaluating it and then
+            # attaching the result to a text-only episode.
+            try:
+                orphan_action = execution.find_action(
+                    action_id=input_data.get("action_id") or "",
+                    episode_id=str(episode_id),
+                    include_terminal=False,
+                )
+            except Exception:
+                orphan_action = None
+            if orphan_action is not None:
+                self.autonomy.total_orphan_feedback += 1
+                self._sync_autonomy_projection()
+                return False
+        outcome_record = None
+        if execution is not None and action is not None:
+            observation = input_data.get("tool_observation")
+            if input_data.get("_observation_token") is not self._tool_observation_capability:
+                # Direct/API callers cannot inject the bridge's structured
+                # evidence.  Keep only the bounded text envelope, which is
+                # intentionally insufficient for a verified outcome.
+                observation = None
+            if not isinstance(observation, dict):
+                observation = {
+                    "summary": str(input_data.get("text", ""))[:300],
+                    "data": {},
+                }
+            try:
+                outcome_record = execution.record_observation(
+                    action.id,
+                    observation,
+                    tick=self.state.total_ticks,
+                )
+            except Exception as exc:
+                self._record_loop_error("task_execution_observation", exc)
+                outcome_record = None
+            if outcome_record is not None and hasattr(outcome_record, "status"):
+                self._last_execution_outcome = outcome_record
+                verified_success = bool(
+                    getattr(outcome_record, "status", "") == OutcomeQuality.VERIFIED
+                    and getattr(outcome_record, "success", None) is True
+                )
+                accepted = self.autonomy.record_feedback(
+                    episode_id=episode_id,
+                    success=verified_success,
+                    tool_name=tool_name,
+                    tick=self.state.total_ticks,
+                    intent_id=input_data.get("intent_id") or "",
+                    result_summary=(
+                        getattr(outcome_record, "summary", "")
+                        or getattr(outcome_record, "reason", "")
+                        or ("success" if verified_success else "failure")
+                    ),
+                    result_quality=getattr(outcome_record, "status", OutcomeQuality.UNKNOWN),
+                    plan_id=input_data.get("plan_id") or "",
+                    step_id=input_data.get("step_id") or "",
+                    action_id=input_data.get("action_id") or "",
+                )
+                self._sync_autonomy_projection()
+                return accepted
+            # A validated action can still fail to append its observation
+            # (most commonly because the bounded journal is full).  The
+            # ledger pauses/quarantines the plan in that case, so leaving the
+            # autonomy episode active would hold the scheduler's single lane
+            # until an unrelated timeout.  Close only this exact episode;
+            # ``_finish_autonomy_episode`` will cancel any remaining
+            # ambiguous action without fabricating an outcome.
+            self.autonomy.total_orphan_feedback += 1
+            active_now = getattr(self.autonomy, "active", None)
+            if active_now is active_record and getattr(self.autonomy, "is_active", False):
+                reason = "执行观察无法写入有界账本，计划已暂停"
+                try:
+                    aborted = self.autonomy.abort(reason, self.state.total_ticks)
+                    self._finish_autonomy_episode(aborted, False, reason)
+                except Exception as exc:
+                    self._record_loop_error("task_execution_observation_abort", exc)
+            self._sync_autonomy_projection()
+            return False
+
+        if execution is not None and active_plan is not None:
+            # Correlated plan actions are the only authority for V13 feedback;
+            # do not downgrade to the legacy textual path on a missing or
+            # mismatched action.
+            self.autonomy.total_orphan_feedback += 1
+            self._sync_autonomy_projection()
+            return False
+
+        # Legacy bridge/episode path.  Keep correlation checks and the old
+        # textual classifier for compatibility, but still pass an explicit
+        # quality so unknown callbacks cannot be silently promoted.
+        quality = self._classify_autonomy_feedback(
+            input_data.get("text", ""), success
+        )
+        # Preserve explicit structured failure/simulation markers for the
+        # compatibility path as well.  This prevents a rendered
+        # ``{"success": false}`` payload from being promoted by keyword
+        # classification while retaining older positive text callbacks.
+        legacy_observation = input_data.get("tool_observation")
+        if isinstance(legacy_observation, dict):
+            legacy_data = legacy_observation.get("data")
+            if not isinstance(legacy_data, dict):
+                legacy_data = legacy_observation
+            if (
+                legacy_observation.get("error")
+                or legacy_data.get("error")
+                or legacy_data.get("success") is False
+                or legacy_data.get("ok") is False
+                or str(legacy_data.get("result_quality", legacy_data.get("quality", ""))).lower()
+                in {"failed", "failure", "error"}
+            ):
+                quality = "failed"
+            elif legacy_observation.get("simulated") or str(
+                legacy_data.get("result_quality", legacy_data.get("quality", ""))
+            ).lower() in {"simulated", "dry_run", "dry-run"}:
+                quality = "simulated"
+        elif not success:
+            quality = "failed"
         accepted = self.autonomy.record_feedback(
             episode_id=episode_id,
             success=success,
@@ -1003,9 +2039,10 @@ class BrainStem:
             tick=self.state.total_ticks,
             intent_id=input_data.get("intent_id") or "",
             result_summary="success" if success else "failure",
-            result_quality=self._classify_autonomy_feedback(
-                input_data.get("text", ""), success
-            ),
+            result_quality=quality,
+            plan_id=input_data.get("plan_id") or "",
+            step_id=input_data.get("step_id") or "",
+            action_id=input_data.get("action_id") or "",
         )
         self._sync_autonomy_projection()
         return accepted
@@ -1030,6 +2067,71 @@ class BrainStem:
         if "来源质量] failed" in normalized:
             return "failed"
         return "verified"
+
+    @staticmethod
+    def _feedback_success_hint(input_data: dict[str, Any]) -> bool:
+        """Derive a conservative failure hint from a tool callback.
+
+        The legacy path receives a rendered string in addition to the V13
+        observation.  A string such as ``{"success": false}`` used to be
+        treated as successful because it contained none of the human-facing
+        error keywords.  Parse bounded structured envelopes when available
+        and fail closed on explicit ``error``/``ok=false``/``success=false``;
+        positive assertions still go through the normal verification policy.
+        """
+        text = str(input_data.get("text", "") or "")
+        if any(
+            keyword in text.casefold()
+            for keyword in ("失败", "error", "错误", "exception", "traceback")
+        ):
+            return False
+
+        candidates: list[Any] = []
+        observation = input_data.get("tool_observation")
+        if isinstance(observation, dict):
+            candidates.append(observation)
+            data = observation.get("data")
+            if isinstance(data, dict):
+                candidates.append(data)
+
+        # Tool formatters commonly prefix a JSON object with a short label.
+        # Decode the full text first, then bounded object fragments.  This is
+        # only a failure hint; no parsed positive flag is used as proof.
+        for raw in (text,):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    candidates.append(parsed)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+            for marker in ("{", "["):
+                start = raw.find(marker)
+                if start < 0:
+                    continue
+                fragment = raw[start : start + 8000]
+                try:
+                    parsed = json.loads(fragment)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if isinstance(parsed, dict):
+                    candidates.append(parsed)
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("error") not in (None, "", False):
+                return False
+            for key in ("success", "ok"):
+                value = candidate.get(key)
+                if isinstance(value, bool) and value is False:
+                    return False
+            quality = str(
+                candidate.get("result_quality", candidate.get("quality", ""))
+                or ""
+            ).casefold()
+            if quality in {"failed", "failure", "error"}:
+                return False
+        return True
 
     def _observe_autonomy_intent(self, intent: Intent) -> bool:
         """Attach a follow-up intent to the active episode.
@@ -1058,16 +2160,205 @@ class BrainStem:
         if not intent.origin or intent.origin == "external":
             intent.origin = active.origin or "autonomous"
         if intent.type == IntentType.CALL_TOOL:
-            planned = self.autonomy.plan(
-                episode_id=active.id,
-                action_type=intent.type.value,
-                tool_name=intent.tool_name or "",
-                tick=self.state.total_ticks,
-                reason=intent.reason,
-                intent_id=intent.intent_id,
-                expected=intent.reason[:240],
-                attempt_no=intent.attempt_no,
+            execution = self.task_execution
+            followup_plan_key = (
+                getattr(active, "plan_id", "")
+                or getattr(active, "task_id", "")
             )
+            plan = self._execution_plan_for_goal(active.goal_id, followup_plan_key)
+            # A language-model follow-up cannot choose a new tool outside a
+            # bounded plan.  If any V13 correlation is present, a missing
+            # plan is itself a hard failure rather than permission to fall
+            # back to the legacy free-form path.
+            plan_backed = bool(
+                execution is not None
+                and (
+                    plan is not None
+                    or getattr(active, "task_id", "")
+                    or getattr(active, "plan_id", "")
+                    or getattr(intent, "plan_id", None)
+                    or getattr(intent, "step_id", None)
+                    or getattr(intent, "action_id", None)
+                )
+            )
+            if plan_backed:
+                if plan is None:
+                    return False
+                # A follow-up describes the next step, not an arbitrary
+                # action chosen by the model.  Reject caller-supplied IDs
+                # before mutating the ledger; the fresh IDs are assigned only
+                # after the deterministic step has been claimed.
+                if intent.plan_id and intent.plan_id != plan.id:
+                    return False
+                if intent.step_id or intent.action_id:
+                    return False
+
+                claim_state = self._capture_execution_claim_state(plan)
+                try:
+                    action_ids_before = {
+                        str(key) for key in getattr(execution, "actions", {}).keys()
+                    }
+                except Exception:
+                    action_ids_before = set()
+                # ``autonomy.plan`` is the second half of this hand-off and
+                # mutates the live episode.  Keep a small before-image too;
+                # otherwise a ledger action could be rolled back while the
+                # episode remains AWAITING_ACTION with a dead correlation.
+                autonomy_fields = (
+                    "status", "action_type", "tool_name", "intent_id",
+                    "expected", "attempt_no", "step_count", "plan_id",
+                    "step_id", "action_id", "success", "outcome",
+                    "last_feedback", "result_summary", "result_quality",
+                )
+                autonomy_before = {
+                    field: getattr(active, field, None) for field in autonomy_fields
+                }
+                autonomy_events_before = len(getattr(active, "events", []) or [])
+                step = None
+                action = None
+
+                def rollback(reason: str) -> None:
+                    try:
+                        self._rollback_execution_claim(
+                            execution,
+                            plan,
+                            claim_state,
+                            action_ids_before,
+                            action=action,
+                            step_id=str(getattr(step, "id", "") or ""),
+                            reason=reason,
+                        )
+                    except Exception as exc:
+                        self._record_loop_error("task_execution_followup_rollback", exc)
+                    for field, value in autonomy_before.items():
+                        try:
+                            setattr(active, field, value)
+                        except Exception:
+                            pass
+                    try:
+                        if isinstance(active.events, list):
+                            active.events = active.events[:autonomy_events_before]
+                            append_event = getattr(self.autonomy, "_append_event", None)
+                            if callable(append_event):
+                                append_event(
+                                    active,
+                                    "followup_rolled_back",
+                                    self.state.total_ticks,
+                                    reason[:240],
+                                )
+                    except Exception as exc:
+                        self._record_loop_error("autonomy_followup_rollback", exc)
+
+                try:
+                    step = execution.next_step(
+                        plan_id=plan.id, current_tick=self.state.total_ticks
+                    )
+                    if step is None:
+                        # ``next_step`` may discover a terminal, blocked, or
+                        # dependency-deadlocked plan.  Close this exact
+                        # episode so it cannot remain the scheduler's active
+                        # lane forever; the helper only projects verified
+                        # completion and otherwise pauses/aborts safely.
+                        self._close_unqueued_execution_episode(
+                            self._find_goal(active.goal_id), active, plan
+                        )
+                        return False
+                    if intent.tool_name and step.tool_name and intent.tool_name != step.tool_name:
+                        rollback("后续意图工具与计划步骤不一致，已回滚执行认领")
+                        return False
+                    goal = self._find_goal(active.goal_id)
+                    if goal is None:
+                        rollback("后续意图所属目标不存在，已回滚执行认领")
+                        return False
+                    deterministic_intent = self._goal_to_intent(
+                        goal,
+                        episode_id=active.id,
+                        attempt_no=getattr(goal, "attempt_count", 0),
+                        step=step,
+                        plan_id=plan.id,
+                        step_id=step.id,
+                    )
+                    if deterministic_intent is None:
+                        rollback("无法构造后续工具意图，已回滚执行认领")
+                        return False
+                    # Retain only the model's short reason.  Tool and
+                    # arguments come from the bounded plan, never from the
+                    # untrusted follow-up payload.
+                    deterministic_intent.reason = (
+                        intent.reason[:200] or deterministic_intent.reason
+                    )
+                    intent.type = deterministic_intent.type
+                    intent.tool_name = deterministic_intent.tool_name
+                    intent.tool_args = deterministic_intent.tool_args
+                    intent.plan_id = plan.id
+                    intent.step_id = step.id
+                    intent.goal_id = active.goal_id
+                    intent.episode_id = active.id
+                    action = execution.record_action(
+                        plan.id,
+                        step.id,
+                        action_type=intent.type.value,
+                        tool_name=intent.tool_name or step.tool_name,
+                        args=intent.tool_args,
+                        expected=step.expected,
+                        tick=self.state.total_ticks,
+                        episode_id=active.id,
+                        attempt_no=intent.attempt_no,
+                    )
+                    if action is None:
+                        rollback("执行账本无法记录后续行动，已回滚执行认领")
+                        return False
+                    intent.action_id = action.id
+                    planned = self.autonomy.plan(
+                        episode_id=active.id,
+                        action_type=intent.type.value,
+                        tool_name=intent.tool_name or "",
+                        tick=self.state.total_ticks,
+                        reason=intent.reason,
+                        intent_id=intent.intent_id,
+                        expected=step.expected or intent.reason[:240],
+                        attempt_no=intent.attempt_no,
+                        plan_id=plan.id,
+                        step_id=step.id,
+                        action_id=action.id,
+                    )
+                    if not planned:
+                        rollback("自主经历无法登记后续步骤，已回滚执行认领")
+                        return False
+                    binder = getattr(self.autonomy, "bind_action", None)
+                    if callable(binder) and not binder(
+                        active.id,
+                        plan_id=plan.id,
+                        step_id=step.id,
+                        action_id=action.id,
+                        tick=self.state.total_ticks,
+                    ):
+                        rollback("自主经历无法绑定后续行动，已回滚执行认领")
+                        return False
+                except Exception as exc:
+                    self._record_loop_error("task_execution_followup", exc)
+                    rollback("后续执行步骤交接异常，已回滚执行认领")
+                    return False
+                self._sync_autonomy_projection()
+                return True
+
+            # Compatibility path for episodes created before V13.  It still
+            # requires the autonomy correlation checks above, but has no
+            # ledger action to claim.
+            try:
+                planned = self.autonomy.plan(
+                    episode_id=active.id,
+                    action_type=intent.type.value,
+                    tool_name=intent.tool_name or "",
+                    tick=self.state.total_ticks,
+                    reason=intent.reason,
+                    intent_id=intent.intent_id,
+                    expected=intent.reason[:240],
+                    attempt_no=intent.attempt_no,
+                )
+            except Exception as exc:
+                self._record_loop_error("autonomy_followup_plan", exc)
+                planned = False
             self._sync_autonomy_projection()
             return planned
         if intent.type in {
@@ -1163,6 +2454,19 @@ class BrainStem:
         if self.autonomy is not None and isinstance(snapshot.get("autonomy"), dict):
             _restore_component("autonomy", "autonomy", AutonomyEpisode.from_snapshot)
             self._sync_autonomy_projection()
+        if self.task_execution is not None and isinstance(snapshot.get("task_execution"), dict):
+            _restore_component("task_execution", "task_execution", TaskExecutionLedger.from_snapshot)
+            try:
+                self.task_execution.require_verified_completion = bool(
+                    TASK_EXECUTION_REQUIRE_VERIFIED_COMPLETION
+                )
+                self.task_execution.auto_replan = bool(TASK_EXECUTION_AUTO_REPLAN)
+            except Exception:
+                pass
+        if self.learning_feedback is not None and isinstance(snapshot.get("learning_feedback"), dict):
+            _restore_component(
+                "learning_feedback", "learning_feedback", VerifiedLearningFeedback.from_snapshot
+            )
 
         raw_thalamus = snapshot.get("thalamus", {})
         if isinstance(raw_thalamus, dict):
@@ -1236,6 +2540,73 @@ class BrainStem:
         except Exception as exc:
             self._record_loop_error("restore_task_scheduler", exc)
 
+        # Recovery is ordered deliberately: first cancel ambiguous ledger
+        # actions, then project any resulting PAUSED/BLOCKED plan onto its
+        # owning Goal, and only then let the scheduler normalize its running
+        # pointer.  If scheduler.sync runs only before ledger recovery, a
+        # snapshot with an ACTIVE goal can retain ``running_goal_id`` even
+        # though its in-flight action has just been cancelled; that stale
+        # pointer blocks the next safe task and can invite a replay.
+        if self.task_execution is not None:
+            execution_before = {
+                plan.id: (plan.status, plan.active_step_id)
+                for plan in getattr(self.task_execution, "plans", {}).values()
+            }
+            try:
+                self.task_execution.recover_inflight(
+                    current_tick=self.state.total_ticks
+                )
+            except Exception as exc:
+                self._record_loop_error("restore_task_execution", exc)
+            for plan in list(
+                getattr(self.task_execution, "plans", {}).values()
+            ):
+                goal = self._find_goal(getattr(plan, "goal_id", ""))
+                if goal is None:
+                    continue
+                previous = execution_before.get(plan.id)
+                changed = previous is None or previous != (
+                    plan.status,
+                    plan.active_step_id,
+                )
+                # A plan may already have been persisted as paused while the
+                # legacy Goal was still ACTIVE (for example a crash between
+                # the two component snapshots).  Project that mismatch too,
+                # not just transitions observed during this recovery pass.
+                needs_projection = changed or (
+                    plan.status
+                    in {
+                        PlanStatus.PAUSED,
+                        PlanStatus.BLOCKED,
+                        PlanStatus.FAILED,
+                        PlanStatus.COMPLETED,
+                    }
+                    and getattr(goal, "status", "")
+                    in {
+                        GoalStatus.PENDING,
+                        GoalStatus.ACTIVE,
+                    }
+                )
+                if needs_projection:
+                    try:
+                        self._sync_goal_with_plan(
+                            goal,
+                            plan,
+                            "重启恢复后未确认行动已取消，计划需显式恢复",
+                        )
+                    except Exception as exc:
+                        self._record_loop_error(
+                            "restore_task_execution_projection", exc
+                        )
+            # The projection above clears a matching running pointer when a
+            # goal is paused/terminal.  A second pure normalization pass also
+            # handles malformed snapshots where no Goal object was available
+            # for projection.
+            try:
+                self.task_scheduler.sync(self.goal_system, self.state.total_ticks)
+            except Exception as exc:
+                self._record_loop_error("restore_task_scheduler_post_execution", exc)
+
     async def _tick(self):
         """One tick of consciousness. V6: ActivationField drives state dynamics."""
 
@@ -1244,9 +2615,11 @@ class BrainStem:
         # caller instead of waking every caller at once.
         self._active_input_id = None
         autonomy_feedback_seen = False
+        autonomy_feedback_rejected = False
         autonomy_followup_intent = False
         autonomy_feedback_success = False
         autonomy_feedback_tool = ""
+        self._last_execution_outcome = None
 
         if self.autonomy:
             expired = self.autonomy.tick(self.state.total_ticks)
@@ -1322,6 +2695,40 @@ class BrainStem:
             input_data and thalamus_out.get("has_input") and not boundary_accepted
         )
 
+        # Register tool feedback before committing any per-source context or
+        # running cognition.  A callback that carries autonomous correlation
+        # metadata (or arrives while an autonomous episode is active) is
+        # treated as a quarantined input when the causal check rejects it.
+        # This is stronger than merely refusing to close the ledger: rejected
+        # feedback must not train prediction, emotion, habits, memory, or
+        # reward state through the ordinary input pipeline either.
+        if input_data and not refused_input and str(
+            input_data.get("source", "")
+        ).startswith("agent/tool/"):
+            autonomy_feedback_candidate = bool(
+                any(input_data.get(key) for key in (
+                    "episode_id", "intent_id", "goal_id", "plan_id",
+                    "step_id", "action_id",
+                ))
+                or (self.autonomy is not None and self.autonomy.is_active)
+            )
+            autonomy_feedback_success = self._feedback_success_hint(input_data)
+            autonomy_feedback_tool = str(input_data.get("source", ""))[len("agent/tool/"):]
+            autonomy_feedback_seen = self._record_autonomy_feedback(
+                input_data,
+                autonomy_feedback_success,
+                autonomy_feedback_tool,
+            )
+            autonomy_feedback_rejected = bool(
+                autonomy_feedback_candidate and not autonomy_feedback_seen
+            )
+            if autonomy_feedback_rejected:
+                # Reuse the established refused-input guards below so this
+                # untrusted callback is acknowledged and its waiter resolved,
+                # but cannot become a learning event for another causal lane.
+                refused_input = True
+                boundary_reason = "自主反馈关联校验失败"
+
         # A new accepted subject input preempts an in-flight autonomous action;
         # a rejected message does not get to rewrite the episode timeline.
         if (
@@ -1370,6 +2777,13 @@ class BrainStem:
                     source=str(input_data.get("source", "user")),
                 )
                 if user_goal is not None:
+                    if self.task_execution is not None:
+                        try:
+                            self.task_execution.ensure_plan_for_goal(
+                                user_goal, current_tick=self.state.total_ticks
+                            )
+                        except Exception as exc:
+                            self._record_loop_error("task_execution_plan", exc)
                     self.working_memory.push(
                         content="[用户任务] {0}".format(user_goal.description[:120]),
                         source="task_scheduler",
@@ -1389,23 +2803,6 @@ class BrainStem:
             self.state.ticks_since_input = previous_ticks_since_input + 1
             self.sleep_state = previous_sleep_state
             self.state.sleep_state = self.sleep_state
-
-        # Register tool feedback before cognitive dispatch so a follow-up
-        # intent can advance the same episode instead of racing its status.
-        if input_data and not refused_input and str(
-            input_data.get("source", "")
-        ).startswith("agent/tool/"):
-            feedback_text = (input_data.get("text", "") or "").lower()
-            autonomy_feedback_success = not any(
-                keyword in feedback_text
-                for keyword in ["失败", "error", "错误", "exception", "traceback"]
-            )
-            autonomy_feedback_tool = str(input_data.get("source", ""))[len("agent/tool/"):]
-            autonomy_feedback_seen = self._record_autonomy_feedback(
-                input_data,
-                autonomy_feedback_success,
-                autonomy_feedback_tool,
-            )
 
         # ── V9 Predictive Layer: 在感知之前生成预测 ──
         # Build an expectation only for an accepted message.  A rejected
@@ -1458,7 +2855,13 @@ class BrainStem:
 
         # ── V9 Predictive Layer: 计算预测误差，surprise → salience boost ──
         surprise_salience = 0.0
-        if self.predictive_layer and boundary_accepted and input_data and thalamus_out["has_input"]:
+        if (
+            self.predictive_layer
+            and boundary_accepted
+            and input_data
+            and thalamus_out["has_input"]
+            and not refused_input
+        ):
             emotion_vec = amygdala_out.get("emotion_vector", {})
             error = self.predictive_layer.observe_and_compute(
                 expectation=self.predictive_layer.last_expectation,
@@ -1514,10 +2917,16 @@ class BrainStem:
                 # accepted the message.  Retrieval can update access counters
                 # and expose hit counts, so doing it first leaked side effects
                 # from a request the subject had already refused.
-                hippocampus_out = await self.hippocampus.retrieve(
-                    query=thalamus_out["text"],
-                    top_k=5,
+                hippocampus_out = await self._bounded_cognitive_await(
+                    self.hippocampus.retrieve(
+                        query=thalamus_out["text"],
+                        top_k=5,
+                    ),
+                    "hippocampus.retrieve",
+                    {"results": [], "total_stored": 0},
                 )
+                if not isinstance(hippocampus_out, dict):
+                    hippocampus_out = {"results": [], "total_stored": 0}
                 self.state.last_retrieved = [
                     str(item.get("id", item.get("title", "")))
                     for item in hippocampus_out.get("results", [])
@@ -1540,7 +2949,10 @@ class BrainStem:
             # gated without invoking the regular attention gate.
             self.state.last_input_gated = not gate["passed"]
             self.state.last_input_accepted = gate["passed"]
-            self.state.last_error = ""
+            # ``last_error`` was cleared at the input boundary above.  Keep
+            # any error recorded while preparing this same request (for
+            # example a bounded hippocampus timeout) so the health snapshot
+            # and long-running metrics do not erase the evidence immediately.
 
             # LLM Processing: encoding + focus + monologue + intent
             # V9: 多通道认知调度；V5-V8: 统一单次调用
@@ -1571,28 +2983,41 @@ class BrainStem:
                     # ── V9: Cognitive Dispatch (多通道) vs Legacy Unified (单次调用) ──
                     if self.cognitive_dispatch:
                         # 使用多通道认知调度器
-                        cog_result = await self.cognitive_dispatch.dispatch(
-                            text=thalamus_out["text"],
-                            source=thalamus_out["source"],
-                            goal=self.state.current_goal,
-                            current_emotion={
-                                "valence": self.emotional_spectrum.valence,
-                                "arousal": self.emotional_spectrum.arousal,
-                                "dominance": self.emotional_spectrum.dominance,
-                            },
-                            recent_thoughts=self.working_memory.get_context()[:300],
-                            identity_anchor=self.state.self_model.identity_anchor[:300],
-                            identity_memories_context=id_context,
-                            top_drives=[
-                                d["label"] for d in self.state.self_model.get_top_drives(2)
-                            ],
-                            tools_summary=tools_summary or "",
-                            temporal_context=temporal_ctx,
-                            skill_hint=skill_hint or "",
-                            llm_client=llm,
+                        cog_result = await self._bounded_cognitive_await(
+                            self.cognitive_dispatch.dispatch(
+                                text=thalamus_out["text"],
+                                source=thalamus_out["source"],
+                                goal=self.state.current_goal,
+                                current_emotion={
+                                    "valence": self.emotional_spectrum.valence,
+                                    "arousal": self.emotional_spectrum.arousal,
+                                    "dominance": self.emotional_spectrum.dominance,
+                                },
+                                recent_thoughts=self.working_memory.get_context()[:300],
+                                identity_anchor=self.state.self_model.identity_anchor[:300],
+                                identity_memories_context=id_context,
+                                top_drives=[
+                                    d["label"] for d in self.state.self_model.get_top_drives(2)
+                                ],
+                                tools_summary=tools_summary or "",
+                                temporal_context=temporal_ctx,
+                                skill_hint=skill_hint or "",
+                                llm_client=llm,
+                            ),
+                            "cognitive_dispatch",
+                            None,
                         )
-                        # 转换为与旧 unified 格式兼容的 dict
-                        unified = cog_result.to_unified_dict()
+                        # 转换为与旧 unified 格式兼容的 dict.  A timeout
+                        # yields a deterministic think-only envelope so the
+                        # remainder of the tick can still commit state and
+                        # resolve the caller's future.
+                        unified = (
+                            cog_result.to_unified_dict()
+                            if cog_result is not None
+                            else self._cognitive_timeout_fallback(
+                                thalamus_out["text"]
+                            )
+                        )
 
                         # ── V9: 规则引擎情绪已在 dispatch 中计算，跳过 LLM 情绪摄入 ──
                         # 直接用规则引擎的 VAD 值（不做 LLM 情绪混合）
@@ -1650,7 +3075,20 @@ class BrainStem:
                             ctx_obj["skill_memory"] = skill_hint
                         ctx = json.dumps(ctx_obj, ensure_ascii=False)
 
-                        unified = await llm.chat_json(system=UNIFIED_TICK_PROMPT, user=ctx, temperature=0.1, max_tokens=1024)
+                        unified = await self._bounded_cognitive_await(
+                            llm.chat_json(
+                                system=UNIFIED_TICK_PROMPT,
+                                user=ctx,
+                                temperature=0.1,
+                                max_tokens=1024,
+                            ),
+                            "llm.chat_json",
+                            self._cognitive_timeout_fallback(thalamus_out["text"]),
+                        )
+                        if not isinstance(unified, dict):
+                            unified = self._cognitive_timeout_fallback(
+                                thalamus_out["text"]
+                            )
 
                     # ── LLM Emotion — v5.3: 情感光谱摄入（替代旧杏仁核混合）──
                     llm_emotion = unified.get("emotion", {})
@@ -1866,11 +3304,15 @@ class BrainStem:
             
             # Chain association (async, fire and forget)
             if encoded_memory:
-                chain = await self.hippocampus.associate(
-                    query=thalamus_out["text"],
-                    previous_results=hippocampus_out.get("results", []) if hippocampus_out else [],
+                chain = await self._bounded_cognitive_await(
+                    self.hippocampus.associate(
+                        query=thalamus_out["text"],
+                        previous_results=hippocampus_out.get("results", []) if hippocampus_out else [],
+                    ),
+                    "hippocampus.associate",
+                    [],
                 )
-                self.state.association_chain = chain
+                self.state.association_chain = chain if isinstance(chain, list) else []
         
         # Default mode + Curiosity — idle tick inner monologue + spontaneous thinking
         if not is_external and self.state.ticks_since_input >= 5:
@@ -1944,55 +3386,92 @@ class BrainStem:
                 )
                 if active_goal and active_goal.status == "active":
                     episode = None
+                    plan = None
                     if self.autonomy and not episode_busy:
-                        episode = self.autonomy.begin(
-                            goal_id=active_goal.id,
-                            goal=active_goal.description,
-                            drive=getattr(active_goal, "source_drive", "") or active_goal.drive,
-                            trigger="drive",
-                            tick=self.state.total_ticks,
-                            attempt_no=active_goal.attempt_count,
-                        )
-
-                    # Convert goal to a CALL_TOOL intent if we have tools to execute it
-                    can_issue = (self.autonomy is None) or (episode is not None)
-                    goal_intent = (
-                        self._goal_to_intent(
-                            active_goal,
-                            episode_id=episode.id if episode else (
-                                active_episode.id if episode_busy else None
-                            ),
-                            attempt_no=getattr(active_goal, "attempt_count", 0),
-                        )
-                        if can_issue and not episode_busy else None
-                    )
-                    if goal_intent:
-                        if episode:
-                            self.autonomy.plan(
-                                episode.id,
-                                goal_intent.type.value,
-                                goal_intent.tool_name or "",
-                                self.state.total_ticks,
-                                goal_intent.reason,
-                                intent_id=goal_intent.intent_id,
-                                expected=f"完成目标：{active_goal.description[:180]}",
-                                attempt_no=goal_intent.attempt_no,
+                        if self.task_execution is not None:
+                            try:
+                                plan = self._execution_plan_for_goal(active_goal.id)
+                                if plan is None:
+                                    plan = self.task_execution.ensure_plan_for_goal(
+                                        active_goal, current_tick=self.state.total_ticks
+                                    )
+                                if plan is not None and plan.status in {
+                                    PlanStatus.PAUSED,
+                                    PlanStatus.BLOCKED,
+                                    PlanStatus.COMPLETED,
+                                    PlanStatus.FAILED,
+                                    "abandoned",
+                                }:
+                                    self._sync_goal_with_plan(active_goal, plan)
+                                elif plan is not None:
+                                    episode = self.autonomy.begin(
+                                        goal_id=active_goal.id,
+                                        goal=active_goal.description,
+                                        drive=getattr(active_goal, "source_drive", "") or active_goal.drive,
+                                        trigger="drive",
+                                        tick=self.state.total_ticks,
+                                        task_id=plan.id,
+                                        attempt_no=active_goal.attempt_count,
+                                    )
+                            except Exception as exc:
+                                self._record_loop_error("task_execution_plan", exc)
+                        if episode is None and self.task_execution is None:
+                            episode = self.autonomy.begin(
+                                goal_id=active_goal.id,
+                                goal=active_goal.description,
+                                drive=getattr(active_goal, "source_drive", "") or active_goal.drive,
+                                trigger="drive",
+                                tick=self.state.total_ticks,
+                                attempt_no=active_goal.attempt_count,
                             )
-                            if self.reward_system:
-                                self.reward_system.anticipate(
-                                    channel="achievement",
-                                    expectation=max(
-                                        0.0,
-                                        min(1.0, float(getattr(active_goal, "priority", 0.5))),
-                                    ),
-                                )
+
+                    # Convert the ready plan step (or legacy goal) to a
+                    # correlated CALL_TOOL intent.  No plan-backed action is
+                    # emitted until its ledger record exists.
+                    action = None
+                    if plan is not None and episode is not None:
+                        goal_intent, action = self._queue_execution_step(
+                            active_goal, episode, plan
+                        )
+                        # ``begin`` precedes the ledger claim so the episode
+                        # can carry the exact causal IDs.  If the plan has no
+                        # ready step, close that just-created lane here;
+                        # otherwise ``episode_busy`` would remain true on
+                        # every later tick and starve the scheduler.
+                        if goal_intent is None and episode is not None:
+                            self._close_unqueued_execution_episode(
+                                active_goal, episode, plan
+                            )
+                    else:
+                        can_issue = (self.autonomy is None) or (episode is not None)
+                        goal_intent = (
+                            self._goal_to_intent(
+                                active_goal,
+                                episode_id=episode.id if episode else (
+                                    active_episode.id if episode_busy else None
+                                ),
+                                attempt_no=getattr(active_goal, "attempt_count", 0),
+                            )
+                            if can_issue and not episode_busy else None
+                        )
+                    if goal_intent:
                         self.state.last_intent = goal_intent.to_dict()
                         self.state.intent_count += 1
                         queued = await self.intent_queue.put(goal_intent)
                         if not queued and episode:
+                            if action is not None and self.task_execution is not None:
+                                try:
+                                    self.task_execution.cancel_action(
+                                        action.id,
+                                        "意图队列已满，行动未交付",
+                                        tick=self.state.total_ticks,
+                                    )
+                                except Exception as exc:
+                                    self._record_loop_error("task_execution_queue_failure", exc)
                             failed = self.autonomy.fail(
                                 "意图队列已满，行动未交付",
                                 self.state.total_ticks,
+                                result_quality=OutcomeQuality.FAILED,
                             )
                             self._finish_autonomy_episode(
                                 failed,
@@ -2053,17 +3532,33 @@ class BrainStem:
 
         # ── v5.2: detect tool result inputs (agent feedback loop) and feed outcomes ──
         if input_data and not refused_input and input_data.get("source", "").startswith("agent/tool/"):
-            # Tool result came back — if text doesn't contain error, treat as success
+            # Tool result came back. V13 uses the deterministic outcome when
+            # one was recorded; legacy traffic retains the text fallback.
             success = autonomy_feedback_success
             tool = autonomy_feedback_tool or input_data.get("source", "").replace("agent/tool/", "")
-            self.metacognition.feed_outcome(success, 0.6)
-            # v5.4: record experience for procedural memory
-            self.procedural_memory.record_experience("call_tool", tool, success, input_data.get("text", "")[:200])
+            execution_outcome = self._last_execution_outcome
+            verified_success = bool(
+                execution_outcome is not None
+                and getattr(execution_outcome, "status", "") == OutcomeQuality.VERIFIED
+                and getattr(execution_outcome, "success", None) is True
+            )
+            outcome_success = verified_success if execution_outcome is not None else success
+            outcome_confidence = (
+                float(getattr(execution_outcome, "confidence", 0.6))
+                if execution_outcome is not None else 0.6
+            )
+            self.metacognition.feed_outcome(outcome_success, outcome_confidence)
+            # V13 learning is deferred until the episode closes, where the
+            # idempotent feedback sink receives the full causal outcome.
+            if execution_outcome is None:
+                self.procedural_memory.record_experience(
+                    "call_tool", tool, success, input_data.get("text", "")[:200]
+                )
             # V10: 工具结果 → 奖励交付
             # Autonomous episodes receive one richer, correlated reward in
             # ``_finish_autonomy_episode``.  Avoid double-counting the same
             # tool result here; external tool traffic keeps the legacy path.
-            if self.reward_system and not autonomy_feedback_seen:
+            if self.reward_system and not autonomy_feedback_seen and execution_outcome is None:
                 actual_reward = 0.7 if success else 0.2
                 self.reward_system.deliver_reward(
                     channel="achievement",
@@ -2082,17 +3577,54 @@ class BrainStem:
                 and not autonomy_followup_intent
             ):
                 active = self.autonomy.active
-                outcome = f"工具 {tool} {'执行成功' if success else '返回失败'}"
-                record = (
-                    self.autonomy.complete(outcome, self.state.total_ticks)
-                    if success
-                    else self.autonomy.fail(outcome, self.state.total_ticks)
+                # A plan may have another dependency-ready step (or a retry)
+                # after this observation. Keep the same causal episode alive
+                # and queue exactly one next action where possible.
+                queued_next = False
+                plan = self._execution_plan_for_goal(
+                    getattr(active, "goal_id", ""), getattr(active, "task_id", "")
                 )
-                self._finish_autonomy_episode(
-                    record,
-                    success,
-                    outcome,
-                )
+                if execution_outcome is not None and plan is not None:
+                    goal = self._find_goal(getattr(active, "goal_id", ""))
+                    next_intent, next_action = self._queue_execution_step(
+                        goal, active, plan
+                    )
+                    if next_intent is not None and next_action is not None:
+                        self.state.last_intent = next_intent.to_dict()
+                        self.state.intent_count += 1
+                        queued_next = await self.intent_queue.put(next_intent)
+                        if not queued_next:
+                            try:
+                                self.task_execution.cancel_action(
+                                    next_action.id,
+                                    "意图队列已满，后续行动未交付",
+                                    tick=self.state.total_ticks,
+                                )
+                            except Exception as exc:
+                                self._record_loop_error("task_execution_queue_failure", exc)
+                        autonomy_followup_intent = queued_next
+                if not queued_next:
+                    outcome = (
+                        f"工具 {tool} {'执行成功' if outcome_success else '返回失败'}"
+                    )
+                    quality = (
+                        getattr(execution_outcome, "status", OutcomeQuality.UNKNOWN)
+                        if execution_outcome is not None else None
+                    )
+                    record = (
+                        self.autonomy.complete(
+                            outcome,
+                            self.state.total_ticks,
+                            result_quality=quality,
+                        )
+                        if outcome_success
+                        else self.autonomy.fail(
+                            outcome,
+                            self.state.total_ticks,
+                            result_quality=quality,
+                        )
+                    )
+                    self._finish_autonomy_episode(record, outcome_success, outcome)
 
         # ── v5.3: 情感光谱 tick（每个 tick 漂移一步）──
         self.emotional_spectrum.tick()
@@ -2137,12 +3669,13 @@ class BrainStem:
             and not refused_input
             and not (input_data.get("source", "") or "").startswith("agent/")
         )
-        self.metacognition.update_cognitive_load(
-            llm_called=(is_external and not refused_input and thalamus_out.get("has_input") and not thalamus_out.get("discarded", True)),
-            input_processed=has_external_input,
-            recent_input_count=min(10, self.state.intent_count),
-            activation=activation,  # V6: 同步 fatigue/uncertainty/confidence 到 ActivationField
-        )
+        if not refused_input:
+            self.metacognition.update_cognitive_load(
+                llm_called=(is_external and not refused_input and thalamus_out.get("has_input") and not thalamus_out.get("discarded", True)),
+                input_processed=has_external_input,
+                recent_input_count=min(10, self.state.intent_count),
+                activation=activation,  # V6: 同步 fatigue/uncertainty/confidence 到 ActivationField
+            )
 
         # ── Step 6: Basal Ganglia — habit match ──
         habit_out = None
@@ -2401,6 +3934,13 @@ Rules:
             )
             if not registered:
                 continue
+            if self.task_execution is not None:
+                try:
+                    self.task_execution.ensure_plan_for_goal(
+                        g, current_tick=self.state.total_ticks
+                    )
+                except Exception as exc:
+                    self._record_loop_error("task_execution_plan", exc)
             self.drive_engine.total_goals_generated += 1
             existing.add(fingerprint)
             self.working_memory.push(
@@ -2423,6 +3963,9 @@ Rules:
         goal,
         episode_id: str | None = None,
         attempt_no: int = 0,
+        step=None,
+        plan_id: str | None = None,
+        step_id: str | None = None,
     ) -> Intent | None:
         """v5.1: Convert a goal into a CALL_TOOL intent."""
         from brain.intent import IntentType
@@ -2436,7 +3979,24 @@ Rules:
             "self_preservation": ("memory_search", {"query": "身份变化 核心认知"}),
         }
 
-        tool_name, tool_args = tool_map.get(goal.drive, ("memory_search", {"query": goal.description[:100]}))
+        if step is not None:
+            tool_name = getattr(step, "tool_name", "") or "memory_search"
+            metadata = getattr(step, "metadata", {})
+            query_hint = (
+                metadata.get("query_hint")
+                if isinstance(metadata, dict) else None
+            ) or goal.description[:160]
+            if tool_name in {"memory_search", "web_search"}:
+                tool_args = {"query": str(query_hint)[:300]}
+            elif tool_name == "file_read":
+                path = metadata.get("path", "") if isinstance(metadata, dict) else ""
+                tool_args = {"path": str(path)[:300]} if path else {}
+            else:
+                # A plan may describe a non-read-only step for an operator,
+                # but autonomous defaults never synthesize arbitrary args.
+                tool_args = {}
+        else:
+            tool_name, tool_args = tool_map.get(goal.drive, ("memory_search", {"query": goal.description[:100]}))
 
         return Intent(
             type=IntentType.CALL_TOOL,
@@ -2447,6 +4007,8 @@ Rules:
             source_input=goal.description[:200],
             episode_id=episode_id,
             goal_id=getattr(goal, "id", None),
+            plan_id=plan_id,
+            step_id=step_id,
             attempt_no=max(0, int(attempt_no or 0)),
             origin="autonomous",
             created_tick=self.state.total_ticks,
@@ -2475,6 +4037,10 @@ Rules:
             }
             snap["goal_system"] = self.goal_system.snapshot()
             snap["task_scheduler"] = self.task_scheduler.snapshot(self.goal_system)
+            if self.task_execution is not None:
+                snap["task_execution"] = self.task_execution.snapshot()
+            if self.learning_feedback is not None:
+                snap["learning_feedback"] = self.learning_feedback.snapshot()
             snap["metacognition"] = self.metacognition.snapshot()
             snap["emotional_spectrum"] = self.emotional_spectrum.snapshot()
             snap["procedural_memory"] = self.procedural_memory.snapshot()

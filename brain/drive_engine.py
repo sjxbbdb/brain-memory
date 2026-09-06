@@ -36,6 +36,17 @@ DRIVE_DEFINITIONS = {
     "connection_drive": {"label": "连接",  "baseline": 0.4, "decay": 0.001},
 }
 
+_GOAL_DRIVE_TO_ACTIVATION = {
+    "survival": "survival_drive",
+    "self_preservation": "survival_drive",
+    "curiosity": "curiosity_drive",
+    "coherence": "coherence_drive",
+    "growth": "growth_drive",
+    "exploration": "exploration_drive",
+    "creation": "creation_drive",
+    "connection": "connection_drive",
+}
+
 
 # ══════════════════════════════════════════════
 # 信号源 → 驱动力映射
@@ -110,6 +121,10 @@ class DriveEngine:
         self.total_signals_emitted: int = 0
         self.total_goals_generated: int = 0
         self._ticks_since_last_completion: int = 0
+        self.total_verified_outcomes: int = 0
+        self.total_verified_successes: int = 0
+        self.total_verified_failures: int = 0
+        self.last_verified_outcome_tick: int = 0
 
     # ══════════════════════════════════════════════
     # 信号检测 → 驱动更新
@@ -214,11 +229,68 @@ class DriveEngine:
         """目标完成时重置停滞计数器。"""
         self._ticks_since_last_completion = 0
 
+    def record_verified_outcome(
+        self,
+        activation,
+        *,
+        drive: str = "",
+        success: bool,
+        current_tick: int = 0,
+    ) -> None:
+        """Feed one verified terminal result back into the drive field.
+
+        This hook is intentionally narrow: it is called by the idempotent
+        verified-learning boundary, never by raw tool feedback.  A confirmed
+        success slightly satisfies the drive that produced the goal, while a
+        confirmed failure raises its unresolved pressure.  Unknown and
+        simulated outcomes never reach this method.
+        """
+        self.total_verified_outcomes += 1
+        self.last_verified_outcome_tick = max(0, int(current_tick or 0))
+        if success:
+            self.total_verified_successes += 1
+            self.notify_goal_completed()
+        else:
+            self.total_verified_failures += 1
+
+        if activation is None:
+            return
+        normalized = str(drive or "").strip().lower()
+        drive_name = (
+            normalized
+            if normalized in DRIVE_DEFINITIONS
+            else _GOAL_DRIVE_TO_ACTIVATION.get(normalized, "")
+        )
+        if not drive_name:
+            return
+        try:
+            current = float(activation.get(drive_name))
+            delta = -0.02 if success else 0.04
+            activation.set(drive_name, min(1.0, max(0.0, current + delta)))
+            # A verified failure is also evidence that the current model or
+            # plan needs reconciliation.  Keep this secondary adjustment
+            # small so it cannot swamp the ordinary signal/decay loop.
+            if not success and drive_name != "coherence_drive":
+                coherence = float(activation.get("coherence_drive"))
+                activation.set(
+                    "coherence_drive",
+                    min(1.0, max(0.0, coherence + 0.01)),
+                )
+        except Exception:
+            # The learning boundary records component errors around this
+            # call.  Re-raise so a malformed activation implementation stays
+            # observable without undoing the other verified-learning sinks.
+            raise
+
     def snapshot(self) -> dict:
         return {
             "total_signals_emitted": self.total_signals_emitted,
             "total_goals_generated": self.total_goals_generated,
             "ticks_since_completion": self._ticks_since_last_completion,
+            "total_verified_outcomes": self.total_verified_outcomes,
+            "total_verified_successes": self.total_verified_successes,
+            "total_verified_failures": self.total_verified_failures,
+            "last_verified_outcome_tick": self.last_verified_outcome_tick,
             "last_signals": {k: v for k, v in self._last_signal_ticks.items()
                             if v > 0},
         }
@@ -232,6 +304,18 @@ class DriveEngine:
         engine.total_signals_emitted = int(data.get("total_signals_emitted", 0))
         engine.total_goals_generated = int(data.get("total_goals_generated", 0))
         engine._ticks_since_last_completion = int(data.get("ticks_since_completion", 0))
+        engine.total_verified_outcomes = max(
+            0, int(data.get("total_verified_outcomes", 0))
+        )
+        engine.total_verified_successes = max(
+            0, int(data.get("total_verified_successes", 0))
+        )
+        engine.total_verified_failures = max(
+            0, int(data.get("total_verified_failures", 0))
+        )
+        engine.last_verified_outcome_tick = max(
+            0, int(data.get("last_verified_outcome_tick", 0))
+        )
         last_signals = data.get("last_signals", {})
         if isinstance(last_signals, dict):
             engine._last_signal_ticks = {

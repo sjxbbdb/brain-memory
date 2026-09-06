@@ -159,6 +159,13 @@ class EpisodeRecord:
     prediction_error: float | None = None
     memory_ids: list[str] = field(default_factory=list)
     events: list[EpisodeEvent] = field(default_factory=list)
+    # V13 causal execution correlation.  These fields are deliberately kept
+    # on the episode record (rather than inferred from the latest action) so a
+    # close/abort after a retry or a restart can identify the exact ledger
+    # action that must not be replayed.
+    plan_id: str = ""
+    step_id: str = ""
+    action_id: str = ""
 
     def __post_init__(self):
         self.id = _text(self.id, 80) or f"episode-{uuid.uuid4().hex[:12]}"
@@ -199,6 +206,9 @@ class EpisodeRecord:
             self.events = []
         else:
             self.events = [event for event in self.events if isinstance(event, EpisodeEvent)]
+        self.plan_id = _text(self.plan_id, 100)
+        self.step_id = _text(self.step_id, 100)
+        self.action_id = _text(self.action_id, 100)
 
     def to_dict(self, max_events: int = 64) -> dict:
         max_events = max(1, min(256, _int(max_events, 64)))
@@ -235,6 +245,9 @@ class EpisodeRecord:
             ),
             "memory_ids": [_text(item, 100) for item in self.memory_ids[-20:]]
             if isinstance(self.memory_ids, list) else [],
+            "plan_id": _text(self.plan_id, 100),
+            "step_id": _text(self.step_id, 100),
+            "action_id": _text(self.action_id, 100),
             "events": [
                 event.to_dict() for event in self.events[-max_events:]
                 if isinstance(event, EpisodeEvent)
@@ -283,6 +296,9 @@ class EpisodeRecord:
                 [_text(item, 100) for item in data.get("memory_ids", [])[-20:]]
                 if isinstance(data.get("memory_ids"), list) else []
             ),
+            plan_id=_text(data.get("plan_id", ""), 100),
+            step_id=_text(data.get("step_id", ""), 100),
+            action_id=_text(data.get("action_id", ""), 100),
         )
         if record.status not in {
             EpisodeStatus.PLANNED,
@@ -404,6 +420,9 @@ class AutonomyEpisode:
         intent_id: str = "",
         expected: str = "",
         attempt_no: int | None = None,
+        plan_id: str = "",
+        step_id: str = "",
+        action_id: str = "",
     ) -> bool:
         record = self._resolve(episode_id)
         if record is None or record.status in TERMINAL_STATUSES:
@@ -413,10 +432,45 @@ class AutonomyEpisode:
             EpisodeStatus.FEEDBACK_RECEIVED,
         }:
             return False
+        normalized_plan = _text(plan_id, 100)
+        normalized_step = _text(step_id, 100)
+        normalized_action = _text(action_id, 100)
+
+        # A plan is an episode's causal lane and must never be switched by a
+        # later callback.  Sequential V13 steps are allowed to replace the
+        # step/action pair only after the previous feedback boundary; the
+        # plan itself remains immutable.  This keeps ``bind_action`` and
+        # ``record_feedback`` checks meaningful even when an embedder calls
+        # the autonomy object directly.
+        bound_plan = _text(record.plan_id or record.task_id, 100)
+        if normalized_plan and bound_plan and normalized_plan != bound_plan:
+            return False
+        if record.task_id and normalized_plan and record.task_id != normalized_plan:
+            return False
+        if record.status == EpisodeStatus.PLANNED:
+            if (
+                (record.step_id and normalized_step and record.step_id != normalized_step)
+                or (record.action_id and normalized_action and record.action_id != normalized_action)
+            ):
+                return False
+        elif bound_plan and ((bool(normalized_step) != bool(normalized_action))):
+            # A plan-backed follow-up must bind both sides of the step/action
+            # pair atomically.  Legacy planless episodes retain their older
+            # single-lane behaviour.
+            return False
+
         record.action_type = _text(action_type, 60)
         record.tool_name = _text(tool_name, 120)
         record.intent_id = _text(intent_id, 80)
         record.expected = _text(expected, 240)
+        if normalized_plan:
+            record.plan_id = normalized_plan
+            if not record.task_id:
+                record.task_id = normalized_plan
+        if normalized_step:
+            record.step_id = normalized_step
+        if normalized_action:
+            record.action_id = normalized_action
         if attempt_no is not None:
             record.attempt_no = _int(attempt_no)
         record.step_count += 1
@@ -426,6 +480,61 @@ class AutonomyEpisode:
             "tool_name": record.tool_name,
             "step": record.step_count,
             "intent_id": record.intent_id,
+        })
+        return True
+
+    def bind_action(
+        self,
+        episode_id: str | None,
+        *,
+        plan_id: str = "",
+        step_id: str = "",
+        action_id: str = "",
+        tick: int = 0,
+    ) -> bool:
+        """Bind the exact V13 plan/step/action to an active episode.
+
+        The binding is metadata only; the ledger and bridge still perform the
+        authoritative state transitions.  Keeping it here lets interruption,
+        timeout and restart recovery cancel precisely the action that was in
+        flight instead of guessing from a newest-record query.
+        """
+        record = self._resolve(episode_id)
+        if record is None or record.status in TERMINAL_STATUSES:
+            return False
+        normalized_plan = _text(plan_id, 100)
+        normalized_step = _text(step_id, 100)
+        normalized_action = _text(action_id, 100)
+        bound_plan = _text(record.plan_id or record.task_id, 100)
+        if normalized_plan and bound_plan and normalized_plan != bound_plan:
+            return False
+        if record.task_id and normalized_plan and record.task_id != normalized_plan:
+            return False
+        # Binding is intentionally monotonic.  ``plan()`` is the only method
+        # that may advance to a new sequential step after feedback; this
+        # method merely confirms/fills the exact IDs produced there.
+        for bound, supplied in (
+            (record.step_id, normalized_step),
+            (record.action_id, normalized_action),
+        ):
+            if bound and supplied and bound != supplied:
+                return False
+        if normalized_step and not normalized_action and (record.action_id or bound_plan):
+            return False
+        if normalized_action and not normalized_step and (record.step_id or bound_plan):
+            return False
+        if normalized_plan:
+            record.plan_id = normalized_plan
+            if not record.task_id:
+                record.task_id = normalized_plan
+        if normalized_step:
+            record.step_id = normalized_step
+        if normalized_action:
+            record.action_id = normalized_action
+        self._append_event(record, "action_bound", tick, "执行账本关联已绑定", {
+            "plan_id": record.plan_id,
+            "step_id": record.step_id,
+            "action_id": record.action_id,
         })
         return True
 
@@ -460,6 +569,9 @@ class AutonomyEpisode:
         result_quality: str | None = None,
         reward: float | None = None,
         prediction_error: float | None = None,
+        plan_id: str = "",
+        step_id: str = "",
+        action_id: str = "",
     ) -> bool:
         """记录工具反馈；不接受来自其他经历的迟到反馈。"""
         record = self._resolve(episode_id)
@@ -470,6 +582,15 @@ class AutonomyEpisode:
             EpisodeStatus.AWAITING_ACTION,
             EpisodeStatus.AWAITING_FEEDBACK,
         }:
+            self.total_orphan_feedback += 1
+            return False
+        if (
+            record.status == EpisodeStatus.AWAITING_ACTION
+            and (record.plan_id or record.task_id)
+        ):
+            # A plan-backed callback is only valid after the bridge has
+            # claimed the corresponding action.  Legacy planless episodes
+            # retain their historical single-lane compatibility behavior.
             self.total_orphan_feedback += 1
             return False
         normalized_tool = _text(tool_name, 120)
@@ -483,6 +604,21 @@ class AutonomyEpisode:
             return False
         if intent_id:
             record.intent_id = _text(intent_id, 80)
+        # When a V13 binding is present, all supplied correlation fields must
+        # agree with it.  A stale/forged episode id must not be able to attach
+        # a result from a different plan or action.
+        for name, value in (
+            ("plan_id", plan_id),
+            ("step_id", step_id),
+            ("action_id", action_id),
+        ):
+            normalized = _text(value, 100)
+            bound = _text(getattr(record, name, ""), 100)
+            if normalized and bound and normalized != bound:
+                self.total_orphan_feedback += 1
+                return False
+            if normalized and not bound:
+                setattr(record, name, normalized)
         record.success = bool(success)
         record.status = EpisodeStatus.FEEDBACK_RECEIVED
         record.last_feedback = "success" if success else "failure"
@@ -492,8 +628,11 @@ class AutonomyEpisode:
             record.result_quality = quality if quality in RESULT_QUALITIES else "unknown"
         elif not success:
             record.result_quality = "failed"
-        elif record.result_quality == "unknown":
-            record.result_quality = "verified"
+        # A positive boolean only says that the adapter returned without an
+        # obvious error.  V13's deterministic execution ledger is the sole
+        # authority allowed to promote an observation to ``verified``.  Keep
+        # an omitted quality unknown so an unstructured/legacy callback can
+        # never close a task as a proven success.
         if reward is not None:
             record.reward = _number(reward, default=0.0, low=-1.0, high=1.0)
         if prediction_error is not None:
@@ -515,6 +654,7 @@ class AutonomyEpisode:
         outcome: str = "",
         tick: int = 0,
         status: str | None = None,
+        result_quality: str | None = None,
         reward: float | None = None,
         prediction_error: float | None = None,
         memory_ids: list[str] | None = None,
@@ -532,7 +672,15 @@ class AutonomyEpisode:
         record.success = bool(success) if final_status != EpisodeStatus.ABORTED else False
         record.status = final_status
         record.outcome = _text(outcome, 300)
-        if final_status == EpisodeStatus.FAILED and record.result_quality == "unknown":
+        if result_quality is not None:
+            normalized_quality = _text(result_quality, 20).lower()
+            if normalized_quality in RESULT_QUALITIES:
+                record.result_quality = normalized_quality
+        if (
+            final_status == EpisodeStatus.FAILED
+            and record.result_quality == "unknown"
+            and result_quality is None
+        ):
             record.result_quality = "failed"
         if reward is not None:
             record.reward = _number(reward, default=0.0, low=-1.0, high=1.0)

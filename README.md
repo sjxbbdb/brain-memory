@@ -116,6 +116,30 @@ BRAIN_MEMORY_SOURCE_WIKIPEDIA_LANGS=zh,en
 不会在重启时重放未确认的工具行动。用户可在 `/api/v4/input` 的 `goal` 字段提交
 明确任务，并通过 `/api/v11/tasks` 查看队列。
 
+### V13 只读执行层
+
+V13 不新增任何写接口，只提供执行计划与学习指标的只读视图：
+
+- `/api/v13/tasks`：执行计划摘要列表，返回计划级状态、步骤计数和调度侧上下文
+- `/api/v13/tasks/{plan_id}`：单个计划详情，保留步骤摘要与结果摘要，不暴露原始工具响应
+- `/api/v13/metrics`：执行层与学习层的聚合指标
+
+健康检查 `/api/v4/health` 额外包含紧凑的 `execution` 和 `learning` 摘要，便于快速确认
+计划执行与学习反馈是否正常。
+
+执行层的因果链固定为“计划 → 步骤 → 行动 → 观察 → 结果”。只有同一计划、步骤、
+行动、意图和工具的桥接回传，且确定性检查得到 `verified + success=true`，才会把步骤
+和目标推进为完成；纯文本、HTTP 客户端自报的 `verified`、空/模拟结果都会保持隔离或
+进入重试/暂停。重启时未确认的行动会被取消，绝不自动重放。HTTP API 只提供观察和
+只读输入入口，可信结构化观察仅在同进程 `AgentBridge` 内部传递。
+
+已验证终态会以 `type=episodic` 写入情景记忆，并通过同一幂等收据更新程序性记忆、
+自我模型、奖励与驱动力；未知、模拟或未经验证的结果不会进入强化学习路径。
+
+写工具默认关闭。即使设置 `BRAIN_MEMORY_AGENT_BRIDGE_ALLOW_WRITE_TOOLS=1`，也只是
+开启“可申请审批”的能力；每一次具体行动仍须通过 `approve_write_action` 逐项授权，
+并绑定工具及参数摘要的一次性凭证，重试或参数变化都需要重新审批。
+
 ### 第四步：启动
 
 ```bash
@@ -253,7 +277,7 @@ V11 自主经历 📓（驱动→目标→行动→反馈→收束→持久化�
 |------|------|------|
 | POST | `/api/v4/input` | 📥 提交输入 → 返回编码+情绪+焦点+独白+意图 |
 | GET | `/api/v4/state` | 🧠 完整脑状态快照（含所有 V9/V10 模块） |
-| GET | `/api/v4/health` | 💓 心跳 + 记忆统计 |
+| GET | `/api/v4/health` | 💓 心跳 + 记忆统计 + execution/learning 摘要 |
 | GET | `/api/v4/self` | 🆔 自我模型 + 身份事实 + 行为倾向 + 驱动力 |
 | GET | `/api/v4/monologue` | 💭 当前内在独白 |
 | GET | `/api/v4/identity-memories` | 🏛️ 塑造身份的关键记忆 |
@@ -270,6 +294,9 @@ V11 自主经历 📓（驱动→目标→行动→反馈→收束→持久化�
 | GET | `/api/v4/autobiography` | 📖 生命故事 + 转折点（V10） |
 | GET | `/api/v4/boundary` | 🛡️ 自我边界状态（V10） |
 | GET | `/api/v11/autonomy` | 📓 当前自主经历、有限历史与收束统计 |
+| GET | `/api/v13/tasks` | 📒 执行计划摘要列表（只读） |
+| GET | `/api/v13/tasks/{plan_id}` | 📄 单个执行计划详情（只读） |
+| GET | `/api/v13/metrics` | 📊 执行/学习聚合指标（只读） |
 | WS | `/ws` | 🔌 WebSocket 实时状态推送 |
 
 ---
@@ -305,7 +332,7 @@ BOUNDARY_ENABLED = True             # 自我边界
 # V11
 AUTONOMY_ENABLED = True             # 有界自主经历
 AGENT_BRIDGE_ENABLED = True         # 在 API 进程内运行执行边界
-AGENT_BRIDGE_ALLOW_WRITE_TOOLS = False  # 写工具必须显式开启
+AGENT_BRIDGE_ALLOW_WRITE_TOOLS = False  # 能力开关；每次行动仍须逐项审批
 ```
 
 设为 `False` 即回退到对应模块未加载的状态。
@@ -318,6 +345,8 @@ AGENT_BRIDGE_ALLOW_WRITE_TOOLS = False  # 写工具必须显式开启
 `BRAIN_MEMORY_SOURCE_CACHE_TTL_SEC` 和 `BRAIN_MEMORY_OFFLINE`。
 长期任务策略支持 `BRAIN_MEMORY_TASK_QUEUE_LIMIT`、
 `BRAIN_MEMORY_TASK_*_BUDGET_TICKS` 和 `BRAIN_MEMORY_TASK_*_DEADLINE_TICKS`。
+心跳内认知 I/O 的上限由 `BRAIN_MEMORY_COGNITIVE_TIMEOUT_SEC` 控制；超时会回退到
+只思考、不执行工具的本地结果，并在健康指标中保留错误计数。
 
 ---
 

@@ -46,6 +46,18 @@ class VerifiedLearningFeedbackTests(unittest.TestCase):
         self.db_path = str(Path(self.temp_dir.name) / "learning.db")
         init_db(self.db_path)
         self.memory = MemoryStore(self.db_path)
+        self.drive_events = []
+
+        class DriveRecorder:
+            def __init__(inner_self, events):
+                inner_self.events = events
+
+            def record_verified_outcome(
+                inner_self, activation, *, drive, success, current_tick
+            ):
+                inner_self.events.append((activation, drive, success, current_tick))
+
+        self.drive = DriveRecorder(self.drive_events)
 
     def tearDown(self):
         self.memory.close()
@@ -58,6 +70,9 @@ class VerifiedLearningFeedbackTests(unittest.TestCase):
             reward_system=self.reward,
             self_model=self.self_model,
             memory_store=self.memory,
+            drive_engine=self.drive,
+            activation="activation-sentinel",
+            current_tick=17,
         )
 
     def test_verified_success_updates_all_safe_sinks(self):
@@ -69,13 +84,17 @@ class VerifiedLearningFeedbackTests(unittest.TestCase):
         self.assertEqual(self.reward.total_rewards, 1)
         self.assertEqual(self.self_model.total_experiences, 1)
         self.assertEqual(len(receipt.memory_ids), 1)
+        self.assertEqual(
+            self.drive_events,
+            [("activation-sentinel", "", True, 17)],
+        )
 
         row = self.memory.conn.execute(
             "SELECT type, source, content FROM memories WHERE id = ?",
             (receipt.memory_ids[0],),
         ).fetchone()
         self.assertIsNotNone(row)
-        self.assertEqual(row["type"], "reflection")
+        self.assertEqual(row["type"], "episodic")
         self.assertEqual(row["source"], "verified_learning_feedback")
         self.assertIn("已验证成功", row["content"])
 
@@ -91,6 +110,7 @@ class VerifiedLearningFeedbackTests(unittest.TestCase):
         self.assertEqual(self.reward.total_rewards, 0)
         self.assertEqual(self.self_model.total_experiences, 0)
         self.assertEqual(self.memory.count(), 0)
+        self.assertEqual(self.drive_events, [])
 
     def test_verified_or_explicit_failed_result_only_weakens(self):
         receipt = self.apply(
@@ -109,6 +129,26 @@ class VerifiedLearningFeedbackTests(unittest.TestCase):
         self.assertEqual(self.reward.total_rewards, 1)
         self.assertEqual(self.self_model.total_experiences, 1)
         self.assertIn("不作为成功范例", receipt.reflection)
+        self.assertEqual(self.drive_events[-1][2], False)
+
+    def test_legacy_structured_failure_without_quality_is_still_negative(self):
+        receipt = self.apply(
+            {
+                "outcome_id": "legacy-failure",
+                "episode_id": "episode-legacy-failure",
+                "task_id": "task-legacy-failure",
+                "status": "failed",
+                "success": False,
+                "summary": "旧结构化结果只给出 success=false",
+                "tool_name": "memory_search",
+            }
+        )
+
+        self.assertEqual(receipt.disposition, LearningDisposition.NEGATIVE)
+        self.assertTrue(receipt.learned)
+        self.assertFalse(self.procedural._experience_buffer[-1]["success"])
+        self.assertEqual(self.reward.total_rewards, 1)
+        self.assertEqual(self.self_model.total_experiences, 1)
 
     def test_contradiction_and_non_terminal_result_are_quarantined(self):
         contradiction = self.apply(
@@ -122,6 +162,22 @@ class VerifiedLearningFeedbackTests(unittest.TestCase):
         self.assertEqual(self.reward.total_rewards, 0)
         self.assertEqual(len(self.procedural._experience_buffer), 0)
 
+    def test_missing_terminal_status_and_bare_verified_flag_are_quarantined(self):
+        missing_status = self.apply(verified("missing-status", status=""))
+        bare_flag = self.apply(
+            {
+                "outcome_id": "bare-verified-flag",
+                "status": "completed",
+                "success": True,
+                "verified": True,
+                "summary": "仅自报已验证",
+            }
+        )
+
+        self.assertEqual(missing_status.disposition, LearningDisposition.QUARANTINED)
+        self.assertEqual(bare_flag.disposition, LearningDisposition.QUARANTINED)
+        self.assertEqual(self.drive_events, [])
+
     def test_duplicate_is_idempotent_and_snapshot_restores_guard(self):
         first = self.apply(verified("outcome-once"))
         duplicate = self.apply(verified("outcome-once"))
@@ -129,6 +185,7 @@ class VerifiedLearningFeedbackTests(unittest.TestCase):
         self.assertEqual(duplicate.disposition, LearningDisposition.DUPLICATE)
         self.assertEqual(self.reward.total_rewards, 1)
         self.assertEqual(len(self.procedural._experience_buffer), 1)
+        self.assertEqual(len(self.drive_events), 1)
 
         restored = VerifiedLearningFeedback.from_snapshot(
             json.loads(json.dumps(self.feedback.snapshot(), ensure_ascii=False))

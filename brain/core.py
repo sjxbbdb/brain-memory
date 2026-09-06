@@ -124,6 +124,10 @@ class Brain:
         episode_id: str | None = None,
         intent_id: str | None = None,
         goal_id: str | None = None,
+        plan_id: str | None = None,
+        step_id: str | None = None,
+        action_id: str | None = None,
+        tool_observation: dict | None = None,
     ) -> dict:
         """Process input and return context for the calling agent.
 
@@ -161,6 +165,10 @@ class Brain:
             episode_id=episode_id,
             intent_id=intent_id,
             goal_id=goal_id,
+            plan_id=plan_id,
+            step_id=step_id,
+            action_id=action_id,
+            tool_observation=tool_observation,
         )
         try:
             return await asyncio.wait_for(

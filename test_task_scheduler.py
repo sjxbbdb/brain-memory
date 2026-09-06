@@ -145,6 +145,27 @@ class LongTermTaskSchedulerTests(unittest.TestCase):
         self.assertEqual(restored_goal.budget_ticks, goal.budget_ticks)
         self.assertEqual(restored_goal.consumed_ticks, 1)
 
+    def test_read_only_snapshot_does_not_normalize_or_evict(self):
+        """A diagnostic snapshot must never perform the scheduler write pass."""
+        goals = GoalSystem()
+        scheduler = LongTermTaskScheduler(max_queue=1)
+        legacy = make_goal("legacy", priority=0.2)
+        self.assertTrue(goals.add_goal(legacy))
+        scheduler.running_goal_id = "stale-pointer"
+        scheduler.last_tick = 9
+        before_goal = legacy.to_dict()
+        before_scheduler = scheduler.snapshot()
+
+        observed = scheduler.read_only_snapshot(goals)
+
+        self.assertEqual(observed, scheduler.snapshot(goals))
+        self.assertEqual(legacy.to_dict(), before_goal)
+        # In particular, no lazy defaults, pointer cleanup, or queue
+        # eviction may be triggered by a read-only call.
+        self.assertEqual(scheduler.last_tick, 9)
+        self.assertEqual(scheduler.running_goal_id, "stale-pointer")
+        self.assertEqual(scheduler.snapshot(), before_scheduler)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

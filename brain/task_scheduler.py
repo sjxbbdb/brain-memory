@@ -425,7 +425,7 @@ class LongTermTaskScheduler:
             return False
         if status == GoalStatus.PAUSED and _text(
             getattr(goal, "paused_reason", ""), 120
-        ).startswith("manual:"):
+        ).startswith(("manual:", "execution:", "restart:")):
             return False
         return True
 
@@ -573,6 +573,14 @@ class LongTermTaskScheduler:
         return max(0, self.max_queue - len(self._queued(goal_system)))
 
     def snapshot(self, goal_system=None) -> dict[str, Any]:
+        """Return a scheduler snapshot without changing scheduler/goal state.
+
+        ``sync`` is intentionally *not* called here.  Apart from normalising
+        legacy goals, ``sync`` may evict queue entries, clear the running
+        pointer, and increment eviction counters.  A snapshot is used
+        by HTTP GET endpoints and diagnostics, so those callers must be able
+        to observe state without introducing a write as a side effect.
+        """
         queue = []
         tier_counts = {tier: 0 for tier in TaskTier.ORDER}
         if goal_system is not None:
@@ -614,6 +622,20 @@ class LongTermTaskScheduler:
                 "deadlines": dict(self.default_deadlines),
             },
         }
+
+    def read_only_snapshot(self, goal_system=None) -> dict[str, Any]:
+        """Explicit read-only alias for API/diagnostic consumers.
+
+        Keeping this as a named method makes the no-side-effect contract
+        visible at call sites while preserving ``snapshot`` compatibility for
+        older embedders.  Do not add lazy normalisation or expiry handling
+        here; state transitions belong to the scheduler tick path (``sync`` /
+        ``select``), never to a query.
+        """
+        return self.snapshot(goal_system)
+
+    # ``peek`` is a concise compatibility name used by a few integrations.
+    peek = read_only_snapshot
 
     @classmethod
     def from_snapshot(cls, data: Any) -> "LongTermTaskScheduler":

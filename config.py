@@ -31,6 +31,12 @@ def _env_bool(name: str, default: bool) -> bool:
 HOST = os.getenv("BRAIN_MEMORY_HOST", "127.0.0.1") or "127.0.0.1"
 PORT = _env_int("BRAIN_MEMORY_PORT", 8001, minimum=1, maximum=65535)
 INPUT_TIMEOUT_SEC = 15           # 等待大脑处理输入的秒数
+# Bound external/optional cognitive work inside one heartbeat.  The caller
+# may still receive a ``pending`` response after INPUT_TIMEOUT_SEC, but the
+# heartbeat itself must regain control and continue maintenance promptly.
+COGNITIVE_TIMEOUT_SEC = _env_int(
+    "BRAIN_MEMORY_COGNITIVE_TIMEOUT_SEC", 10, minimum=1, maximum=120
+)
 LOG_LEVEL = "INFO"               # 日志级别: DEBUG|INFO|WARNING|ERROR
 
 # ── Consciousness Loop ──
@@ -74,6 +80,43 @@ TASK_USER_DEADLINE_TICKS = _env_int(
 )
 TASK_EXPLORATION_DEADLINE_TICKS = _env_int(
     "BRAIN_MEMORY_TASK_EXPLORATION_DEADLINE_TICKS", 240, minimum=1, maximum=100000
+)
+
+# V13 task execution / verification loop.  The limits are deliberately
+# conservative so a long-running process cannot grow an unbounded plan or
+# replay an unverified action after restart.  ``REQUIRE_VERIFIED_COMPLETION``
+# is enabled by default: a returning tool call is not, by itself, proof that
+# a goal was achieved.
+TASK_EXECUTION_ENABLED = _env_bool("BRAIN_MEMORY_TASK_EXECUTION_ENABLED", True)
+TASK_EXECUTION_MAX_PLANS = _env_int(
+    "BRAIN_MEMORY_TASK_EXECUTION_MAX_PLANS", 32, minimum=1, maximum=1000
+)
+TASK_EXECUTION_MAX_STEPS = _env_int(
+    "BRAIN_MEMORY_TASK_EXECUTION_MAX_STEPS", 8, minimum=1, maximum=128
+)
+TASK_EXECUTION_MAX_DEPTH = _env_int(
+    "BRAIN_MEMORY_TASK_EXECUTION_MAX_DEPTH", 3, minimum=0, maximum=16
+)
+TASK_EXECUTION_MAX_RETRIES = _env_int(
+    "BRAIN_MEMORY_TASK_EXECUTION_MAX_RETRIES", 2, minimum=0, maximum=10
+)
+TASK_EXECUTION_MAX_ACTIONS = _env_int(
+    "BRAIN_MEMORY_TASK_EXECUTION_MAX_ACTIONS", 128, minimum=1, maximum=5000
+)
+TASK_EXECUTION_MAX_OBSERVATIONS = _env_int(
+    "BRAIN_MEMORY_TASK_EXECUTION_MAX_OBSERVATIONS", 128, minimum=1, maximum=5000
+)
+TASK_EXECUTION_MAX_OUTCOMES = _env_int(
+    "BRAIN_MEMORY_TASK_EXECUTION_MAX_OUTCOMES", 128, minimum=1, maximum=5000
+)
+TASK_EXECUTION_MAX_EVENTS = _env_int(
+    "BRAIN_MEMORY_TASK_EXECUTION_MAX_EVENTS", 256, minimum=1, maximum=10000
+)
+TASK_EXECUTION_REQUIRE_VERIFIED_COMPLETION = _env_bool(
+    "BRAIN_MEMORY_TASK_EXECUTION_REQUIRE_VERIFIED_COMPLETION", True
+)
+TASK_EXECUTION_AUTO_REPLAN = _env_bool(
+    "BRAIN_MEMORY_TASK_EXECUTION_AUTO_REPLAN", False
 )
 
 # The API process can host the read-only execution boundary alongside the

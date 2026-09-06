@@ -33,11 +33,13 @@ Safety rules:
   arguments, evidence bodies, and credentials are never copied.
 
 The existing ``ReflectionEngine`` exposes a periodic whole-brain ``reflect``
-method rather than an outcome-ingestion method.  For that reason this module
-stores a compact ``type=reflection`` memory and updates the public
-``SelfModel.integrate_reflection`` hook.  If a future reflection engine adds a
-``record_learning_reflection`` hook, it is called opportunistically without
-making that hook a requirement today.
+method rather than an outcome-ingestion method.  This boundary therefore
+stores each verified result as a compact ``type=episodic`` memory (with a
+reflection tag) and updates the public ``SelfModel.integrate_reflection``
+hook.  Keeping the record episodic makes it available to consolidation and
+timeline queries while retaining the reflective interpretation of the event.
+If a future reflection engine adds a ``record_learning_reflection`` hook, it
+is called opportunistically without making that hook a requirement today.
 """
 
 from __future__ import annotations
@@ -203,6 +205,7 @@ class LearningOutcome:
     episode_id: str = ""
     step_id: str = ""
     goal: str = ""
+    drive: str = ""
     intent_type: str = "call_tool"
     tool_name: str = ""
     summary: str = ""
@@ -252,12 +255,10 @@ class LearningOutcome:
         )
         quality = _QUALITY_ALIASES.get(_text(raw_quality, 30).lower(), "unknown")
 
-        verified_flag = _first(data, "verified", "verification_passed")
-        parsed_verified = _parse_bool(verified_flag)
-        if parsed_verified is True and raw_quality in (None, "", "unknown"):
-            quality = "verified"
-        elif parsed_verified is False and raw_quality in (None, ""):
-            quality = "unknown"
+        # A bare ``verified=true`` flag is an assertion by the producer, not
+        # a quality decision from the execution verifier.  Keep it out of the
+        # classification path; trusted callers must provide the normalized
+        # ``quality``/``result_quality`` value from their verifier.
 
         raw_success = _first(data, "success", "succeeded", "ok")
         success = _parse_bool(raw_success)
@@ -269,6 +270,8 @@ class LearningOutcome:
         terminal = _first(data, "terminal", "is_terminal")
         if terminal is False or _parse_bool(terminal) is False:
             status = "non_terminal"
+        if quality == "unknown" and success is False and status in {"failed", "failure"}:
+            quality = "failed"
 
         return cls(
             outcome_id=outcome_id,
@@ -279,6 +282,7 @@ class LearningOutcome:
             episode_id=episode_id,
             step_id=step_id,
             goal=_safe_text(_first(data, "goal", "objective", "description"), 240),
+            drive=_safe_text(_first(data, "drive", "source_drive"), 80).lower(),
             intent_type=_safe_text(_first(data, "intent_type", "action_type"), 60)
             or "call_tool",
             tool_name=tool_name,
@@ -394,6 +398,8 @@ class VerifiedLearningFeedback:
         self_model: Any = None,
         memory_store: Any = None,
         reflection_engine: Any = None,
+        drive_engine: Any = None,
+        activation: Any = None,
         current_tick: int | None = None,
     ) -> LearningReceipt:
         """Classify and apply one outcome, returning a bounded receipt.
@@ -476,6 +482,14 @@ class VerifiedLearningFeedback:
             )
             self._apply_procedural(normalized, positive, procedural_memory, receipt)
             self._apply_reward(normalized, positive, reward_system, receipt)
+            self._apply_drive(
+                normalized,
+                positive,
+                drive_engine,
+                activation,
+                current_tick,
+                receipt,
+            )
             self._apply_memory_and_reflection(
                 normalized,
                 positive,
@@ -566,7 +580,9 @@ class VerifiedLearningFeedback:
     def _classify(outcome: LearningOutcome) -> tuple[str, str]:
         if outcome.success is None:
             return LearningDisposition.REJECTED, "结果缺少明确的 success 布尔值"
-        if outcome.status and outcome.status not in _TERMINAL_STATUSES:
+        if not outcome.status:
+            return LearningDisposition.QUARANTINED, "结果缺少明确终态，不进入学习层"
+        if outcome.status not in _TERMINAL_STATUSES:
             return LearningDisposition.QUARANTINED, "结果尚未处于终态，不进入学习层"
         if outcome.quality in {"unknown", "simulated"}:
             return LearningDisposition.QUARANTINED, "结果未被外部事实验证，保持隔离"
@@ -637,9 +653,11 @@ class VerifiedLearningFeedback:
             return
         try:
             channel = outcome.channel if outcome.channel in _KNOWN_REWARD_CHANNELS else "achievement"
-            actual_reward = (
-                min(0.95, 0.72 + 0.20 * outcome.confidence) if positive else 0.12
-            )
+            # Keep the positive learning signal aligned with the legacy
+            # autonomy reward contract (0.8).  Confidence is retained in the
+            # outcome/receipt for calibration, but must not make identical
+            # verified events produce drifting reward magnitudes.
+            actual_reward = 0.8 if positive else 0.12
             reward_system.deliver_reward(
                 channel=channel,
                 actual_reward=actual_reward,
@@ -648,6 +666,31 @@ class VerifiedLearningFeedback:
             receipt.actions.append("reward.deliver_reward")
         except Exception as exc:
             self._error(receipt, "reward_system", exc)
+
+    def _apply_drive(
+        self,
+        outcome: LearningOutcome,
+        positive: bool,
+        drive_engine: Any,
+        activation: Any,
+        current_tick: int | None,
+        receipt: LearningReceipt,
+    ) -> None:
+        if drive_engine is None:
+            return
+        try:
+            apply_outcome = getattr(drive_engine, "record_verified_outcome", None)
+            if not callable(apply_outcome):
+                return
+            apply_outcome(
+                activation,
+                drive=outcome.drive,
+                success=positive,
+                current_tick=int(current_tick or 0),
+            )
+            receipt.actions.append("drive_engine.record_verified_outcome")
+        except Exception as exc:
+            self._error(receipt, "drive_engine", exc)
 
     def _apply_memory_and_reflection(
         self,
@@ -689,8 +732,13 @@ class VerifiedLearningFeedback:
                 ).hexdigest()[:24]
                 memory = {
                     "id": memory_id,
-                    "type": "reflection",
-                    "title": f"{label}学习记录",
+                    # Verified outcomes are episodes first: consolidation,
+                    # timeline queries and replay-safe learning all consume
+                    # the episodic stream.  ``reflection`` remains an
+                    # emotion tag/action label for compatibility with the
+                    # existing reflection subsystem.
+                    "type": "episodic",
+                    "title": f"{label}情景学习记录",
                     "content": (
                         f"{label} | 目标: {safe_goal} | 行动: {safe_tool} | "
                         f"结果摘要: {safe_summary} | {reflection}"
@@ -701,7 +749,7 @@ class VerifiedLearningFeedback:
                     "emotion_label": emotion_label,
                     "emotion_vector": dict(emotion_vector),
                     "entities": ["验证结果", "学习反馈"],
-                    "emotion_tags": ["verified", "learning"],
+                    "emotion_tags": ["verified", "learning", "reflection"],
                     "is_identity_forming": False,
                     "created": outcome.timestamp or _now(),
                 }

@@ -80,6 +80,12 @@ class Intent:
     attempt_no: int = 0
     origin: str = "external"
     created_tick: int | None = None
+    # V13 execution-ledger correlation. These identifiers are descriptive
+    # only; the AgentBridge still has to claim the corresponding action. They
+    # are appended to preserve the positional constructor order of V5--V12.
+    plan_id: str | None = None
+    step_id: str | None = None
+    action_id: str | None = None
 
     def __post_init__(self):
         if not isinstance(self.type, IntentType):
@@ -101,6 +107,9 @@ class Intent:
             self.goal_id = str(self.goal_id)[:100]
         else:
             self.goal_id = None
+        for name in ("plan_id", "step_id", "action_id"):
+            value = getattr(self, name, None)
+            setattr(self, name, str(value)[:100] if value else None)
         if self.created_tick is not None:
             self.created_tick = _safe_int(self.created_tick)
         if not isinstance(self.tool_args, dict):
@@ -129,6 +138,12 @@ class Intent:
             d["episode_id"] = str(self.episode_id)[:80]
         if self.goal_id:
             d["goal_id"] = str(self.goal_id)[:100]
+        if self.plan_id:
+            d["plan_id"] = str(self.plan_id)[:100]
+        if self.step_id:
+            d["step_id"] = str(self.step_id)[:100]
+        if self.action_id:
+            d["action_id"] = str(self.action_id)[:100]
         if self.type == IntentType.CALL_TOOL:
             d["tool_name"] = self.tool_name
             d["tool_args"] = self.tool_args
@@ -162,6 +177,9 @@ class Intent:
             source_input=data.get("source_input", ""),
             episode_id=(str(data.get("episode_id"))[:80] if data.get("episode_id") else None),
             goal_id=(str(data.get("goal_id"))[:100] if data.get("goal_id") else None),
+            plan_id=(str(data.get("plan_id"))[:100] if data.get("plan_id") else None),
+            step_id=(str(data.get("step_id"))[:100] if data.get("step_id") else None),
+            action_id=(str(data.get("action_id"))[:100] if data.get("action_id") else None),
             intent_id=str(data.get("intent_id") or f"intent-{uuid.uuid4().hex[:12]}")[:80],
             attempt_no=_safe_int(data.get("attempt_no", 0) or 0),
             origin=str(data.get("origin") or "external")[:40],
