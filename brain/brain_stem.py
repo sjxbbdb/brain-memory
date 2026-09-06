@@ -992,9 +992,17 @@ class BrainStem:
         normalized = str(text or "").lower()
         if any(
             marker in normalized
-            for marker in ("模拟", "simulated", "dry-run", "需配置搜索引擎")
+            for marker in (
+                "模拟",
+                "simulated",
+                "dry-run",
+                "需配置搜索引擎",
+                "来源质量] simulated",
+            )
         ):
             return "simulated"
+        if "来源质量] failed" in normalized:
+            return "failed"
         return "verified"
 
     def _observe_autonomy_intent(self, intent: Intent) -> bool:

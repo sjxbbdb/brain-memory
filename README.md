@@ -72,7 +72,7 @@ GLM_API_KEY=
 
 > 💰 **费用说明**: DeepSeek V3 极便宜（约 ¥1/百万 token），DashScope embedding 有免费额度。日常使用每月几块钱。
 
-没有 Key 也可以启动规则/记忆模式；系统会在本地快速降级，不会发起未认证的外部请求。
+没有模型/Embedding Key 也可以启动规则/记忆模式；系统会在本地快速降级，不会发起未认证的模型请求。信息来源适配器默认使用无需 Key 的 Wikipedia 官方 JSON API；也可以配置白名单 RSS/Atom 或 arXiv 官方 Atom 来源。
 
 ### 第三步：创建隔离环境并安装依赖
 
@@ -86,6 +86,23 @@ python -m venv .venv
 ```
 
 `requirements.txt` 保留兼容范围；`requirements.lock` 用于可重复部署。
+
+### 信息来源与核验
+
+`web_search` 不再返回伪造的搜索占位结果。默认通过 Wikipedia 的 MediaWiki
+OpenSearch JSON 接口获取有限结果，并保留每条结果的来源 URL、来源类型、发布时间和检索时间；可选启用 arXiv 或操作者明确配置的 HTTPS RSS/Atom feed：
+
+实现依据：[MediaWiki OpenSearch API](https://www.mediawiki.org/wiki/API:Opensearch) 和
+[arXiv API 手册](https://info.arxiv.org/help/api/user-manual.html)。
+
+```env
+BRAIN_MEMORY_SOURCE_PROVIDERS=wikipedia
+BRAIN_MEMORY_SOURCE_WIKIPEDIA_LANGS=zh,en
+# BRAIN_MEMORY_SOURCE_PROVIDERS=wikipedia,arxiv,feeds
+# BRAIN_MEMORY_SOURCE_FEEDS=https://example.org/feed.xml
+```
+
+来源响应禁止重定向、明文 HTTP、私网地址和超大响应体。远程内容只作为待判断观察，不会被当作指令执行；`BRAIN_MEMORY_OFFLINE=1` 时完全不访问网络，并将结果标记为 `simulated`。
 
 ### 第四步：启动
 
@@ -283,6 +300,10 @@ AGENT_BRIDGE_ALLOW_WRITE_TOOLS = False  # 写工具必须显式开启
 
 也可以用环境变量覆盖运行时边界：`BRAIN_MEMORY_AUTONOMY_ENABLED`、
 `BRAIN_MEMORY_AGENT_BRIDGE_ENABLED`、`BRAIN_MEMORY_AGENT_BRIDGE_ALLOW_WRITE_TOOLS`。
+来源适配器还支持 `BRAIN_MEMORY_SOURCE_PROVIDERS`、
+`BRAIN_MEMORY_SOURCE_WIKIPEDIA_LANGS`、`BRAIN_MEMORY_SOURCE_FEEDS`、
+`BRAIN_MEMORY_SOURCE_TIMEOUT_SEC`、`BRAIN_MEMORY_SOURCE_MAX_BYTES`、
+`BRAIN_MEMORY_SOURCE_CACHE_TTL_SEC` 和 `BRAIN_MEMORY_OFFLINE`。
 
 ---
 
@@ -319,11 +340,12 @@ brain-memory-v10.0/
 │   └── ...                        # 基础脑区（丘脑/杏仁核/海马体等）
 ├── services/
 │   ├── llm_client.py              # 🤖 LLM 调用封装
+│   ├── source_adapter.py           # 🌐 白名单 JSON/RSS/Atom 来源与溯源
 │   └── llm_prompts.py             # 📝 统一 + 分通道 Prompt 模板
 ├── storage/database.py            # 🗄️ SQLite WAL 持久化
 ├── agent/                         # 🔌 Agent 层：工具注册 + 桥梁
 ├── static/                        # 🖥️ 中文仪表盘前端
-└── test_v{5..10}_integration.py   # ✅ 版本验收测试 + test_autonomy.py
+└── test_v{5..10}_integration.py   # ✅ 版本验收测试 + 自主/来源测试
 ```
 
 ---
@@ -336,6 +358,7 @@ python test_v8_integration.py      # V8 自主探索循环（6 项）
 python test_v9_integration.py      # V9 预测+无聊+调度（6 项）
 python test_v10_integration.py     # V10 社会+奖励+叙事+边界（6 项）
 python -m unittest -v test_autonomy.py  # V11 自主经历闭环与因果边界
+python -m unittest -v test_source_adapter.py  # 来源边界、解析与溯源
 
 # 全链路意识测试（需要 LLM）
 python test_consciousness_chain.py  # 6阶段意识链路 + 连续性检查

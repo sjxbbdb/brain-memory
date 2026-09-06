@@ -17,6 +17,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from agent.tool_registry import registry, ToolDef
+from services.source_adapter import get_source_adapter
 
 logger = logging.getLogger("brain-v5.tool.web-search")
 
@@ -25,30 +26,32 @@ logger = logging.getLogger("brain-v5.tool.web-search")
 
 async def _web_search(args: dict, context: dict) -> str:
     """执行网络搜索。"""
-    query = args.get("query", "")
-    limit = min(int(args.get("limit", 5)), 10)
+    query = str(args.get("query", "") or "").strip()[:300]
+    try:
+        limit = max(1, min(int(args.get("limit", 5)), 10))
+    except (TypeError, ValueError, OverflowError):
+        limit = 5
     if not query:
         return json.dumps({"error": "query required"}, ensure_ascii=False)
-    # 实际搜索通过 Hermes 的 web_tools 或直接 HTTP 调用
     try:
-        url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
-        # 简化实现 — 实际集成时使用 Hermes web_tools 或 Brave API
-        return json.dumps({
-            "query": query,
-            "results": [{"title": f"Search: {query}", "url": url}],
-            "note": "搜索功能已注册，需配置搜索引擎 API Key 实现完整功能",
-        }, ensure_ascii=False)
+        result = await get_source_adapter().search(query, limit=limit)
+        return json.dumps(result, ensure_ascii=False)
     except Exception as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        logger.warning("source adapter failed: %s", str(e)[:160])
+        return json.dumps({
+            "error": "source adapter unavailable",
+            "result_quality": "failed",
+            "note": "未获得可核验来源，未生成占位事实",
+        }, ensure_ascii=False)
 
 
 async def _web_search_prompt(context: dict) -> str:
-    return "搜索互联网获取最新信息。适用场景：查找资料、验证事实、获取实时数据。"
+    return "从白名单 RSS/Atom 或官方 JSON 来源检索信息；结果会附带来源 URL、类型和时间，未核验内容不得当作事实。"
 
 
 registry.register(ToolDef(
     name="web_search",
-    description="搜索互联网获取最新信息。输入 query（搜索关键词）和可选的 limit（结果数量）。",
+    description="从已配置的可核验信息源检索有限结果。输入 query（搜索关键词）和可选的 limit（结果数量）。",
     schema={
         "type": "object",
         "properties": {
