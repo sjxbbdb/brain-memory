@@ -41,8 +41,12 @@ INPUT_TIMEOUT_SEC = 15           # 等待大脑处理输入的秒数
 # Bound external/optional cognitive work inside one heartbeat.  The caller
 # may still receive a ``pending`` response after INPUT_TIMEOUT_SEC, but the
 # heartbeat itself must regain control and continue maintenance promptly.
+# Keep the default cognitive budget below one heartbeat interval.  A slow or
+# unavailable provider must not hold the life loop (or a caller's completion
+# future) indefinitely.  Deployments that have a measured need for a larger
+# budget can opt in explicitly through the environment.
 COGNITIVE_TIMEOUT_SEC = _env_int(
-    "BRAIN_MEMORY_COGNITIVE_TIMEOUT_SEC", 10, minimum=1, maximum=120
+    "BRAIN_MEMORY_COGNITIVE_TIMEOUT_SEC", 1, minimum=1, maximum=120
 )
 LOG_LEVEL = "INFO"               # 日志级别: DEBUG|INFO|WARNING|ERROR
 

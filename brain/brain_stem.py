@@ -2617,6 +2617,11 @@ class BrainStem:
         autonomy_feedback_seen = False
         autonomy_feedback_rejected = False
         autonomy_followup_intent = False
+        # A tool-feedback intent may be consumed by the correlated autonomy
+        # lane.  It must not also enter the generic intent queue, otherwise a
+        # stale response/call_tool intent can be mistaken for the next plan
+        # step (and can leak an uncorrelated action to the agent bridge).
+        autonomy_intent_consumed = False
         autonomy_feedback_success = False
         autonomy_feedback_tool = ""
         self._last_execution_outcome = None
@@ -3270,6 +3275,7 @@ class BrainStem:
                             and self.autonomy.is_active
                         ):
                             autonomy_followup_intent = self._observe_autonomy_intent(intent)
+                            autonomy_intent_consumed = autonomy_followup_intent
                         # V8: 行为倾向特质调制 intent 置信度
                         intent.confidence = self.state.self_model.modulate_intent(
                             intent.type.value, intent.confidence)
@@ -3279,7 +3285,11 @@ class BrainStem:
                             intent.tool_name or "",
                         )
 
-                    if intent and intent.type.value in ("call_tool", "respond"):
+                    if (
+                        intent
+                        and intent.type.value in ("call_tool", "respond")
+                        and not autonomy_intent_consumed
+                    ):
                         self.state.last_intent = intent.to_dict()
                         self.state.intent_count += 1
                         await self.intent_queue.put(intent)
