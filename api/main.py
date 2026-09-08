@@ -677,6 +677,9 @@ async def health():
         "last_heartbeat_at": state.get("last_heartbeat_at", ""),
         "active_sessions": brain.brain_stem.state.session_manager.get_session_count(),
         "sleep_state": brain.brain_stem.sleep_state,
+        # Constitutional lifecycle projection; the immutable ledger remains
+        # local and is never exposed through this compact health response.
+        "life": state.get("life", {}),
         "autonomy": state.get("autonomy", {}),
         "tasks": {
             "running_goal_id": task_snapshot.get("running_goal_id"),

@@ -100,6 +100,12 @@ class BrainState:
     # projection so callers can inspect continuity without importing it.
     autonomy: dict[str, Any] = field(default_factory=dict)
 
+    # ── Constitutional life projection (P1) ──
+    # This is a read-only API/snapshot view populated by BrainStem.  The
+    # LifeKernel object and its append-only history live outside this mutable
+    # cognitive state container.
+    life: dict[str, Any] = field(default_factory=dict)
+
     # ── V6 Activation Field（全局状态总线）──
     activation: ActivationField = field(default_factory=ActivationField)
 
@@ -162,6 +168,7 @@ class BrainState:
             "last_loop_error": _text(self.last_loop_error, 500),
             "last_heartbeat_at": _text(self.last_heartbeat_at),
             "autonomy": self.autonomy if isinstance(self.autonomy, dict) else {},
+            "life": self.life if isinstance(self.life, dict) else {},
             "total_ticks": self.total_ticks,
             "uptime_seconds": round(self.uptime_seconds, 1),
             "active_habit": _text(self.active_habit, 200) if self.active_habit is not None else None,
@@ -259,6 +266,8 @@ class BrainState:
         state.last_heartbeat_at = _text(data.get("last_heartbeat_at", ""))
         raw_autonomy = data.get("autonomy", {})
         state.autonomy = dict(raw_autonomy) if isinstance(raw_autonomy, dict) else {}
+        raw_life = data.get("life", {})
+        state.life = dict(raw_life) if isinstance(raw_life, dict) else {}
         state.total_ticks = _int(data.get("total_ticks", 0), minimum=0)
         state.uptime_seconds = max(0.0, _float(data.get("uptime_seconds", 0.0)))
         active_habit = data.get("active_habit")

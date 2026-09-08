@@ -2,12 +2,36 @@
 
 import json, logging, sqlite3, uuid
 from datetime import datetime, timezone
+from threading import RLock
 
 from config import DB_PATH
 
 logger = logging.getLogger("brain-v5.storage")
 DB_TIMEOUT = 10.0
 STATE_SNAPSHOT_RETENTION = 200
+
+# Life history is deliberately separate from ``brain_state``.  The latter is
+# a bounded snapshot journal and is allowed to delete old rows; this table is
+# INSERT-only and therefore keeps the constitutional lifecycle audit intact.
+LIFE_LEDGER_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS life_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        lineage_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        instance_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        timestamp TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        from_state TEXT,
+        to_state TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        metadata TEXT NOT NULL,
+        previous_hash TEXT NOT NULL,
+        event_hash TEXT NOT NULL,
+        UNIQUE(instance_id, sequence)
+    )
+"""
 
 
 def _connect(path: str = DB_PATH) -> sqlite3.Connection:
@@ -51,6 +75,7 @@ def init_db(db_path: str = DB_PATH):
             id TEXT PRIMARY KEY, trigger TEXT, pattern TEXT, response TEXT,
             confidence REAL DEFAULT 0.6
         )""")
+        conn.execute(LIFE_LEDGER_TABLE_SQL)
         for col, ct in [
             ("embedding", "TEXT DEFAULT NULL"),
             ("is_identity_forming", "INTEGER DEFAULT 0"),
@@ -71,6 +96,10 @@ class StateStore:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         self._conn = None
+        # Life events may be appended by an embedded adapter from a different
+        # thread than the heartbeat.  Keep those short transactions serialized
+        # without sharing a thread-bound SQLite connection.
+        self._life_ledger_lock = RLock()
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -133,6 +162,143 @@ class StateStore:
             logger.warning("state-store load failed: %s", str(exc)[:100])
             self._reset_connection()
             return None
+
+    # ── Constitutional life ledger (INSERT-only) ──
+
+    def _life_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=DB_TIMEOUT,
+            check_same_thread=False,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(LIFE_LEDGER_TABLE_SQL)
+        return conn
+
+    def append_life_event(self, event: dict) -> bool:
+        """Append one validated lifecycle event, idempotently.
+
+        There is intentionally no update/delete counterpart.  A duplicate
+        event is accepted only when its hash is identical; a conflicting
+        duplicate is rejected so history cannot be rewritten silently.
+        """
+        if not isinstance(event, dict):
+            return False
+        required = (
+            "event_id", "lineage_id", "generation", "instance_id", "sequence",
+            "timestamp", "event_type", "to_state", "reason", "metadata",
+            "previous_hash", "event_hash",
+        )
+        if any(key not in event for key in required):
+            return False
+        # ``previous_hash`` is intentionally empty for the genesis event;
+        # generation/sequence are numeric and may legitimately be zero.
+        if any(
+            not str(event.get(key, "")).strip()
+            for key in (
+                "event_id", "lineage_id", "instance_id", "timestamp",
+                "event_type", "to_state", "reason", "event_hash",
+            )
+        ):
+            return False
+        try:
+            metadata = json.dumps(event.get("metadata", {}), ensure_ascii=False, sort_keys=True)
+            values = (
+                str(event["event_id"]),
+                str(event["lineage_id"]),
+                int(event["generation"]),
+                str(event["instance_id"]),
+                int(event["sequence"]),
+                str(event["timestamp"]),
+                str(event["event_type"]),
+                event.get("from_state"),
+                str(event["to_state"]),
+                str(event["reason"]),
+                metadata,
+                str(event["previous_hash"]),
+                str(event["event_hash"]),
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        with self._life_ledger_lock:
+            conn = self._life_connection()
+            try:
+                try:
+                    conn.execute(
+                        """INSERT INTO life_ledger
+                        (event_id, lineage_id, generation, instance_id, sequence,
+                         timestamp, event_type, from_state, to_state, reason,
+                         metadata, previous_hash, event_hash)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        values,
+                    )
+                    conn.commit()
+                    return True
+                except sqlite3.IntegrityError:
+                    existing = conn.execute(
+                        "SELECT event_hash FROM life_ledger WHERE event_id = ?",
+                        (str(event["event_id"]),),
+                    ).fetchone()
+                    conn.rollback()
+                    return bool(existing and existing["event_hash"] == str(event["event_hash"]))
+            finally:
+                conn.close()
+
+    # Alias keeps terminology discoverable for callers that say lifecycle.
+    append_lifecycle_event = append_life_event
+
+    def load_life_events(
+        self,
+        *,
+        instance_id: str | None = None,
+        lineage_id: str | None = None,
+    ) -> list[dict]:
+        clauses = []
+        params = []
+        if instance_id is not None:
+            clauses.append("instance_id = ?")
+            params.append(str(instance_id))
+        if lineage_id is not None:
+            clauses.append("lineage_id = ?")
+            params.append(str(lineage_id))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._life_ledger_lock:
+            conn = self._life_connection()
+            try:
+                rows = conn.execute(
+                    "SELECT event_id, lineage_id, generation, instance_id, sequence, "
+                    "timestamp, event_type, from_state, to_state, reason, metadata, "
+                    "previous_hash, event_hash FROM life_ledger" + where
+                    + " ORDER BY id ASC",
+                    params,
+                ).fetchall()
+                result = []
+                for row in rows:
+                    item = dict(row)
+                    try:
+                        item["metadata"] = json.loads(item["metadata"])
+                    except (TypeError, json.JSONDecodeError):
+                        item["metadata"] = {}
+                    result.append(item)
+                return result
+            finally:
+                conn.close()
+
+    load_lifecycle_events = load_life_events
+
+    def verify_life_ledger(self, *, instance_id: str | None = None) -> bool:
+        """Validate every selected instance chain through the kernel parser."""
+        from brain.life_kernel import AppendOnlyLedger
+
+        grouped: dict[str, AppendOnlyLedger] = {}
+        for raw in self.load_life_events(instance_id=instance_id):
+            key = str(raw["instance_id"])
+            grouped.setdefault(key, AppendOnlyLedger()).append_event(raw)
+        for ledger in grouped.values():
+            ledger.verify_chain()
+        return True
 
 
 class MemoryStore:

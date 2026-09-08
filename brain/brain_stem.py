@@ -59,6 +59,17 @@ from brain.task_execution import (
     OutcomeQuality,
 )
 from brain.learning_feedback import VerifiedLearningFeedback
+from brain.life_kernel import (
+    AppendOnlyLedger,
+    IdentityCore,
+    LifeKernel,
+    LifeIdentity,
+    LedgerIntegrityError,
+    LedgerPersistenceError,
+    LifecycleError,
+    LifecycleEvent,
+    LifecycleState,
+)
 from config import (
     TICK_INTERVAL_SEC,
     COGNITIVE_TIMEOUT_SEC,
@@ -117,7 +128,7 @@ logger = logging.getLogger("brain-v5.brain-stem")
 class BrainStem:
     """Consciousness loop engine — the brain's heartbeat."""
 
-    def __init__(self, state_store=None, memory_store=None):
+    def __init__(self, state_store=None, memory_store=None, *, life_kernel=None):
         # Brain regions
         self.thalamus = Thalamus()
         self.amygdala = Amygdala()
@@ -138,6 +149,21 @@ class BrainStem:
         self.state = BrainState()
         self.state_store = state_store
         self.memory_store = memory_store
+
+        # Constitutional lifecycle seam.  The kernel is deliberately kept
+        # outside ``BrainState``: cognition may evolve, while identity,
+        # lifecycle edges, and their append-only audit remain independently
+        # verifiable.  Persistence is attached lazily at the first explicit
+        # snapshot/start so constructing a stem does not create a second
+        # lineage before an existing snapshot has been inspected.
+        if life_kernel is not None and not isinstance(life_kernel, LifeKernel):
+            raise TypeError("life_kernel must be a LifeKernel")
+        self.life_kernel = life_kernel or LifeKernel()
+        self._life_sink_attached = False
+        self._life_runtime_started = False
+        self._life_restore_blocked = False
+        self._life_restore_error = ""
+        self._life_legacy_bootstrap = True
 
         # Loop control
         self._stop_event = asyncio.Event()
@@ -266,6 +292,282 @@ class BrainStem:
         self.last_decay = 0.0
         if self.autonomy:
             self.state.autonomy = self.autonomy.summary()
+        self._sync_life_projection()
+
+    # ── Constitutional life seam (P1) ──
+
+    def _sync_life_projection(self) -> None:
+        """Project the immutable kernel into the serializable brain state."""
+        try:
+            projection = dict(self.life_kernel.public_snapshot())
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            projection = {
+                "schema_version": 1,
+                "lifecycle_state": "UNKNOWN",
+                "accepts_input": False,
+                "allows_self_modification": False,
+            }
+            self._life_restore_error = str(exc)[:300]
+        if self._life_restore_blocked:
+            projection["restore_blocked"] = True
+            projection["restore_error"] = self._life_restore_error[:300]
+        self.state.life = projection
+
+    def _life_event_sink(self, event: dict[str, Any]) -> bool:
+        """Persist one kernel event through the configured INSERT-only store."""
+        store = self.state_store
+        append = getattr(store, "append_life_event", None) if store is not None else None
+        if not callable(append):
+            # A custom in-memory StateStore-like adapter may not implement the
+            # optional constitutional table.  Keep the kernel usable in that
+            # embedding, while real ``StateStore`` instances always expose it.
+            return True
+        return bool(append(event))
+
+    def _attach_life_sink(self, kernel: LifeKernel) -> None:
+        """Attach durable history exactly once for the current kernel."""
+        if self.state_store is None:
+            self._life_sink_attached = False
+            return
+        if self._life_sink_attached and kernel is self.life_kernel:
+            return
+        append = getattr(self.state_store, "append_life_event", None)
+        if not callable(append):
+            self._life_sink_attached = False
+            return
+        kernel.attach_event_sink(self._life_event_sink, replay=True)
+        self._life_sink_attached = True
+
+    def _load_life_events(self, *, instance_id: str | None = None) -> list[dict]:
+        """Read the permanent lifecycle table without swallowing I/O errors."""
+        loader = getattr(self.state_store, "load_life_events", None)
+        if self.state_store is None or not callable(loader):
+            return []
+        try:
+            if instance_id is None:
+                raw = loader()
+            else:
+                raw = loader(instance_id=instance_id)
+        except TypeError:
+            raw = loader()
+        if raw is None:
+            return []
+        if not isinstance(raw, (list, tuple)):
+            raise LedgerIntegrityError("life ledger loader returned a non-list")
+        return [dict(item) if isinstance(item, dict) else item for item in raw]
+
+    @staticmethod
+    def _event_identity(raw: LifecycleEvent | dict) -> tuple[str, str, int]:
+        if isinstance(raw, LifecycleEvent):
+            return raw.lineage_id, raw.instance_id, raw.generation
+        return (
+            str(raw.get("lineage_id", "")),
+            str(raw.get("instance_id", "")),
+            int(raw.get("generation", 0)),
+        )
+
+    def _kernel_from_life_events(
+        self,
+        raw_events: list[dict],
+        *,
+        preferred_instance_id: str | None = None,
+    ) -> LifeKernel:
+        """Rebuild one current instance from the permanent ledger.
+
+        Older generations may remain in the table after succession.  They are
+        retained as evidence, but only one non-terminal instance may be live;
+        ambiguity is treated as corruption instead of guessed recovery.
+        """
+        groups: dict[tuple[str, str, int], list[dict]] = {}
+        for raw in raw_events:
+            if not isinstance(raw, dict):
+                raise LedgerIntegrityError("life ledger event is not an object")
+            key = self._event_identity(raw)
+            if not key[0] or not key[1]:
+                raise LedgerIntegrityError("life ledger event identity is incomplete")
+            groups.setdefault(key, []).append(raw)
+        if not groups:
+            raise LedgerIntegrityError("life ledger is empty")
+        lineages = {key[0] for key in groups}
+        if len(lineages) != 1:
+            raise LedgerIntegrityError("multiple lineages found in one brain store")
+
+        candidates: list[tuple[tuple[str, str, int], AppendOnlyLedger]] = []
+        for key, events in groups.items():
+            ledger = AppendOnlyLedger(events)
+            ledger.verify_chain()
+            candidates.append((key, ledger))
+
+        if preferred_instance_id:
+            preferred = [
+                item for item in candidates if item[0][1] == str(preferred_instance_id)
+            ]
+            if preferred:
+                candidates = preferred
+
+        non_terminal = [
+            item for item in candidates
+            if LifecycleState.parse(item[1].head.to_state)
+            not in {LifecycleState.RETIRED, LifecycleState.DEAD}
+        ]
+        if len(non_terminal) > 1:
+            raise LedgerIntegrityError("multiple non-terminal life instances found")
+        pool = non_terminal or candidates
+        # Generation is the succession order; sequence and event timestamp
+        # make selection deterministic when a store contains archived peers.
+        key, ledger = max(
+            pool,
+            key=lambda item: (
+                item[0][2],
+                item[1].last_sequence,
+                str(item[1].head.timestamp),
+                item[0][1],
+            ),
+        )
+        genesis_metadata = dict(ledger.events[0].metadata)
+        core_data = genesis_metadata.get("identity_core")
+        if not isinstance(core_data, dict) and not hasattr(core_data, "items"):
+            # A kernel created before the durable-core metadata was introduced
+            # can still be recovered only when the current in-memory core is
+            # an exact lineage/fingerprint match.  Never invent a purpose.
+            current_core = self.life_kernel.identity_core
+            if (
+                current_core.lineage_id == key[0]
+                and genesis_metadata.get("identity_core_fingerprint")
+                == current_core.fingerprint
+            ):
+                core = current_core
+            else:
+                raise LedgerIntegrityError("life genesis has no identity core")
+        else:
+            core = IdentityCore.from_dict(core_data)
+        if core.lineage_id != key[0]:
+            raise LedgerIntegrityError("life genesis lineage differs from event lineage")
+        identity_data = genesis_metadata.get("identity")
+        if isinstance(identity_data, dict) or hasattr(identity_data, "items"):
+            identity = LifeIdentity.from_dict(identity_data)
+            if identity.instance_id != key[1] or identity.generation != key[2]:
+                raise LedgerIntegrityError("life genesis identity differs from event identity")
+            parent_instance_id = identity.parent_instance_id
+        else:
+            parent_instance_id = None
+        return LifeKernel(
+            identity_core=core,
+            instance_id=key[1],
+            generation=key[2],
+            parent_instance_id=parent_instance_id,
+            ledger=ledger,
+            lifecycle_state=ledger.head.to_state,
+        )
+
+    def _mark_life_restore_blocked(self, error: Exception | str) -> None:
+        self._life_restore_blocked = True
+        self._life_restore_error = str(error)[:300]
+        self._accepting_input = False
+        self._sync_life_projection()
+
+    def _restore_life(self, snapshot: dict | None) -> None:
+        """Restore/validate the constitutional kernel before waking a loop."""
+        if self._life_restore_blocked:
+            raise LifecycleError(self._life_restore_error or "life restore is blocked")
+        candidate: LifeKernel | None = None
+        raw_kernel = snapshot.get("life_kernel") if isinstance(snapshot, dict) else None
+        legacy_bootstrap = False
+        try:
+            if raw_kernel is not None:
+                candidate = LifeKernel.from_snapshot(raw_kernel)
+                durable = self._load_life_events(instance_id=candidate.instance_id)
+                if durable:
+                    durable_candidate = self._kernel_from_life_events(
+                        durable, preferred_instance_id=candidate.instance_id
+                    )
+                    snap_events = candidate.ledger.events
+                    durable_events = durable_candidate.ledger.events
+                    common = min(len(snap_events), len(durable_events))
+                    if any(
+                        snap_events[index].event_hash
+                        != durable_events[index].event_hash
+                        for index in range(common)
+                    ):
+                        raise LedgerIntegrityError(
+                            "snapshot and durable life ledgers diverge"
+                        )
+                    # A durable suffix may have been committed after the last
+                    # brain-state snapshot.  Prefer it so a restart cannot
+                    # repeat a transition or resurrect an older state.
+                    if len(durable_events) > len(snap_events):
+                        candidate = durable_candidate
+            else:
+                durable = self._load_life_events()
+                if durable:
+                    candidate = self._kernel_from_life_events(durable)
+                else:
+                    # ``BrainState.snapshot()`` is a legacy/compact API and
+                    # may contain only the public projection.  It cannot prove
+                    # identity, so deliberately ignore those fields and start
+                    # the current process from its already-created kernel.
+                    # This is an explicit compatibility mode, not an implicit
+                    # claim that the projection was verified.
+                    candidate = self.life_kernel
+                    legacy_bootstrap = True
+            self._attach_life_sink(candidate)
+            self.life_kernel = candidate
+            self._life_legacy_bootstrap = legacy_bootstrap
+            self._sync_life_projection()
+        except (LifecycleError, ValueError, TypeError) as exc:
+            self._mark_life_restore_blocked(exc)
+            raise LifecycleError(str(exc)) from exc
+
+    def _prepare_life_for_start(self) -> None:
+        """Apply only safe wake edges; never auto-revive quarantine/terminal states."""
+        if self._life_restore_blocked:
+            raise LifecycleError(self._life_restore_error or "life restore is blocked")
+        try:
+            state = self.life_kernel.state
+            if state == LifecycleState.CREATED:
+                self.life_kernel.transition(
+                    LifecycleState.BOOTSTRAPPING,
+                    "心跳启动，开始受控引导",
+                    event_type="bootstrap_started",
+                )
+                self.life_kernel.transition(
+                    LifecycleState.ACTIVE,
+                    "引导检查通过，进入活动态",
+                    event_type="bootstrap_completed",
+                )
+            elif state in {LifecycleState.BOOTSTRAPPING, LifecycleState.SLEEPING}:
+                self.life_kernel.transition(
+                    LifecycleState.ACTIVE,
+                    "显式唤醒请求",
+                    event_type="wake",
+                )
+            elif state in {LifecycleState.ACTIVE, LifecycleState.DEGRADED}:
+                pass
+            else:
+                raise LifecycleError(
+                    f"life kernel cannot auto-resume from {state.value}"
+                )
+        except LifecycleError:
+            self._accepting_input = False
+            self._sync_life_projection()
+            raise
+        self._sync_life_projection()
+
+    def _enter_life_sleep(self) -> None:
+        """Record an orderly process stop without changing terminal states."""
+        try:
+            if self._life_runtime_started and self.life_kernel.state in {
+                LifecycleState.ACTIVE,
+                LifecycleState.DEGRADED,
+            }:
+                self.life_kernel.transition(
+                    LifecycleState.SLEEPING,
+                    "心跳显式停止，进入可恢复休眠",
+                    event_type="sleep",
+                )
+        finally:
+            self._life_runtime_started = False
+            self._sync_life_projection()
 
     # ── Public API ──
 
@@ -362,10 +664,19 @@ class BrainStem:
             return
         self._task = None
 
+        if self._life_restore_blocked:
+            self._accepting_input = False
+            raise LifecycleError(
+                self._life_restore_error or "life kernel restore is blocked"
+            )
+
         logger.info("brain-stem: consciousness loop starting")
         self._stop_event.clear()
-        self._accepting_input = True
-        self._has_started = True
+        # Admission stays closed until the constitutional kernel has been
+        # restored, its durable sink attached, and the wake transition has
+        # committed.  This prevents a request from racing an unverified
+        # identity during restart.
+        self._accepting_input = False
         self.start_time = datetime.now(timezone.utc)
 
         # Restore state before starting the loop.  Starting the task first
@@ -380,12 +691,34 @@ class BrainStem:
                 try:
                     self._restore_snapshot(restored)
                     logger.info("brain-stem: state restored from snapshot")
+                except LifecycleError:
+                    self._accepting_input = False
+                    raise
                 except Exception as exc:
                     # A corrupt/old snapshot must not prevent a fresh
                     # heartbeat from starting.  The in-memory defaults remain
                     # usable and the failure is visible in health state.
                     self._record_loop_error("state_restore", exc)
                     logger.warning("brain-stem: ignoring invalid snapshot: %s", str(exc)[:120])
+                    # A generic snapshot decoder failure is recoverable, but
+                    # the life ledger still has to be loaded/validated before
+                    # the heartbeat can become active.
+                    self._restore_life(None)
+            else:
+                self._restore_life(None)
+        else:
+            self._restore_life(None)
+
+        try:
+            self._prepare_life_for_start()
+        except LifecycleError as exc:
+            self._accepting_input = False
+            self._record_loop_error("life_start", exc)
+            raise
+
+        self._has_started = True
+        self._accepting_input = True
+        self._life_runtime_started = True
 
         # Tool execution is intentionally not replayed from a snapshot: a
         # crash may have happened after an external side effect but before its
@@ -435,6 +768,47 @@ class BrainStem:
         async with self._lifecycle_lock:
             await self._stop_unlocked()
 
+    async def retire(self, reason: str = "operator requested orderly retirement"):
+        """Orderly, irreversible retirement of this concrete life instance."""
+        return await self._terminate_life(LifecycleState.RETIRED, reason)
+
+    async def mark_dead(self, reason: str = "integrity failure"):
+        """Record an irreversible death after cancelling the runtime safely."""
+        return await self._terminate_life(LifecycleState.DEAD, reason)
+
+    async def _terminate_life(self, target: LifecycleState, reason: str) -> dict:
+        """Stop runtime work, then commit one terminal kernel transition."""
+        self._ensure_loop_primitives()
+        async with self._lifecycle_lock:
+            self._accepting_input = False
+            self._stop_event.set()
+            task = self._task
+            self._task = None
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    self._record_loop_error("terminal_shutdown", exc)
+            self._discard_pending_inputs("life instance terminated")
+            self._fail_all_waiters("life instance terminated")
+            self._life_runtime_started = False
+            try:
+                self.life_kernel.transition(
+                    target,
+                    str(reason or "terminal transition")[:500],
+                    event_type="retired" if target == LifecycleState.RETIRED else "dead",
+                )
+            except LifecycleError:
+                self._sync_life_projection()
+                raise
+            self.state.awake = False
+            self._sync_life_projection()
+            await self._snapshot_state()
+            return self.life_kernel.public_snapshot()
+
     async def _stop_unlocked(self):
         """Stop the consciousness loop."""
         logger.info("brain-stem: stopping consciousness loop")
@@ -458,6 +832,18 @@ class BrainStem:
         self._discard_pending_inputs("brain stopped")
         self._fail_all_waiters("brain stopped")
         self.state.awake = False
+
+        # Keep process shutdown and constitutional lifecycle distinct: an
+        # orderly stop records SLEEPING only for a runtime that actually
+        # reached ACTIVE/DEGRADED.  A never-started stem remains CREATED, and
+        # terminal states are never revived or rewritten.
+        try:
+            self._enter_life_sleep()
+        except LifecycleError as exc:
+            # The heartbeat is already stopped.  Preserve the last verified
+            # kernel state and surface a durable-sink failure in health data;
+            # do not claim that sleep was committed when it was not.
+            self._record_loop_error("life_sleep", exc)
 
         # Final snapshot
         try:
@@ -650,6 +1036,26 @@ class BrainStem:
         else:
             tool_observation = None
         future = None
+        life_rejection = None
+        if self._life_restore_blocked:
+            life_rejection = self._life_restore_error or "life kernel restore is blocked"
+        elif self.life_kernel.is_terminal:
+            life_rejection = f"life kernel is terminal ({self.life_kernel.state.value})"
+        elif self._life_runtime_started and not self.life_kernel.accepts_input:
+            life_rejection = f"life kernel does not accept input in {self.life_kernel.state.value}"
+        if life_rejection:
+            if _raise_on_reject:
+                raise LifecycleError(life_rejection)
+            if track:
+                self._ensure_loop_primitives()
+                future = asyncio.get_running_loop().create_future()
+                future.set_result(self._build_input_result(
+                    source=source,
+                    pending=False,
+                    request_id=request_id,
+                    error=life_rejection,
+                ))
+            return request_id, future
         # ``submit_input`` is also used by the legacy pre-start path.  A first
         # request may be buffered before ``start()``, but after an instance has
         # been started and stopped admission is closed until the next start.
@@ -718,6 +1124,7 @@ class BrainStem:
     async def get_state(self) -> dict:
         """Get current brain state snapshot."""
         self._ensure_loop_primitives()
+        self._sync_life_projection()
         return self.state.snapshot()
 
     # ── Main Loop ──
@@ -2405,6 +2812,11 @@ class BrainStem:
         # BrainState has its own defensive decoder and is the source of truth
         # for self-model, curiosity, activation, and per-source sessions.
         self.state = BrainState.from_snapshot(snapshot)
+        # Restore the constitutional seam separately from mutable cognition.
+        # A malformed life snapshot is never downgraded to a fresh identity;
+        # ``_restore_life`` marks the stem blocked and raises instead.
+        self._restore_life(snapshot)
+        self._sync_life_projection()
 
         raw_wm = snapshot.get("working_memory")
         if isinstance(raw_wm, dict):
@@ -2607,6 +3019,8 @@ class BrainStem:
             except Exception as exc:
                 self._record_loop_error("restore_task_scheduler_post_execution", exc)
 
+        self._sync_life_projection()
+
     async def _tick(self):
         """One tick of consciousness. V6: ActivationField drives state dynamics."""
 
@@ -2622,6 +3036,10 @@ class BrainStem:
         # stale response/call_tool intent can be mistaken for the next plan
         # step (and can leak an uncorrelated action to the agent bridge).
         autonomy_intent_consumed = False
+        # Tool feedback is an untrusted observation boundary.  Until the
+        # correlated autonomy lane proves a valid follow-up, no intent parsed
+        # from that text may enter the generic agent queue.
+        autonomy_intent_queueable = True
         autonomy_feedback_success = False
         autonomy_feedback_tool = ""
         self._last_execution_outcome = None
@@ -3268,14 +3686,39 @@ class BrainStem:
                         source_input=thalamus_out["text"][:200],
                     )
                     if intent:
-                        if (
+                        is_tool_feedback = bool(
                             input_data
                             and str(input_data.get("source", "")).startswith("agent/tool/")
+                        )
+                        if (
+                            is_tool_feedback
                             and self.autonomy
                             and self.autonomy.is_active
                         ):
                             autonomy_followup_intent = self._observe_autonomy_intent(intent)
-                            autonomy_intent_consumed = autonomy_followup_intent
+                            # A correlated CALL_TOOL follow-up is rewritten
+                            # from the deterministic plan and still needs to
+                            # be delivered once.  RESPOND/THINK follow-ups,
+                            # however, are fully consumed by the autonomy lane
+                            # and must not leak into the generic queue.
+                            autonomy_intent_consumed = (
+                                autonomy_followup_intent
+                                and intent.type != IntentType.CALL_TOOL
+                            )
+                            # A CALL_TOOL follow-up is queueable only after
+                            # the autonomy lane has correlated and rewritten
+                            # it.  This covers both V13 plan-backed actions
+                            # and the bounded legacy episode path.  An
+                            # uncorrelated model action is discarded here.
+                            autonomy_intent_queueable = bool(
+                                autonomy_followup_intent
+                                and intent.type == IntentType.CALL_TOOL
+                                and intent.episode_id
+                                and intent.goal_id
+                                and str(intent.origin or "") != "external"
+                            )
+                        elif is_tool_feedback:
+                            autonomy_intent_queueable = False
                         # V8: 行为倾向特质调制 intent 置信度
                         intent.confidence = self.state.self_model.modulate_intent(
                             intent.type.value, intent.confidence)
@@ -3289,6 +3732,7 @@ class BrainStem:
                         intent
                         and intent.type.value in ("call_tool", "respond")
                         and not autonomy_intent_consumed
+                        and autonomy_intent_queueable
                     ):
                         self.state.last_intent = intent.to_dict()
                         self.state.intent_count += 1
@@ -4027,8 +4471,21 @@ Rules:
     async def _snapshot_state(self):
         """Persist brain state. V6: includes ActivationField."""
         if self.state_store:
+            if self._life_restore_blocked:
+                self._sync_life_projection()
+                self._record_loop_error(
+                    "snapshot_life", self._life_restore_error or "life restore is blocked"
+                )
+                return False
+            try:
+                self._attach_life_sink(self.life_kernel)
+            except (LifecycleError, ValueError, TypeError) as exc:
+                self._mark_life_restore_blocked(exc)
+                self._record_loop_error("snapshot_life", exc)
+                return False
             # Keep the compact BrainState fields and the lossless working
             # memory view in sync immediately before journaling.
+            self._sync_life_projection()
             self.state.sleep_state = self.sleep_state
             self.state.active_thoughts = [dict(item) for item in self.working_memory.items]
             self.state.current_context = self.working_memory.get_context()
@@ -4036,6 +4493,7 @@ Rules:
                 self._sync_autonomy_projection()
             self.task_scheduler.sync(self.goal_system, self.state.total_ticks)
             snap = self.state.snapshot()  # State.snapshot() already includes activation
+            snap["life_kernel"] = self.life_kernel.snapshot()
             snap["working_memory"] = self.working_memory.snapshot()
             snap["last_archived_count"] = self._last_archived_count
             snap["maintenance"] = {

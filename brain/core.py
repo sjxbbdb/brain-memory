@@ -201,7 +201,7 @@ class Brain:
         """Get full brain state for external inspection."""
         self._ensure_loop_primitives()
         self.brain_stem._ensure_loop_primitives()
-        return self.brain_stem.state.snapshot()
+        return await self.brain_stem.get_state()
 
     async def get_inner_monologue(self) -> str:
         """Get the brain's current inner monologue."""
