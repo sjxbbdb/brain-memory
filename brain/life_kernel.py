@@ -808,6 +808,28 @@ class LifeKernel:
             "identity_core_fingerprint"
         ) != self.identity_core.fingerprint:
             raise LedgerIntegrityError("identity core fingerprint does not match genesis")
+        # Pin the complete constitutional identity, not just the lineage and
+        # core fingerprint.  In particular, a forged snapshot must not be
+        # able to rewrite ``parent_instance_id`` while replaying the same
+        # immutable event hashes.
+        genesis_core = genesis_metadata.get("identity_core")
+        if isinstance(genesis_core, Mapping):
+            try:
+                if IdentityCore.from_dict(genesis_core).to_dict() != self.identity_core.to_dict():
+                    raise LedgerIntegrityError("identity core differs from genesis metadata")
+            except LedgerIntegrityError:
+                raise
+            except Exception as exc:
+                raise LedgerIntegrityError("genesis identity core is invalid") from exc
+        genesis_identity = genesis_metadata.get("identity")
+        if isinstance(genesis_identity, Mapping):
+            try:
+                if LifeIdentity.from_dict(genesis_identity).to_dict() != self.identity.to_dict():
+                    raise LedgerIntegrityError("life identity differs from genesis metadata")
+            except LedgerIntegrityError:
+                raise
+            except Exception as exc:
+                raise LedgerIntegrityError("genesis identity is invalid") from exc
 
     def _commit_new_event(
         self,
@@ -1012,6 +1034,23 @@ class SQLiteLedger:
         )
     """
 
+    # Keep the standalone adapter subject to the same append-only guarantee
+    # as ``StateStore``.  The guard lives in SQLite itself so a caller that
+    # obtains a raw connection cannot rewrite constitutional history through
+    # UPDATE or DELETE.
+    GUARD_SQL = """
+        CREATE TRIGGER IF NOT EXISTS life_ledger_no_update
+        BEFORE UPDATE ON life_ledger
+        BEGIN
+            SELECT RAISE(ABORT, 'life_ledger is INSERT-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS life_ledger_no_delete
+        BEFORE DELETE ON life_ledger
+        BEGIN
+            SELECT RAISE(ABORT, 'life_ledger is INSERT-only');
+        END;
+    """
+
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
         self._lock = RLock()
@@ -1029,17 +1068,72 @@ class SQLiteLedger:
             conn = self._connect()
             try:
                 conn.execute(self.TABLE_SQL)
+                conn.executescript(self.GUARD_SQL)
                 conn.commit()
             finally:
                 conn.close()
 
     def append(self, event: LifecycleEvent | Mapping[str, Any]) -> bool:
-        parsed = event if isinstance(event, LifecycleEvent) else LifecycleEvent.from_dict(event)
-        payload = parsed.to_dict()
+        # Validate the immutable event and its genesis contract before any
+        # write.  A correctly-shaped but hash-invalid row must never enter the
+        # durable table.
+        try:
+            parsed = event if isinstance(event, LifecycleEvent) else LifecycleEvent.from_dict(event)
+            payload = parsed.to_dict()
+            # Only a sequence-1 event can be checked as a standalone ledger;
+            # later events are validated against the persisted predecessor
+            # below.  Requiring every event to look like a genesis record
+            # would incorrectly reject normal transitions during replay.
+            if parsed.sequence == 1:
+                AppendOnlyLedger([parsed]).verify_chain()
+            metadata = _canonical_json(payload.get("metadata", {}))
+        except Exception:
+            return False
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute(self.TABLE_SQL)
+                conn.executescript(self.GUARD_SQL)
+                # Replays are idempotent only when every immutable field is
+                # identical.  Comparing the normalized event projection is
+                # stronger than checking event_hash alone.
+                existing = conn.execute(
+                    "SELECT event_id, lineage_id, generation, instance_id, sequence, "
+                    "timestamp, event_type, from_state, to_state, reason, metadata, "
+                    "previous_hash, event_hash FROM life_ledger WHERE event_id = ?",
+                    (payload["event_id"],),
+                ).fetchone()
+                if existing is not None:
+                    try:
+                        existing_payload = dict(existing)
+                        existing_payload["metadata"] = json.loads(existing_payload["metadata"])
+                        return LifecycleEvent.from_dict(existing_payload).to_dict() == payload
+                    except Exception:
+                        return False
+
+                # Build the selected instance chain and append to a probe
+                # before touching SQLite.  This rejects sequence gaps,
+                # predecessor mismatches, identity changes and illegal state
+                # edges at this adapter boundary (not only in LifeKernel).
+                try:
+                    rows = conn.execute(
+                        "SELECT event_id, lineage_id, generation, instance_id, sequence, "
+                        "timestamp, event_type, from_state, to_state, reason, metadata, "
+                        "previous_hash, event_hash FROM life_ledger "
+                        "WHERE instance_id = ? ORDER BY sequence ASC",
+                        (payload["instance_id"],),
+                    ).fetchall()
+                    existing_events: list[LifecycleEvent] = []
+                    for row in rows:
+                        item = dict(row)
+                        item["metadata"] = json.loads(item["metadata"])
+                        existing_events.append(LifecycleEvent.from_dict(item))
+                    probe = AppendOnlyLedger(existing_events)
+                    probe.append_event(parsed)
+                    probe.verify_chain()
+                except Exception:
+                    conn.rollback()
+                    return False
                 try:
                     conn.execute(
                         """INSERT INTO life_ledger
@@ -1058,7 +1152,7 @@ class SQLiteLedger:
                             payload["from_state"],
                             payload["to_state"],
                             payload["reason"],
-                            _canonical_json(payload["metadata"]),
+                            metadata,
                             payload["previous_hash"],
                             payload["event_hash"],
                         ),
@@ -1067,11 +1161,23 @@ class SQLiteLedger:
                     return True
                 except sqlite3.IntegrityError:
                     existing = conn.execute(
-                        "SELECT event_hash FROM life_ledger WHERE event_id = ?",
+                        "SELECT event_id, lineage_id, generation, instance_id, sequence, "
+                        "timestamp, event_type, from_state, to_state, reason, metadata, "
+                        "previous_hash, event_hash FROM life_ledger WHERE event_id = ?",
                         (payload["event_id"],),
                     ).fetchone()
                     conn.rollback()
-                    return bool(existing and existing["event_hash"] == payload["event_hash"])
+                    if existing is None:
+                        return False
+                    try:
+                        existing_payload = dict(existing)
+                        existing_payload["metadata"] = json.loads(existing_payload["metadata"])
+                        return LifecycleEvent.from_dict(existing_payload).to_dict() == payload
+                    except Exception:
+                        return False
+                except Exception:
+                    conn.rollback()
+                    return False
             finally:
                 conn.close()
 

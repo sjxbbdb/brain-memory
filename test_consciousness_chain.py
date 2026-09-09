@@ -17,15 +17,14 @@ import asyncio
 import json
 import sys
 import os
+from pathlib import Path
+import tempfile
 import time
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from brain.core import Brain
-from storage.database import init_db
-
-init_db()
 
 # ═══════════════════════════════════════════════
 # 测试指标追踪
@@ -155,13 +154,32 @@ class ConsciousnessMetrics:
 # 长链路测试
 # ═══════════════════════════════════════════════
 
-async def run_long_chain_test():
+async def run_long_chain_test(db_path: str | os.PathLike[str] | None = None):
+    """Run the long chain against an explicit or disposable database.
+
+    Importing this module must stay side-effect free: the historical test used
+    to initialise ``brain_v4.db`` at collection time, which could mutate a
+    developer checkout before any test had started.  A caller that needs to
+    inspect a persistent run can pass ``db_path`` (or set
+    ``BRAIN_MEMORY_TEST_DB_PATH``); the normal CLI path receives a temporary
+    SQLite file instead.
+    """
+
+    configured_path = db_path or os.getenv("BRAIN_MEMORY_TEST_DB_PATH")
+    if configured_path:
+        await _run_long_chain_test(str(Path(configured_path)))
+        return
+    with tempfile.TemporaryDirectory(prefix="brain-memory-chain-") as temp_root:
+        await _run_long_chain_test(str(Path(temp_root) / "chain.sqlite"))
+
+
+async def _run_long_chain_test(db_path: str):
     print("╔══════════════════════════════════════════════╗")
     print("║  Brain Memory V8 — 全场景意识链路测试        ║")
     print("╚══════════════════════════════════════════════╝")
     print()
 
-    brain = Brain(db_path="brain_v4.db")
+    brain = Brain(db_path=db_path)
     await brain.wake_up()
     metrics = ConsciousnessMetrics(brain)
 

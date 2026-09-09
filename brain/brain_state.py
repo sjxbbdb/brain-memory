@@ -106,6 +106,14 @@ class BrainState:
     # cognitive state container.
     life: dict[str, Any] = field(default_factory=dict)
 
+    # ── Bounded self-maintenance projections (P2/P4) ──
+    # The mutable state container exposes compact, JSON-safe views only.
+    # Motivational evidence and the resource hash ledger are owned by their
+    # respective managers in BrainStem and are persisted separately at the
+    # snapshot boundary.
+    motivation: dict[str, Any] = field(default_factory=dict)
+    homeostasis: dict[str, Any] = field(default_factory=dict)
+
     # ── V6 Activation Field（全局状态总线）──
     activation: ActivationField = field(default_factory=ActivationField)
 
@@ -169,6 +177,8 @@ class BrainState:
             "last_heartbeat_at": _text(self.last_heartbeat_at),
             "autonomy": self.autonomy if isinstance(self.autonomy, dict) else {},
             "life": self.life if isinstance(self.life, dict) else {},
+            "motivation": self.motivation if isinstance(self.motivation, dict) else {},
+            "homeostasis": self.homeostasis if isinstance(self.homeostasis, dict) else {},
             "total_ticks": self.total_ticks,
             "uptime_seconds": round(self.uptime_seconds, 1),
             "active_habit": _text(self.active_habit, 200) if self.active_habit is not None else None,
@@ -268,6 +278,10 @@ class BrainState:
         state.autonomy = dict(raw_autonomy) if isinstance(raw_autonomy, dict) else {}
         raw_life = data.get("life", {})
         state.life = dict(raw_life) if isinstance(raw_life, dict) else {}
+        raw_motivation = data.get("motivation", {})
+        state.motivation = dict(raw_motivation) if isinstance(raw_motivation, dict) else {}
+        raw_homeostasis = data.get("homeostasis", {})
+        state.homeostasis = dict(raw_homeostasis) if isinstance(raw_homeostasis, dict) else {}
         state.total_ticks = _int(data.get("total_ticks", 0), minimum=0)
         state.uptime_seconds = max(0.0, _float(data.get("uptime_seconds", 0.0)))
         active_habit = data.get("active_habit")

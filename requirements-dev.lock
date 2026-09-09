@@ -1,0 +1,8 @@
+# Generated for the project-local Python 3.12 environment on 2026-09-09.
+# Recreate with: .venv\Scripts\python.exe -m pip install -r requirements-dev.lock
+-r requirements.lock
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+Pygments==2.21.0
+pytest==9.1.1

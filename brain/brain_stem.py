@@ -13,12 +13,18 @@
 """
 
 import asyncio
+from collections.abc import Iterable
+from dataclasses import replace
 import inspect
+import hashlib
 import json
 import logging
+import math
+import re
+import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Mapping
 
 from brain.thalamus import Thalamus
 from brain.amygdala import Amygdala
@@ -59,6 +65,19 @@ from brain.task_execution import (
     OutcomeQuality,
 )
 from brain.learning_feedback import VerifiedLearningFeedback
+from brain.evaluation_harness import (
+    BaselineRevision,
+    CandidateRevision,
+    EvaluationHarness,
+    EvaluationMode,
+    EvaluationReceipt,
+)
+from brain.evolution import (
+    PromotionController,
+    PromotionMode,
+    PromotionOutcome,
+    SandboxAttestation,
+)
 from brain.life_kernel import (
     AppendOnlyLedger,
     IdentityCore,
@@ -69,6 +88,35 @@ from brain.life_kernel import (
     LifecycleError,
     LifecycleEvent,
     LifecycleState,
+)
+from brain.homeostasis import (
+    ActionDecision,
+    ActionRequest,
+    ControlledEnvironment,
+    EnvironmentKind,
+    HomeostasisAction,
+    HomeostasisController,
+    ResourceBudget as HomeostasisBudget,
+    ResourceObservation,
+)
+from brain.motivation import (
+    ChangeProposal,
+    ImpulseEvent,
+    IterationNeed,
+    MotivationalPressure,
+)
+from brain.succession import (
+    AnchorSet,
+    AnchorVault,
+    FailureAssessment,
+    SuccessionLedger,
+)
+from brain.succession_runtime import (
+    SuccessionCoordinator,
+    SuccessionOutcome,
+    SuccessionRuntimeError,
+    SuccessorActivationAttestation,
+    SuccessorActivationAttestor,
 )
 from config import (
     TICK_INTERVAL_SEC,
@@ -128,7 +176,29 @@ logger = logging.getLogger("brain-v5.brain-stem")
 class BrainStem:
     """Consciousness loop engine — the brain's heartbeat."""
 
-    def __init__(self, state_store=None, memory_store=None, *, life_kernel=None):
+    # Candidate records are observability/evidence state, not a work queue.
+    # Keeping the limit here prevents a long-running subject from turning an
+    # otherwise safe proposal seam into an unbounded memory sink.
+    _ITERATION_RECORD_LIMIT = 32
+
+    def __init__(
+        self,
+        state_store=None,
+        memory_store=None,
+        *,
+        life_kernel=None,
+        homeostasis=None,
+        motivation=None,
+        controlled_environment=None,
+        succession_coordinator=None,
+        anchor_vault=None,
+        succession_ledger=None,
+        succession_profile: str = "production",
+        succession_activation_attestor=None,
+        life_control_mode: str = "durable",
+        evaluation_harness: EvaluationHarness | None = None,
+        promotion_controller: PromotionController | None = None,
+    ):
         # Brain regions
         self.thalamus = Thalamus()
         self.amygdala = Amygdala()
@@ -149,6 +219,18 @@ class BrainStem:
         self.state = BrainState()
         self.state_store = state_store
         self.memory_store = memory_store
+        control_mode = str(life_control_mode or "durable").strip().lower()
+        control_mode = {
+            "strict": "durable",
+            "fenced": "durable",
+            "compatibility": "legacy",
+            "legacy": "legacy",
+        }.get(control_mode, control_mode)
+        if control_mode not in {"durable", "legacy"}:
+            raise ValueError("life_control_mode must be 'durable' or explicit 'legacy'")
+        # Durable is the default.  Legacy is an explicit host choice for old
+        # append-only adapters and carries no cross-process single-owner claim.
+        self.life_control_mode = control_mode
 
         # Constitutional lifecycle seam.  The kernel is deliberately kept
         # outside ``BrainState``: cognition may evolve, while identity,
@@ -158,12 +240,188 @@ class BrainStem:
         # lineage before an existing snapshot has been inspected.
         if life_kernel is not None and not isinstance(life_kernel, LifeKernel):
             raise TypeError("life_kernel must be a LifeKernel")
+        if succession_coordinator is not None and not isinstance(
+            succession_coordinator, SuccessionCoordinator
+        ):
+            raise TypeError("succession_coordinator must be a SuccessionCoordinator")
+        if succession_activation_attestor is not None and not isinstance(
+            succession_activation_attestor, SuccessorActivationAttestor
+        ):
+            raise TypeError(
+                "succession_activation_attestor must be a SuccessorActivationAttestor"
+            )
+        if succession_coordinator is not None:
+            coordinator_parent = succession_coordinator.parent
+            if life_kernel is not None and life_kernel is not coordinator_parent:
+                if (
+                    life_kernel.lineage_id != coordinator_parent.lineage_id
+                    or life_kernel.instance_id != coordinator_parent.instance_id
+                    or life_kernel.ledger.last_hash != coordinator_parent.ledger.last_hash
+                ):
+                    raise ValueError("life_kernel does not match succession coordinator parent")
+            life_kernel = coordinator_parent
         self.life_kernel = life_kernel or LifeKernel()
         self._life_sink_attached = False
         self._life_runtime_started = False
         self._life_restore_blocked = False
         self._life_restore_error = ""
         self._life_legacy_bootstrap = True
+        # A persistent host gets a short-lived, fenced SQLite control lease.
+        # The token never enters BrainState or a lifecycle event; it remains
+        # in this process and is renewed while the heartbeat is alive.  An
+        # in-memory stem keeps the older process-local coordinator guard.
+        self._life_control_lease = None
+        self._life_control_owner_id = f"brainstem-{uuid.uuid4().hex}"
+        self._life_local_control_token = object()
+        self._life_control_ttl_sec = 120.0
+        self._life_control_renew_interval_sec = 30.0
+        self._life_control_next_renew_at = 0.0
+        self._life_control_lost = False
+        # Process-local guard ownership is tracked separately from the
+        # durable SQLite lease.  This prevents a second stem that shares the
+        # same LifeKernel object from releasing the first stem's registry
+        # entry during its own failed start/stop path.
+        self._life_local_control_kernel = None
+        # During an explicit succession handover the child genesis event is
+        # durable evidence but the CREATED child must not claim live control
+        # before independent activation.  This narrow context permits that
+        # one genesis append without weakening ordinary lifecycle writes.
+        self._life_handover_lineage = ""
+        self._life_handover_parent_generation = None
+        self._life_replay_mode = False
+
+        # Mutable-organism safety seams.  Neither manager owns identity or
+        # executes an external action: motivation may only request an
+        # evaluation, and homeostasis may only tighten lifecycle/admission
+        # policy.  The aliases keep the public domain names discoverable for
+        # embedders without duplicating state.
+        if homeostasis is not None and not isinstance(homeostasis, HomeostasisController):
+            raise TypeError("homeostasis must be a HomeostasisController")
+        if motivation is not None and not isinstance(motivation, MotivationalPressure):
+            raise TypeError("motivation must be a MotivationalPressure")
+        if controlled_environment is not None and not isinstance(
+            controlled_environment, ControlledEnvironment
+        ):
+            raise TypeError("controlled_environment must be a ControlledEnvironment")
+        # ``HomeostasisController`` is intentionally allowed to be supplied
+        # as an empty-but-configured object.  Do not use truthiness here:
+        # future adapters may expose ``__len__`` and an empty ledger must not
+        # be silently replaced with a fresh budget.
+        self.homeostasis = (
+            homeostasis
+            if homeostasis is not None
+            else HomeostasisController(HomeostasisBudget())
+        )
+        self.homeostasis_controller = self.homeostasis
+        self.motivation = (
+            motivation if motivation is not None else MotivationalPressure()
+        )
+        self.motivational_pressure = self.motivation
+        self.controlled_environment = controlled_environment
+        self._last_iteration_need: IterationNeed | None = None
+
+        # Succession state is kept outside BrainState for the same reason as
+        # the constitutional kernel: mutable cognition must not be able to
+        # rewrite the parent/child boundary.  Empty injected containers are
+        # retained by identity; callers may use them as durable projections.
+        if anchor_vault is not None and not isinstance(anchor_vault, AnchorVault):
+            raise TypeError("anchor_vault must be an AnchorVault")
+        if succession_ledger is not None and not isinstance(
+            succession_ledger, SuccessionLedger
+        ):
+            raise TypeError("succession_ledger must be a SuccessionLedger")
+        if succession_coordinator is not None:
+            if anchor_vault is not None and anchor_vault is not succession_coordinator.anchor_vault:
+                raise ValueError("anchor_vault does not match succession coordinator")
+            if succession_ledger is not None and succession_ledger is not succession_coordinator.succession_ledger:
+                raise ValueError("succession_ledger does not match succession coordinator")
+            self.anchor_vault = succession_coordinator.anchor_vault
+            self.succession_ledger = succession_coordinator.succession_ledger
+        else:
+            self.anchor_vault = anchor_vault if anchor_vault is not None else AnchorVault()
+            self.succession_ledger = (
+                succession_ledger
+                if succession_ledger is not None
+                else SuccessionLedger()
+            )
+        self.succession_coordinator = succession_coordinator
+        if succession_coordinator is not None:
+            # An injected coordinator is already the policy authority.  Keep
+            # its profile/attestor as the single source of truth and reject a
+            # conflicting host binding rather than silently weakening it.
+            if succession_activation_attestor is not None and (
+                succession_coordinator.activation_attestor
+                is not succession_activation_attestor
+            ):
+                raise ValueError(
+                    "succession activation attestor does not match coordinator"
+                )
+            self.succession_profile = succession_coordinator.activation_profile
+            self.succession_activation_attestor = (
+                succession_coordinator.activation_attestor
+            )
+        else:
+            self.succession_profile = str(succession_profile or "production")
+            self.succession_activation_attestor = succession_activation_attestor
+        self._successor_activation_required = bool(
+            succession_coordinator is not None
+            and succession_coordinator.successor is not None
+            and succession_coordinator.successor.state == LifecycleState.CREATED
+        )
+        self._successor_evaluation_receipt_hash = ""
+
+        # P3 candidate-iteration boundary.  These dependencies are host
+        # capabilities and are therefore never auto-created from the live
+        # checkout.  Motivation can suggest a proposal, but only an explicit
+        # host call may evaluate it, and only a second explicit host call may
+        # ask the controller to promote it.  The controller itself remains the
+        # authority for production sandbox attestation and active-tree writes.
+        if evaluation_harness is not None and not isinstance(
+            evaluation_harness, EvaluationHarness
+        ):
+            raise TypeError("evaluation_harness must be an EvaluationHarness")
+        if promotion_controller is not None and not isinstance(
+            promotion_controller, PromotionController
+        ):
+            raise TypeError("promotion_controller must be a PromotionController")
+        controller_harness = (
+            getattr(promotion_controller, "harness", None)
+            if promotion_controller is not None
+            else None
+        )
+        if (
+            evaluation_harness is not None
+            and controller_harness is not None
+            and controller_harness is not evaluation_harness
+        ):
+            raise ValueError(
+                "evaluation_harness must be the same instance bound to promotion_controller"
+            )
+        # If the host supplied only a controller, its fixed harness is the
+        # evaluator for this seam.  No controller or harness is synthesized.
+        self.evaluation_harness = (
+            evaluation_harness
+            if evaluation_harness is not None
+            else controller_harness
+        )
+        self.promotion_controller = promotion_controller
+        # Readable aliases for embedders that use evaluator/evolution terms.
+        self.evaluator = self.evaluation_harness
+        self.evolution_controller = self.promotion_controller
+        if self.promotion_controller is not None and self.state_store is not None:
+            # A database path can be created lazily by SQLite.  Bind it now so
+            # a not-yet-created ``.sqlite`` file cannot later appear inside the
+            # atomically swapped runtime tree.  Adapters without ``db_path``
+            # retain compatibility but remain an explicitly unverified host
+            # boundary (the deployment layer must supply its own guard).
+            persistence_path = getattr(self.state_store, "db_path", None)
+            if persistence_path is not None:
+                self.promotion_controller.bind_persistence_path(persistence_path)
+        self._iteration_proposals: dict[str, Any] = {}
+        self._iteration_candidate_bindings: dict[str, dict[str, str]] = {}
+        self._iteration_receipts: dict[str, EvaluationReceipt] = {}
+        self._iteration_outcomes: dict[str, PromotionOutcome] = {}
+        self._iteration_restore_rejected = 0
 
         # Loop control
         self._stop_event = asyncio.Event()
@@ -293,6 +551,7 @@ class BrainStem:
         if self.autonomy:
             self.state.autonomy = self.autonomy.summary()
         self._sync_life_projection()
+        self._sync_self_maintenance_projection()
 
     # ── Constitutional life seam (P1) ──
 
@@ -311,17 +570,1322 @@ class BrainStem:
         if self._life_restore_blocked:
             projection["restore_blocked"] = True
             projection["restore_error"] = self._life_restore_error[:300]
+        # A resource quarantine can only narrow the kernel permission.  It
+        # never grants self-modification when the lifecycle would deny it.
+        homeostasis = getattr(self, "homeostasis", None)
+        if homeostasis is not None and homeostasis.quarantine_latched:
+            projection["accepts_input"] = False
+            projection["allows_self_modification"] = False
+            projection["homeostasis_quarantine"] = True
+        coordinator = getattr(self, "succession_coordinator", None)
+        if coordinator is not None:
+            projection["succession_active_instance_id"] = coordinator.active_instance_id
+            projection["successor_activation_required"] = bool(
+                getattr(self, "_successor_activation_required", False)
+            )
+        lease = getattr(self, "_life_control_lease", None)
+        if lease is not None:
+            try:
+                # ``LifeControlLease.to_dict`` intentionally omits the token
+                # unless explicitly requested.  Keep only non-capability
+                # diagnostics in the public state projection.
+                projection["control_lease"] = lease.to_dict()
+                projection["control_lease_bound"] = True
+            except Exception:
+                projection["control_lease_bound"] = False
+        else:
+            projection["control_lease_bound"] = False
+        projection["life_control_mode"] = getattr(self, "life_control_mode", "durable")
+        if getattr(self, "_life_control_lost", False):
+            projection["control_lease_lost"] = True
         self.state.life = projection
+
+    def _sync_self_maintenance_projection(self) -> None:
+        """Expose bounded motivation/resource summaries through BrainState."""
+        try:
+            self.state.homeostasis = dict(self.homeostasis.public_snapshot())
+        except Exception as exc:  # pragma: no cover - defensive projection
+            self.state.homeostasis = {
+                "quarantine_latched": True,
+                "projection_error": str(exc)[:200],
+            }
+        try:
+            pressures = self.motivation.get_pressure()
+            if not isinstance(pressures, dict):
+                pressures = {}
+            latest_need = (
+                self._last_iteration_need.to_dict()
+                if self._last_iteration_need is not None
+                else None
+            )
+            self.state.motivation = {
+                "schema_version": 1,
+                "pressures": {
+                    str(key)[:80]: float(value)
+                    for key, value in list(pressures.items())[:128]
+                },
+                "total_received": int(self.motivation.total_received),
+                "total_accepted": int(self.motivation.total_accepted),
+                "total_rejected": int(self.motivation.total_rejected),
+                "total_self_rejected": int(self.motivation.total_self_rejected),
+                "total_needs_emitted": int(self.motivation.total_needs_emitted),
+                "snapshot_rejected": bool(
+                    getattr(self.motivation, "snapshot_rejected", False)
+                ),
+                "last_iteration_need": latest_need,
+                # An IterationNeed is evidence for evaluation, never an
+                # authorization to write or execute a change.
+                "self_modification_authorized": False,
+                # P3 is deliberately a read-only projection.  Host bindings,
+                # attestation secrets and candidate paths never cross this
+                # state boundary.
+                "iteration": self._iteration_snapshot(),
+            }
+        except Exception as exc:  # pragma: no cover - defensive projection
+            self.state.motivation = {
+                "schema_version": 1,
+                "self_modification_authorized": False,
+                "projection_error": str(exc)[:200],
+            }
+        self._sync_life_projection()
+
+    def record_impulse(
+        self,
+        impulse: ImpulseEvent | dict[str, Any] | str,
+        intensity: float | None = None,
+        source: str = "runtime",
+        context: str = "",
+        **kwargs: Any,
+    ) -> float:
+        """Record a motivational observation without granting change rights."""
+        now = kwargs.pop("now", None)
+        if isinstance(impulse, ImpulseEvent):
+            event = impulse
+        elif isinstance(impulse, dict):
+            event = ImpulseEvent.from_dict(impulse)
+            if event is None:
+                raise ValueError("invalid impulse event")
+        else:
+            event = ImpulseEvent.create(
+                impulse_type=str(impulse),
+                intensity=0.0 if intensity is None else intensity,
+                source=source,
+                context=context,
+                **kwargs,
+            )
+        pressure = self.motivation.record(event, now=now)
+        self._sync_self_maintenance_projection()
+        return pressure
+
+    observe_impulse = record_impulse
+
+    def poll_iteration_need(
+        self,
+        motive: str | None = None,
+        *,
+        now: Any = None,
+    ) -> IterationNeed | None:
+        """Return a bounded need record; never mutate source or authorize it."""
+        need = self.motivation.poll_iteration_need(motive=motive, now=now)
+        if need is not None:
+            self._last_iteration_need = need
+        self._sync_self_maintenance_projection()
+        return need
+
+    # ── Explicit candidate iteration seam (P3) ──
+
+    @staticmethod
+    def _require_iteration_host(host: Any) -> Any:
+        """Require a host capability on every candidate-boundary call.
+
+        The stem deliberately does not retain a host object and never infers
+        one from ``state_store``, ``controlled_environment`` or the current
+        process.  A caller must therefore pass the host explicitly for each
+        registration, evaluation and promotion operation.  The host may be a
+        mapping/object understood by :class:`PromotionController`; for the
+        proposal/evaluation phases it need not carry authorization.
+        """
+
+        if host is None:
+            raise PermissionError("an explicit host binding is required")
+        return host
+
+    @staticmethod
+    def _coerce_iteration_need(need: IterationNeed | Mapping[str, Any]) -> IterationNeed:
+        if isinstance(need, IterationNeed):
+            return need
+        if isinstance(need, Mapping):
+            parsed = IterationNeed.from_dict(need)
+            if parsed is not None:
+                return parsed
+        raise TypeError("need must be an IterationNeed or mapping")
+
+    @staticmethod
+    def _coerce_candidate_revision(
+        candidate: str | CandidateRevision,
+    ) -> CandidateRevision:
+        if isinstance(candidate, CandidateRevision):
+            return candidate
+        return CandidateRevision.from_path(candidate)
+
+    @staticmethod
+    def _coerce_iteration_proposal(
+        proposal: ChangeProposal | Mapping[str, Any],
+    ) -> ChangeProposal:
+        if isinstance(proposal, ChangeProposal):
+            return proposal
+        if isinstance(proposal, Mapping):
+            parsed = ChangeProposal.from_dict(proposal)
+            if parsed is not None:
+                return parsed
+        raise TypeError("proposal must be a ChangeProposal or mapping")
+
+    def _remember_iteration_record(self, proposal: ChangeProposal) -> None:
+        """Remember one proposal and evict the oldest related evidence."""
+
+        proposal_id = proposal.proposal_id
+        self._iteration_proposals[proposal_id] = proposal
+        while len(self._iteration_proposals) > self._ITERATION_RECORD_LIMIT:
+            oldest_id = next(iter(self._iteration_proposals))
+            self._iteration_proposals.pop(oldest_id, None)
+            self._iteration_candidate_bindings.pop(oldest_id, None)
+            self._iteration_receipts.pop(oldest_id, None)
+            self._iteration_outcomes.pop(oldest_id, None)
+
+    def _require_registered_iteration_proposal(
+        self,
+        proposal: ChangeProposal | Mapping[str, Any],
+    ) -> ChangeProposal:
+        parsed = self._coerce_iteration_proposal(proposal)
+        registered = self._iteration_proposals.get(parsed.proposal_id)
+        if registered is None:
+            raise ValueError("proposal must be registered through register_iteration_proposal")
+        # A mapping can be reconstituted safely, but it must denote exactly the
+        # immutable record that was registered.  This prevents a caller from
+        # swapping the need/evidence while reusing a receipt or candidate id.
+        if registered.to_dict() != parsed.to_dict():
+            raise ValueError("proposal does not match the registered immutable record")
+        return registered
+
+    @staticmethod
+    def _safe_iteration_proposal_dict(proposal: ChangeProposal) -> dict[str, Any]:
+        """Redact path-like candidate labels at the snapshot boundary."""
+
+        payload = proposal.to_dict()
+        label = str(payload.get("candidate_revision", ""))[:180]
+        # ``candidate_revision`` is an opaque revision label, never a source
+        # path.  A host that accidentally supplies a path should not leak it
+        # through BrainState/SQLite; the candidate is re-bound explicitly on
+        # the next evaluation call.
+        if any(token in label for token in ("/", "\\", ":")):
+            payload["candidate_revision"] = ""
+        return payload
+
+    @staticmethod
+    def _iteration_proposal_hash(payload: Mapping[str, Any]) -> str:
+        canonical = json.dumps(
+            dict(payload),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _safe_iteration_outcome_dict(outcome: PromotionOutcome) -> dict[str, Any]:
+        """Keep outcome observability hash/identity based, not reason/path based."""
+
+        raw = outcome.to_dict()
+        return {
+            key: raw.get(key)
+            for key in (
+                "schema_version",
+                "accepted",
+                "action",
+                "mode",
+                "candidate_revision_id",
+                "candidate_fingerprint",
+                "evaluation_receipt_hash",
+                "active_before_fingerprint",
+                "active_after_fingerprint",
+                "rollback_available",
+                "record_hash",
+                "sandbox_attestation_id",
+                "sandbox_attestation_hash",
+                "attestation_verified",
+            )
+        }
+
+    def _iteration_snapshot(self) -> dict[str, Any]:
+        """Return a bounded, capability-free P3 observability projection."""
+
+        controller = self.promotion_controller
+        last_proposal = None
+        if self._iteration_proposals:
+            last_proposal = self._safe_iteration_proposal_dict(
+                next(reversed(self._iteration_proposals.values()))
+            )
+            last_proposal["proposal_hash"] = self._iteration_proposal_hash(last_proposal)
+        last_receipt = None
+        if self._iteration_receipts:
+            receipt = next(reversed(self._iteration_receipts.values()))
+            last_receipt = {
+                "receipt_id": receipt.receipt_id,
+                "receipt_hash": receipt.receipt_hash,
+                "candidate_revision_id": receipt.candidate_revision_id,
+                "candidate_fingerprint": receipt.candidate_fingerprint,
+                "mode": receipt.mode,
+                "accepted": receipt.accepted,
+                "outcome": receipt.outcome,
+                "isolated": receipt.isolated,
+                "result_verified": receipt.result_verified,
+            }
+        last_outcome = None
+        if self._iteration_outcomes:
+            last_outcome = self._safe_iteration_outcome_dict(
+                next(reversed(self._iteration_outcomes.values()))
+            )
+        return {
+            "schema_version": 1,
+            "enabled": bool(self.evaluation_harness is not None and controller is not None),
+            "evaluation_harness_bound": self.evaluation_harness is not None,
+            "promotion_controller_bound": controller is not None,
+            "promotion_profile": getattr(controller, "profile", None),
+            "sandbox_attestation_required": bool(
+                getattr(controller, "require_sandbox_attestation", False)
+            )
+            if controller is not None
+            else False,
+            "proposal_count": len(self._iteration_proposals),
+            "evaluated_count": len(self._iteration_receipts),
+            "outcome_count": len(self._iteration_outcomes),
+            "restore_rejected": self._iteration_restore_rejected,
+            "last_proposal": last_proposal,
+            "last_receipt": last_receipt,
+            "last_outcome": last_outcome,
+            # Never report a retained host/capability as state.  The host must
+            # be supplied again after every restart and for every operation.
+            "host_bound": False,
+        }
+
+    def _iteration_snapshot_for_persistence(self) -> dict[str, Any]:
+        """Persist bounded evidence records without host capabilities."""
+
+        payload = self._iteration_snapshot()
+        payload["proposals"] = [
+            {
+                "proposal": self._safe_iteration_proposal_dict(proposal),
+                "proposal_hash": self._iteration_proposal_hash(
+                    self._safe_iteration_proposal_dict(proposal)
+                ),
+            }
+            for proposal in list(self._iteration_proposals.values())[
+                -self._ITERATION_RECORD_LIMIT :
+            ]
+        ]
+        payload["receipts"] = [
+            {
+                "proposal_id": proposal_id,
+                "receipt": receipt.to_dict(),
+                "receipt_hash": receipt.receipt_hash,
+                # The receipt carries the evaluator-authoritative revision
+                # identity.  Do not persist a host-supplied source label/path.
+                "binding": {
+                    "revision_id": receipt.candidate_revision_id,
+                    "fingerprint": receipt.candidate_fingerprint,
+                },
+            }
+            for proposal_id, receipt in list(self._iteration_receipts.items())[
+                -self._ITERATION_RECORD_LIMIT :
+            ]
+            if proposal_id in self._iteration_proposals
+        ]
+        payload["outcomes"] = [
+            {
+                "proposal_id": proposal_id,
+                "outcome": self._safe_iteration_outcome_dict(outcome),
+                "outcome_hash": self._iteration_proposal_hash(
+                    self._safe_iteration_outcome_dict(outcome)
+                ),
+            }
+            for proposal_id, outcome in list(self._iteration_outcomes.items())[
+                -self._ITERATION_RECORD_LIMIT :
+            ]
+            if proposal_id in self._iteration_proposals
+        ]
+        return payload
+
+    def _restore_iteration_pipeline(self, snapshot: Mapping[str, Any]) -> None:
+        """Restore evidence only; never restore a host or an active write right."""
+
+        raw = snapshot.get("iteration_pipeline")
+        if not isinstance(raw, Mapping):
+            return
+        rejected = 0
+        raw_proposals = raw.get("proposals", ())
+        if isinstance(raw_proposals, (list, tuple)):
+            for item in list(raw_proposals)[-self._ITERATION_RECORD_LIMIT :]:
+                try:
+                    proposal_payload = item.get("proposal", item) if isinstance(item, Mapping) else item
+                    supplied_hash = (
+                        str(item.get("proposal_hash", "")).strip().lower()
+                        if isinstance(item, Mapping)
+                        else ""
+                    )
+                    if supplied_hash and (
+                        not re.fullmatch(r"[0-9a-f]{64}", supplied_hash)
+                        or supplied_hash != self._iteration_proposal_hash(proposal_payload)
+                    ):
+                        raise ValueError("proposal hash mismatch")
+                    proposal = ChangeProposal.from_dict(proposal_payload)
+                    if proposal is None or proposal.validate():
+                        rejected += 1
+                        continue
+                    if proposal.proposal_id not in self._iteration_proposals:
+                        self._remember_iteration_record(proposal)
+                except Exception:
+                    rejected += 1
+        raw_receipts = raw.get("receipts", ())
+        if isinstance(raw_receipts, (list, tuple)):
+            for item in list(raw_receipts)[-self._ITERATION_RECORD_LIMIT :]:
+                if not isinstance(item, Mapping):
+                    rejected += 1
+                    continue
+                proposal_id = str(item.get("proposal_id", ""))[:100]
+                if proposal_id not in self._iteration_proposals:
+                    rejected += 1
+                    continue
+                try:
+                    receipt_payload = item.get("receipt", {})
+                    supplied_receipt_hash = str(
+                        item.get("receipt_hash", "")
+                    ).strip().lower()
+                    receipt = EvaluationReceipt.from_dict(receipt_payload)
+                    if not receipt.verify():
+                        raise ValueError("receipt hash mismatch")
+                    if supplied_receipt_hash and supplied_receipt_hash != receipt.receipt_hash:
+                        raise ValueError("receipt envelope hash mismatch")
+                    binding = item.get("binding", {})
+                    if not isinstance(binding, Mapping):
+                        raise ValueError("candidate binding is invalid")
+                    revision_id = str(binding.get("revision_id", ""))[:160]
+                    fingerprint = str(binding.get("fingerprint", ""))[:128].lower()
+                    if (
+                        not revision_id
+                        or not re.fullmatch(r"[0-9a-zA-Z._-]{1,160}", revision_id)
+                        or not re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+                        or receipt.candidate_revision_id != revision_id
+                        or receipt.candidate_fingerprint != fingerprint
+                    ):
+                        raise ValueError("candidate binding does not match receipt")
+                    self._iteration_receipts[proposal_id] = receipt
+                    self._iteration_candidate_bindings[proposal_id] = {
+                        "revision_id": revision_id,
+                        "fingerprint": fingerprint,
+                    }
+                except Exception:
+                    rejected += 1
+        while len(self._iteration_receipts) > self._ITERATION_RECORD_LIMIT:
+            oldest_id = next(iter(self._iteration_receipts))
+            self._iteration_receipts.pop(oldest_id, None)
+            self._iteration_candidate_bindings.pop(oldest_id, None)
+        self._iteration_restore_rejected = min(
+            self._ITERATION_RECORD_LIMIT,
+            max(0, int(raw.get("restore_rejected", 0))) + rejected,
+        )
+
+    def iteration_pipeline_snapshot(self) -> dict[str, Any]:
+        """Read the P3 pipeline status without evaluating or writing anything."""
+
+        return self._iteration_snapshot()
+
+    def register_iteration_proposal(
+        self,
+        need: IterationNeed | Mapping[str, Any],
+        *,
+        host: Any,
+        title: str,
+        scope: str,
+        hypothesis: str,
+        evidence: Iterable[str] | None = None,
+        expected_benefits: Iterable[str] | None = None,
+        risks: Iterable[str] | None = None,
+        resource_budget: Mapping[str, Any] | None = None,
+        rollback_revision: str = "",
+        baseline_revision: str = "",
+        candidate_revision: str = "",
+    ) -> ChangeProposal:
+        """Register a candidate change request without touching source files.
+
+        ``IterationNeed`` is evidence only.  The returned
+        :class:`ChangeProposal` is immutable and remains unauthorized even if
+        hostile input attempts to set approval fields.  Registration stores a
+        bounded record in memory; it does not invoke the evaluator, spawn a
+        process, modify ``active_root`` or contact a remote repository.
+        """
+
+        self._require_iteration_host(host)
+        need_obj = self._coerce_iteration_need(need)
+        proposal = ChangeProposal.from_need(
+            need_obj,
+            title=title,
+            scope=scope,
+            hypothesis=hypothesis,
+            evidence=evidence or (),
+            expected_benefits=expected_benefits or (),
+            risks=risks or (),
+            resource_budget=resource_budget or {},
+            rollback_revision=rollback_revision,
+            baseline_revision=baseline_revision,
+        )
+        if candidate_revision:
+            proposal = replace(
+                proposal,
+                candidate_revision=str(candidate_revision)[:180],
+            )
+        issues = proposal.validate()
+        if issues:
+            raise ValueError("invalid change proposal: " + ", ".join(issues))
+        if proposal.proposal_id in self._iteration_proposals:
+            raise ValueError("proposal id collision")
+        self._remember_iteration_record(proposal)
+        self._sync_self_maintenance_projection()
+        return proposal
+
+    # A descriptive alias for hosts that use the ``ChangeProposal`` noun.
+    register_change_proposal = register_iteration_proposal
+
+    def evaluate_iteration_proposal(
+        self,
+        proposal: ChangeProposal | Mapping[str, Any],
+        candidate: str | CandidateRevision,
+        baseline: BaselineRevision | Mapping[str, Any] | str | None,
+        *,
+        host: Any,
+        mode: EvaluationMode | PromotionMode | str = EvaluationMode.EVOLUTION,
+        **kwargs: Any,
+    ) -> EvaluationReceipt:
+        """Evaluate one registered candidate through the host-bound harness.
+
+        Evaluation is explicit and local-only.  It returns immutable evidence
+        and never promotes or writes the active tree.  A configured
+        ``PromotionController`` is preferred because it additionally checks
+        that candidate and active roots are separate siblings.
+        """
+
+        self._require_iteration_host(host)
+        registered = self._require_registered_iteration_proposal(proposal)
+        if not registered.validate() == ():
+            # This branch is defensive for records restored from old snapshots;
+            # freshly registered proposals are validated above.
+            raise ValueError("registered change proposal is no longer valid")
+        descriptor = self._coerce_candidate_revision(candidate)
+        if registered.candidate_revision and (
+            registered.candidate_revision != descriptor.revision_id
+        ):
+            raise ValueError("candidate revision does not match proposal")
+        evaluator = self.evaluation_harness
+        if evaluator is None and self.promotion_controller is not None:
+            evaluator = getattr(self.promotion_controller, "harness", None)
+        if not isinstance(evaluator, EvaluationHarness):
+            raise RuntimeError(
+                "an EvaluationHarness must be injected before candidate evaluation"
+            )
+        evaluation_mode = (
+            mode.value if isinstance(mode, (EvaluationMode, PromotionMode)) else mode
+        )
+        if self.promotion_controller is not None:
+            receipt = self.promotion_controller.evaluate(
+                descriptor,
+                baseline,
+                mode=evaluation_mode,
+                **kwargs,
+            )
+        else:
+            receipt = evaluator.evaluate(
+                descriptor,
+                baseline,
+                mode=evaluation_mode,
+                **kwargs,
+            )
+        if not isinstance(receipt, EvaluationReceipt) or not receipt.verify():
+            raise ValueError("evaluator returned an invalid EvaluationReceipt")
+        self._iteration_candidate_bindings[registered.proposal_id] = {
+            "revision_id": descriptor.revision_id,
+            "fingerprint": descriptor.fingerprint,
+        }
+        self._iteration_receipts[registered.proposal_id] = receipt
+        # Keep receipt memory bounded even if proposals were restored from an
+        # older snapshot with fewer records.
+        while len(self._iteration_receipts) > self._ITERATION_RECORD_LIMIT:
+            oldest_id = next(iter(self._iteration_receipts))
+            self._iteration_receipts.pop(oldest_id, None)
+            self._iteration_candidate_bindings.pop(oldest_id, None)
+        self._sync_self_maintenance_projection()
+        return receipt
+
+    evaluate_iteration_candidate = evaluate_iteration_proposal
+
+    def promote_iteration_proposal(
+        self,
+        proposal: ChangeProposal | Mapping[str, Any],
+        candidate: str | CandidateRevision,
+        evaluation_receipt: EvaluationReceipt | Mapping[str, Any] | None = None,
+        *,
+        host: Any,
+        mode: PromotionMode | EvaluationMode | str | None = None,
+        authorized: bool | None = None,
+        sandbox_attestation: SandboxAttestation | Mapping[str, Any] | None = None,
+        attestation: SandboxAttestation | Mapping[str, Any] | None = None,
+    ) -> PromotionOutcome:
+        """Request one explicit promotion through ``PromotionController``.
+
+        No heartbeat/tick calls this method.  The host must opt in on every
+        invocation; ``authorized=True`` (or an equivalent host authorization
+        object) is required by the controller, and its production profile
+        still requires a one-time host-issued ``SandboxAttestation``.
+        """
+
+        self._require_iteration_host(host)
+        registered = self._require_registered_iteration_proposal(proposal)
+        # An active-tree write is a constitutional operation, not merely a
+        # controller capability.  Keep the check in the BrainStem seam so a
+        # host cannot use an injected PromotionController to bypass lifecycle
+        # or resource quarantine policy.  Evaluation remains available in
+        # CREATED/DEGRADED because it only creates isolated evidence.
+        if self._life_restore_blocked:
+            raise LifecycleError(
+                self._life_restore_error or "life restore is blocked"
+            )
+        if self.homeostasis.quarantine_latched:
+            raise LifecycleError("homeostasis quarantine is latched")
+        if self.life_kernel.is_terminal or self.life_kernel.state is LifecycleState.SUCCESSION_PENDING:
+            raise LifecycleError(
+                f"candidate promotion is denied in lifecycle state {self.life_kernel.state.value}"
+            )
+        if not self.life_kernel.allows_self_modification:
+            raise LifecycleError(
+                "candidate promotion requires an ACTIVE life kernel"
+            )
+        controller = self.promotion_controller
+        if not isinstance(controller, PromotionController):
+            raise RuntimeError(
+                "a PromotionController must be injected before candidate promotion"
+            )
+        descriptor = self._coerce_candidate_revision(candidate)
+        binding = self._iteration_candidate_bindings.get(registered.proposal_id)
+        if binding is None:
+            raise ValueError("candidate must be evaluated before promotion")
+        if (
+            binding.get("revision_id") != descriptor.revision_id
+            or binding.get("fingerprint") != descriptor.fingerprint
+        ):
+            raise ValueError("candidate differs from the evaluated proposal revision")
+        receipt = evaluation_receipt
+        if receipt is None:
+            receipt = self._iteration_receipts.get(registered.proposal_id)
+        if receipt is None:
+            raise ValueError("an EvaluationReceipt is required before promotion")
+        if not isinstance(receipt, EvaluationReceipt):
+            # Let the controller perform its strict mapping decoder, but do
+            # not permit arbitrary candidate-owned receipt objects.
+            if not isinstance(receipt, Mapping):
+                raise TypeError("evaluation_receipt must be an EvaluationReceipt or mapping")
+            receipt_obj = EvaluationReceipt.from_dict(receipt)
+        else:
+            receipt_obj = receipt
+        stored = self._iteration_receipts.get(registered.proposal_id)
+        if stored is not None and stored.receipt_hash != receipt_obj.receipt_hash:
+            raise ValueError("evaluation receipt does not match the registered proposal")
+        outcome = controller.promote(
+            descriptor,
+            receipt_obj,
+            mode=mode,
+            authorized=authorized,
+            host=host,
+            sandbox_attestation=sandbox_attestation,
+            attestation=attestation,
+        )
+        if not isinstance(outcome, PromotionOutcome):
+            raise ValueError("promotion controller returned an invalid outcome")
+        self._iteration_outcomes[registered.proposal_id] = outcome
+        while len(self._iteration_outcomes) > self._ITERATION_RECORD_LIMIT:
+            oldest_id = next(iter(self._iteration_outcomes))
+            self._iteration_outcomes.pop(oldest_id, None)
+        self._sync_self_maintenance_projection()
+        return outcome
+
+    promote_iteration_candidate = promote_iteration_proposal
+    promote_change_proposal = promote_iteration_proposal
+
+    def _apply_homeostasis_decision(self, decision) -> None:
+        """Tighten lifecycle state according to a resource decision."""
+        state = self.life_kernel.state
+        target = None
+        if decision.action is HomeostasisAction.QUARANTINE:
+            target = LifecycleState.QUARANTINED
+        elif decision.action is HomeostasisAction.DEGRADE:
+            target = LifecycleState.DEGRADED
+        elif decision.action is HomeostasisAction.SLEEP:
+            target = LifecycleState.SLEEPING
+        if target is None or state == target or self.life_kernel.is_terminal:
+            return
+        if target not in LifeKernel.allowed_transitions(state):
+            # CREATED cannot be safely skipped into quarantine.  The
+            # controller latch still closes admission and blocks start.
+            return
+        try:
+            self.life_kernel.transition(
+                target,
+                decision.reason,
+                event_type="homeostasis_" + decision.action.value.lower(),
+                metadata={
+                    "resource_tick": decision.tick,
+                    "ratios": dict(decision.ratios),
+                    "exceeded": list(decision.exceeded),
+                },
+            )
+        except LifecycleError as exc:
+            # The resource controller is already conservative; retain its
+            # decision and close admission if lifecycle persistence failed.
+            self._record_loop_error("homeostasis_transition", exc)
+
+    def observe_resources(
+        self,
+        usage: ResourceObservation | dict[str, Any],
+        *,
+        tick: int | None = None,
+        source: str = "runtime",
+        context: str = "",
+    ):
+        """Account for a trusted measurement and apply its safe response."""
+        if isinstance(usage, ResourceObservation):
+            observation = usage
+        elif isinstance(usage, dict):
+            observation = ResourceObservation(
+                tick=self.state.total_ticks if tick is None else tick,
+                usage=usage,
+                source=source,
+                context=context,
+            )
+        else:
+            raise TypeError("usage must be ResourceObservation or a mapping")
+        decision = self.homeostasis.observe(observation)
+        self._apply_homeostasis_decision(decision)
+        self._sync_self_maintenance_projection()
+        return decision
+
+    def clear_homeostasis_quarantine(
+        self,
+        *,
+        verified: bool,
+        evidence: str = "",
+    ) -> None:
+        """Enter RECOVERING only after an independent verification signal."""
+        if not verified:
+            raise PermissionError("independent verification is required")
+        self.homeostasis.clear_quarantine(verified=True)
+        if self.life_kernel.state is LifecycleState.QUARANTINED:
+            self.life_kernel.transition(
+                LifecycleState.RECOVERING,
+                str(evidence or "homeostasis quarantine independently cleared")[:500],
+                event_type="homeostasis_recovery_started",
+            )
+        self._sync_self_maintenance_projection()
+
+    def complete_homeostasis_recovery(
+        self,
+        *,
+        verified: bool,
+        evidence: str,
+    ) -> None:
+        """Return RECOVERING to ACTIVE only with explicit verified evidence."""
+        if not verified or not str(evidence).strip():
+            raise PermissionError("verified recovery evidence is required")
+        if self.homeostasis.quarantine_latched:
+            raise LifecycleError("homeostasis quarantine is still latched")
+        if self.life_kernel.state is not LifecycleState.RECOVERING:
+            raise LifecycleError("life instance is not recovering")
+        self.life_kernel.transition(
+            LifecycleState.ACTIVE,
+            str(evidence)[:500],
+            event_type="homeostasis_recovery_completed",
+        )
+        self._sync_self_maintenance_projection()
+
+    def authorize_environment_action(self, request: ActionRequest) -> ActionDecision:
+        """Delegate to an attached adapter; absence is an explicit denial."""
+        if not isinstance(request, ActionRequest):
+            raise TypeError("request must be an ActionRequest")
+        if self.homeostasis.quarantine_latched or self.life_kernel.state in {
+            LifecycleState.QUARANTINED,
+            LifecycleState.RECOVERING,
+            LifecycleState.SUCCESSION_PENDING,
+            LifecycleState.RETIRED,
+            LifecycleState.DEAD,
+        }:
+            return ActionDecision(
+                False,
+                "lifecycle or homeostasis state denies environment action",
+                request.request_hash,
+                self.controlled_environment.kind
+                if self.controlled_environment is not None
+                else EnvironmentKind.LIVING,
+            )
+        if self.controlled_environment is None:
+            return ActionDecision(
+                False,
+                "no controlled environment is attached",
+                request.request_hash,
+                EnvironmentKind.LIVING,
+            )
+        return self.controlled_environment.authorize(request)
+
+    # ── Disaster-only succession seam (P5) ──
+
+    def _succession_anchor_sink(self, payload: dict[str, Any]) -> bool:
+        """Persist a redacted successor anchor set when the host supports it."""
+        store = self.state_store
+        append = getattr(store, "append_anchor_set", None) if store is not None else None
+        if not callable(append):
+            append = getattr(store, "append_succession_anchor_set", None) if store is not None else None
+        if not callable(append):
+            return True
+        return bool(append(payload))
+
+    def _succession_record_sink(self, payload: dict[str, Any]) -> bool:
+        """Persist one immutable succession record through the host adapter."""
+        store = self.state_store
+        append = (
+            getattr(store, "append_succession_record", None)
+            if store is not None
+            else None
+        )
+        if not callable(append):
+            return True
+        return bool(append(payload))
+
+    def _get_succession_coordinator(self) -> SuccessionCoordinator:
+        coordinator = self.succession_coordinator
+        if coordinator is not None:
+            if coordinator.parent is not self.life_kernel:
+                raise SuccessionRuntimeError(
+                    "succession coordinator parent is not the current life kernel"
+                )
+            return coordinator
+        coordinator = SuccessionCoordinator(
+            self.life_kernel,
+            anchor_vault=self.anchor_vault,
+            succession_ledger=self.succession_ledger,
+            life_event_sink=self._life_event_sink if self.state_store is not None else None,
+            anchor_sink=self._succession_anchor_sink,
+            record_sink=self._succession_record_sink,
+            profile=self.succession_profile,
+            activation_attestor=self.succession_activation_attestor,
+        )
+        self.succession_coordinator = coordinator
+        self.anchor_vault = coordinator.anchor_vault
+        self.succession_ledger = coordinator.succession_ledger
+        self.succession_profile = coordinator.activation_profile
+        self.succession_activation_attestor = coordinator.activation_attestor
+        return coordinator
+
+    async def _stop_runtime_for_succession(self) -> None:
+        """Close runtime admission without recording an intermediate sleep."""
+        self._accepting_input = False
+        self._stop_event.set()
+        task = self._task
+        self._task = None
+        current = asyncio.current_task()
+        if task and task is not current:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                self._record_loop_error("succession_shutdown", exc)
+        self._discard_pending_inputs("succession boundary")
+        self._fail_all_waiters("succession boundary")
+        self._life_runtime_started = False
+        self.state.awake = False
+
+    async def succeed_to_next_generation(
+        self,
+        *,
+        failure: FailureAssessment | dict[str, Any],
+        anchors: AnchorSet | dict[str, Any],
+        reevaluated_anchor_ids=None,
+        evaluation_receipts=None,
+        successor_instance_id: str | None = None,
+        terminal_state: LifecycleState | str | None = None,
+    ) -> SuccessionOutcome:
+        """Execute a verified disaster handover and leave the child CREATED.
+
+        The caller must later provide an independent ``EvaluationReceipt`` to
+        :meth:`authorize_successor`; no automatic wake or environment binding
+        occurs here.
+        """
+        self._ensure_loop_primitives()
+        async with self._lifecycle_lock:
+            if self._successor_activation_required:
+                raise SuccessionRuntimeError("a successor is already awaiting evaluation")
+            await self._stop_runtime_for_succession()
+            coordinator = self._get_succession_coordinator()
+            parent_kernel = self.life_kernel
+            # The coordinator publishes a CREATED child genesis after it has
+            # sealed the parent.  Keep the parent's durable lease for all
+            # parent transitions, and open only the narrow genesis bypass in
+            # ``_life_event_sink`` until the coordinator returns.
+            self._life_handover_lineage = parent_kernel.lineage_id
+            self._life_handover_parent_generation = parent_kernel.generation
+            try:
+                outcome = coordinator.succeed(
+                    failure=failure,
+                    anchors=anchors,
+                    reevaluated_anchor_ids=reevaluated_anchor_ids,
+                    evaluation_receipts=evaluation_receipts,
+                    successor_instance_id=successor_instance_id,
+                    terminal_state=terminal_state,
+                )
+            except Exception:
+                self._life_handover_lineage = ""
+                self._life_handover_parent_generation = None
+                # A failed handover never leaves a live parent lease behind
+                # when the parent was sealed; if it remained non-terminal the
+                # next explicit start may reclaim a fresh lease safely.
+                self._release_life_control(parent_kernel)
+                # Runtime admission remains closed after an unsuccessful
+                # attempt; the parent itself is left untouched unless the
+                # coordinator had already crossed its explicit freeze point.
+                self._sync_life_projection()
+                raise
+            self._life_handover_lineage = ""
+            self._life_handover_parent_generation = None
+            # The parent is terminal after a successful handover.  Release its
+            # exact durable proof before exposing the CREATED child; the child
+            # will claim control only after independent activation evidence.
+            self._release_life_control(parent_kernel)
+            self.succession_coordinator = coordinator
+            self.anchor_vault = coordinator.anchor_vault
+            self.succession_ledger = coordinator.succession_ledger
+            self.life_kernel = outcome.successor
+            self._life_sink_attached = False
+            self._life_runtime_started = False
+            self._successor_activation_required = True
+            self._successor_evaluation_receipt_hash = ""
+            self.state.awake = False
+            self._sync_life_projection()
+            saved = await self._snapshot_state()
+            if saved is False:
+                self._record_loop_error(
+                    "succession_snapshot",
+                    "successor is durable only through its append-only ledgers",
+                )
+            return outcome
+
+    # Vocabulary aliases used by embedders and operator scripts.
+    begin_succession = succeed_to_next_generation
+    create_successor = succeed_to_next_generation
+
+    async def authorize_successor(
+        self,
+        evaluation_receipt: Any,
+        *,
+        activation_attestation: SuccessorActivationAttestation | Mapping[str, Any] | None = None,
+        attestation: SuccessorActivationAttestation | Mapping[str, Any] | None = None,
+    ) -> LifeKernel:
+        """Open the child lifecycle only after an independent hard-gate receipt."""
+        self._ensure_loop_primitives()
+        async with self._lifecycle_lock:
+            coordinator = self.succession_coordinator
+            if coordinator is None or coordinator.successor is None:
+                raise SuccessionRuntimeError("no successor is waiting for evaluation")
+            if self.life_kernel is not coordinator.successor:
+                raise SuccessionRuntimeError("current life kernel is not the successor")
+            if (
+                activation_attestation is not None
+                and attestation is not None
+                and activation_attestation != attestation
+            ):
+                raise SuccessionRuntimeError(
+                    "activation_attestation and attestation disagree"
+                )
+            supplied_attestation = (
+                activation_attestation
+                if activation_attestation is not None
+                else attestation
+            )
+            # Preflight the independent proof before reserving the child in
+            # the durable lease table.  ``activate_successor`` repeats these
+            # checks and consumes a production nonce only after the claim is
+            # ready, so a rejected proof cannot strand the lineage lease.
+            coordinator._verified_evaluation_receipt(evaluation_receipt)
+            if coordinator.require_activation_attestation:
+                if coordinator.activation_attestor is None or supplied_attestation is None:
+                    raise SuccessionRuntimeError(
+                        "production successor activation requires a host-issued attestation"
+                    )
+                coordinator.activation_attestor.validate(
+                    supplied_attestation,
+                    outcome=coordinator.outcome,
+                    evaluation_receipt=evaluation_receipt,
+                    consume=False,
+                )
+            elif supplied_attestation is not None:
+                if coordinator.activation_attestor is None:
+                    raise SuccessionRuntimeError(
+                        "activation attestor is required to consume an attestation"
+                    )
+                coordinator.activation_attestor.validate(
+                    supplied_attestation,
+                    outcome=coordinator.outcome,
+                    evaluation_receipt=evaluation_receipt,
+                    consume=False,
+                )
+            child = coordinator.successor
+            self._claim_life_control(child)
+            try:
+                child = coordinator.activate_successor(
+                    evaluation_receipt,
+                    activation_attestation=activation_attestation,
+                    attestation=attestation,
+                )
+            except Exception:
+                self._release_life_control(child)
+                raise
+            self._successor_activation_required = False
+            if isinstance(evaluation_receipt, Mapping):
+                receipt_hash = evaluation_receipt.get("receipt_hash", "")
+            else:
+                receipt_hash = getattr(evaluation_receipt, "receipt_hash", "")
+            self._successor_evaluation_receipt_hash = str(receipt_hash).strip().lower()
+            self._sync_life_projection()
+            saved = await self._snapshot_state()
+            if saved is False:
+                self._record_loop_error(
+                    "successor_activation_snapshot",
+                    "activation ledger is durable but the bounded snapshot was rejected",
+                )
+            return child
+
+    activate_successor = authorize_successor
+
+    # ── Durable life-control lease ──
+
+    @staticmethod
+    def _has_any_life_lease_api(store: Any) -> bool:
+        """Detect a partially exposed lease adapter and fail closed.
+
+        A duck-typed host that exposes only some fenced methods must not fall
+        back to the historical unleased callback: that would make a typo in
+        the capability contract look like successful persistence.
+        """
+
+        return bool(
+            store is not None
+            and any(
+                callable(getattr(store, name, None))
+                for name in (
+                    "claim_life_control",
+                    "renew_life_control",
+                    "release_life_control",
+                    "append_life_event_with_lease",
+                    "append_life_event_handover",
+                )
+            )
+        )
+
+    def _durable_life_control_available(self) -> bool:
+        """Return whether the attached store exposes the fenced lease seam."""
+
+        store = self.state_store
+        return bool(
+            store is not None
+            and callable(getattr(store, "claim_life_control", None))
+            and callable(getattr(store, "renew_life_control", None))
+            and callable(getattr(store, "release_life_control", None))
+            and callable(getattr(store, "append_life_event_with_lease", None))
+            and callable(getattr(store, "append_life_event", None))
+        )
+
+    def _validate_life_control_policy(self) -> None:
+        """Validate the persistence mode before any lifecycle replay/write."""
+
+        store = self.state_store
+        if store is None:
+            return
+        if self.life_control_mode == "legacy":
+            if self._has_any_life_lease_api(store):
+                raise LifecycleError(
+                    "legacy life control cannot downgrade an adapter that exposes fenced leases"
+                )
+            if not callable(getattr(store, "append_life_event", None)):
+                raise LifecycleError(
+                    "legacy life control requires an append_life_event adapter"
+                )
+            return
+        if not self._durable_life_control_available():
+            raise LifecycleError(
+                "persistent life control requires a fenced StateStore lease API"
+            )
+
+    def _durable_life_handover_available(self) -> bool:
+        """Return whether the store also supports the child-genesis seam."""
+
+        return bool(
+            self._durable_life_control_available()
+            and self.state_store is not None
+            and callable(getattr(self.state_store, "append_life_event_handover", None))
+        )
+
+    def _claim_life_control(self, kernel: LifeKernel | None = None):
+        """Claim the exact kernel before any durable lifecycle transition.
+
+        ``StateStore`` claims are cross-process and fenced.  A stem without a
+        persistent store retains the in-process ``SuccessionCoordinator``
+        guard for backwards-compatible embeddings.  The returned lease is
+        intentionally kept only in memory; it is never serialized.
+        """
+
+        target = kernel or self.life_kernel
+        if not isinstance(target, LifeKernel):
+            raise TypeError("kernel must be a LifeKernel")
+        if self.state_store is None or self.life_control_mode == "legacy":
+            try:
+                SuccessionCoordinator.claim_control(
+                    target, owner=self._life_local_control_token
+                )
+            except Exception as exc:
+                raise LifecycleError("process-local life control claim failed") from exc
+            self._life_local_control_kernel = target
+            return None
+        if not self._durable_life_control_available():
+            raise LifecycleError(
+                "persistent life control requires a fenced StateStore lease API"
+            )
+        claim = self.state_store.claim_life_control
+        try:
+            lease = claim(
+                target.lineage_id,
+                target.instance_id,
+                self._life_control_owner_id,
+                generation=target.generation,
+                ttl_sec=self._life_control_ttl_sec,
+                expected_last_event_hash=target.ledger.last_hash,
+            )
+        except Exception as exc:
+            raise LifecycleError("life-control lease claim failed") from exc
+        if lease is None:
+            raise LifecycleError(
+                "another process owns this lineage or its lifecycle head diverged"
+            )
+        try:
+            # Keep the process-local guard as a second, cheap split-brain
+            # barrier.  If it rejects, release the durable row immediately.
+            SuccessionCoordinator.claim_control(
+                target, owner=self._life_local_control_token
+            )
+        except Exception as exc:
+            try:
+                self.state_store.release_life_control(lease)
+            except Exception:
+                pass
+            raise LifecycleError("process-local life control claim failed") from exc
+        if target is self.life_kernel:
+            self._life_control_lease = lease
+            self._life_control_lost = False
+            self._life_control_next_renew_at = (
+                time.monotonic() + self._life_control_renew_interval_sec
+            )
+        self._life_local_control_kernel = target
+        return lease
+
+    def _release_life_control(self, kernel: LifeKernel | None = None) -> None:
+        """Release only this stem's exact lease, retaining fencing tombstones."""
+
+        target = kernel or self.life_kernel
+        lease = self._life_control_lease
+        if lease is not None and (
+            target is self.life_kernel
+            or (
+                lease.lineage_id == target.lineage_id
+                and lease.instance_id == target.instance_id
+                and lease.generation == target.generation
+            )
+        ):
+            try:
+                release = getattr(self.state_store, "release_life_control", None)
+                if callable(release):
+                    release(lease)
+            except Exception:
+                # A lost/expired lease is already fenced; never replace it
+                # with an unverified delete or make shutdown unsafe.
+                pass
+            if target is self.life_kernel or (
+                lease.lineage_id == target.lineage_id
+                and lease.instance_id == target.instance_id
+                and lease.generation == target.generation
+            ):
+                self._life_control_lease = None
+                self._life_control_next_renew_at = 0.0
+        if self._life_local_control_kernel is target:
+            SuccessionCoordinator.release_control(
+                target, owner=self._life_local_control_token
+            )
+            self._life_local_control_kernel = None
+
+    def _mark_life_control_lost(self, reason: str) -> None:
+        """Close admission after a durable lease cannot be proven."""
+
+        self._life_control_lost = True
+        self._accepting_input = False
+        self._life_restore_error = str(reason or "life-control lease lost")[:300]
+        self._sync_life_projection()
+
+    def _renew_life_control(self, *, force: bool = False) -> bool:
+        """Renew the fenced lease before its TTL can elapse."""
+
+        lease = self._life_control_lease
+        if lease is None or self.state_store is None:
+            return not self._life_control_lost
+        now_mono = time.monotonic()
+        if not force and now_mono < self._life_control_next_renew_at:
+            return True
+        renew = getattr(self.state_store, "renew_life_control", None)
+        if not callable(renew):
+            self._mark_life_control_lost("life-control renewal API disappeared")
+            return False
+        try:
+            refreshed = renew(lease, ttl_sec=self._life_control_ttl_sec)
+        except Exception:
+            refreshed = None
+        if refreshed is None:
+            self._mark_life_control_lost("life-control lease expired or was fenced")
+            return False
+        self._life_control_lease = refreshed
+        self._life_control_next_renew_at = (
+            now_mono + self._life_control_renew_interval_sec
+        )
+        self._life_control_lost = False
+        return True
 
     def _life_event_sink(self, event: dict[str, Any]) -> bool:
         """Persist one kernel event through the configured INSERT-only store."""
         store = self.state_store
         append = getattr(store, "append_life_event", None) if store is not None else None
         if not callable(append):
+            if self._has_any_life_lease_api(store):
+                self._mark_life_control_lost(
+                    "persistent life adapter is missing its replay append API"
+                )
+                return False
             # A custom in-memory StateStore-like adapter may not implement the
             # optional constitutional table.  Keep the kernel usable in that
             # embedding, while real ``StateStore`` instances always expose it.
             return True
+        # Existing history is replayed while restoring a kernel.  Replay is a
+        # read/verify path and must not require a live ownership lease; the
+        # append adapter remains idempotent and validates the immutable event.
+        if self._life_replay_mode:
+            return bool(append(event))
+
+        # A CREATED successor's genesis is published as continuity evidence
+        # before activation and deliberately has no *child* lease.  The
+        # parent's durable proof is still held and the dedicated handover
+        # adapter validates it while inserting the cross-generation event.
+        if self._life_handover_lineage and isinstance(event, Mapping):
+            try:
+                is_child_genesis = (
+                    str(event.get("lineage_id", "")) == self._life_handover_lineage
+                    and str(event.get("event_type", "")) == "created"
+                    and int(event.get("sequence", 0) or 0) == 1
+                    and int(event.get("generation", -1) or -1)
+                    == int(
+                        self._life_handover_parent_generation
+                        if self._life_handover_parent_generation is not None
+                        else -1
+                    )
+                    + 1
+                )
+            except (TypeError, ValueError, OverflowError):
+                is_child_genesis = False
+            if is_child_genesis:
+                lease = self._life_control_lease
+                handover_append = getattr(store, "append_life_event_handover", None)
+                if lease is not None and self._durable_life_handover_available():
+                    try:
+                        accepted = bool(
+                            handover_append(
+                                event,
+                                lease,
+                                successor_instance_id=event.get("instance_id"),
+                            )
+                        )
+                    except Exception:
+                        accepted = False
+                    if not accepted:
+                        self._mark_life_control_lost(
+                            "durable succession genesis rejected by lease"
+                        )
+                        return False
+                    try:
+                        self._life_control_lease = replace(
+                            lease,
+                            last_event_hash=str(event.get("event_hash", ""))
+                            .strip()
+                            .lower(),
+                        )
+                    except Exception:
+                        self._mark_life_control_lost(
+                            "durable succession head update failed"
+                        )
+                        return False
+                    return True
+                # A persistent adapter that exposes any lease seam but not the
+                # dedicated cross-generation transaction must fail closed; an
+                # unleased child insert would reopen the injection window.
+                if self._has_any_life_lease_api(store):
+                    self._mark_life_control_lost(
+                        "durable succession handover API is not bound"
+                    )
+                    return False
+                try:
+                    return bool(append(event))
+                except Exception:
+                    return False
+
+        lease = self._life_control_lease
+        lease_append = getattr(store, "append_life_event_with_lease", None)
+        if lease is not None and callable(lease_append):
+            try:
+                accepted = bool(lease_append(event, lease))
+            except Exception:
+                accepted = False
+            if not accepted:
+                self._mark_life_control_lost("durable lifecycle append rejected by lease")
+                return False
+            # The immutable lease object is refreshed locally after the atomic
+            # append so the next transition presents the new predecessor hash.
+            event_hash = str(event.get("event_hash", "")).strip().lower()
+            if event_hash:
+                try:
+                    self._life_control_lease = replace(
+                        self._life_control_lease,
+                        last_event_hash=event_hash,
+                    )
+                except Exception:
+                    self._mark_life_control_lost("durable lifecycle head update failed")
+                    return False
+            return True
+
+        # A persistent adapter without the fenced append seam must not be
+        # allowed to write lifecycle transitions through the old unguarded
+        # callback.  Custom in-memory adapters remain compatible only when no
+        # durable lease API is present at all.
+        if self._has_any_life_lease_api(store):
+            self._mark_life_control_lost("durable lifecycle lease is not bound")
+            return False
         return bool(append(event))
 
     def _attach_life_sink(self, kernel: LifeKernel) -> None:
@@ -329,14 +1893,26 @@ class BrainStem:
         if self.state_store is None:
             self._life_sink_attached = False
             return
+        # This method is also reachable from direct restore/activation helpers,
+        # so the startup preflight cannot be its only guard.  Validate before
+        # ``replay=True`` might invoke the adapter with the kernel genesis.
+        self._validate_life_control_policy()
         if self._life_sink_attached and kernel is self.life_kernel:
             return
         append = getattr(self.state_store, "append_life_event", None)
         if not callable(append):
+            if self._has_any_life_lease_api(self.state_store):
+                raise LifecycleError(
+                    "persistent life adapter is missing its replay append API"
+                )
             self._life_sink_attached = False
             return
-        kernel.attach_event_sink(self._life_event_sink, replay=True)
-        self._life_sink_attached = True
+        self._life_replay_mode = True
+        try:
+            kernel.attach_event_sink(self._life_event_sink, replay=True)
+            self._life_sink_attached = True
+        finally:
+            self._life_replay_mode = False
 
     def _load_life_events(self, *, instance_id: str | None = None) -> list[dict]:
         """Read the permanent lifecycle table without swallowing I/O errors."""
@@ -483,6 +2059,17 @@ class BrainStem:
                     )
                     snap_events = candidate.ledger.events
                     durable_events = durable_candidate.ledger.events
+                    # A durable ledger is the continuity authority.  A
+                    # shorter durable prefix means history was truncated or
+                    # the store returned an incomplete view; trusting the
+                    # snapshot suffix in that case could resurrect an event
+                    # that no longer has a durable predecessor.  Block
+                    # startup instead of silently choosing the longer,
+                    # potentially stale projection.
+                    if len(durable_events) < len(snap_events):
+                        raise LedgerIntegrityError(
+                            "durable life ledger is shorter than the snapshot"
+                        )
                     common = min(len(snap_events), len(durable_events))
                     if any(
                         snap_events[index].event_hash
@@ -522,8 +2109,32 @@ class BrainStem:
         """Apply only safe wake edges; never auto-revive quarantine/terminal states."""
         if self._life_restore_blocked:
             raise LifecycleError(self._life_restore_error or "life restore is blocked")
+        self._validate_life_control_policy()
         try:
             state = self.life_kernel.state
+            if getattr(self, "_successor_activation_required", False):
+                # A CREATED successor is an audit artifact until an
+                # independently verified evaluator receipt is presented.
+                # Ordinary ``start()`` must not turn succession into an
+                # implicit self-approval.
+                raise LifecycleError(
+                    "successor awaits independent evaluation before start"
+                )
+            # Claim durable ownership before any wake/quarantine transition.
+            # The event sink then checks the same token/fencing/head inside
+            # the SQLite transaction that appends each lifecycle event.
+            self._claim_life_control(self.life_kernel)
+            if self.homeostasis.quarantine_latched:
+                # A latched resource alarm survives restart.  If the
+                # lifecycle is still wakeable, make the quarantine explicit
+                # before refusing startup; never silently resume work.
+                if LifecycleState.QUARANTINED in LifeKernel.allowed_transitions(state):
+                    self.life_kernel.transition(
+                        LifecycleState.QUARANTINED,
+                        "持久化资源稳态告警，启动前保持隔离",
+                        event_type="homeostasis_quarantine_restore",
+                    )
+                raise LifecycleError("homeostasis quarantine is latched")
             if state == LifecycleState.CREATED:
                 self.life_kernel.transition(
                     LifecycleState.BOOTSTRAPPING,
@@ -549,9 +2160,182 @@ class BrainStem:
                 )
         except LifecycleError:
             self._accepting_input = False
+            # A failed startup must not leave a valid lease owned by a stem
+            # that never reached ACTIVE.  Expired/taken-over rows are safely
+            # retained as fencing tombstones by the store.
+            self._release_life_control(self.life_kernel)
             self._sync_life_projection()
             raise
         self._sync_life_projection()
+
+    def _restore_succession_runtime(self, snapshot: dict) -> None:
+        """Restore and cross-check the parent/child succession boundary."""
+        raw_runtime = snapshot.get("succession_runtime") if isinstance(snapshot, dict) else None
+        raw_activation = snapshot.get("succession_activation") if isinstance(snapshot, dict) else None
+        if raw_runtime is None:
+            # A bounded snapshot may be gone while the permanent P5 tables
+            # remain.  Rebuild from those tables when available; otherwise a
+            # pre-P5 snapshot has no succession state and must not infer one
+            # from the compact ``life`` projection.
+            if self._restore_succession_from_durable_store():
+                return
+            # A generation>0 kernel with a parent is only ever created by
+            # the succession boundary.  If its P5 record/anchor proof is not
+            # available, treating it as an ordinary CREATED organism would
+            # let a partial handover bypass the independent activation gate
+            # after restart.  Fail closed and require operator recovery.
+            if (
+                self.life_kernel.generation > 0
+                and self.life_kernel.parent_instance_id
+            ):
+                self._mark_life_restore_blocked(
+                    "successor continuity ledger has no complete succession boundary"
+                )
+                raise LifecycleError(
+                    "successor continuity proof is missing; startup is blocked"
+                )
+            self.succession_coordinator = None
+            self._successor_activation_required = False
+            self._successor_evaluation_receipt_hash = ""
+            return
+        if not isinstance(raw_runtime, dict):
+            self._mark_life_restore_blocked("succession runtime snapshot is invalid")
+            raise LifecycleError("succession runtime snapshot is invalid")
+        try:
+            coordinator = SuccessionCoordinator.from_snapshot(
+                raw_runtime,
+                # The host's configured profile is authoritative; a mutable
+                # snapshot may not downgrade production to legacy on restart.
+                profile=self.succession_profile,
+                activation_attestor=self.succession_activation_attestor,
+            )
+        except Exception as exc:
+            self._mark_life_restore_blocked(exc)
+            raise LifecycleError(f"succession restore is blocked: {str(exc)[:240]}") from exc
+
+        current = self.life_kernel
+        designated = coordinator.successor or coordinator.parent
+        if (
+            current.lineage_id != designated.lineage_id
+            or current.instance_id != designated.instance_id
+            or current.generation != designated.generation
+            or current.ledger.last_hash != designated.ledger.last_hash
+        ):
+            self._mark_life_restore_blocked(
+                "snapshot life kernel and succession designated instance diverge"
+            )
+            raise LifecycleError("snapshot life kernel and succession state diverge")
+        self.succession_coordinator = coordinator
+        self.anchor_vault = coordinator.anchor_vault
+        self.succession_ledger = coordinator.succession_ledger
+        required = False
+        receipt_hash = ""
+        if raw_activation is not None:
+            if not isinstance(raw_activation, dict):
+                self._mark_life_restore_blocked("succession activation projection is invalid")
+                raise LifecycleError("succession activation projection is invalid")
+            required = bool(raw_activation.get("required", False))
+            receipt_hash = str(raw_activation.get("receipt_hash", "")).strip()
+        elif coordinator.successor is not None:
+            required = coordinator.successor.state == LifecycleState.CREATED
+        if coordinator.successor is None and required:
+            self._mark_life_restore_blocked(
+                "activation gate is set without a successor"
+            )
+            raise LifecycleError("activation gate is set without a successor")
+        if coordinator.successor is not None:
+            child_state = coordinator.successor.state
+            if required and child_state != LifecycleState.CREATED:
+                self._mark_life_restore_blocked(
+                    "activation gate disagrees with successor lifecycle state"
+                )
+                raise LifecycleError("activation gate disagrees with successor state")
+            if not required and child_state == LifecycleState.CREATED:
+                self._mark_life_restore_blocked(
+                    "successor is CREATED without an activation gate"
+                )
+                raise LifecycleError("successor activation boundary is incomplete")
+        self._successor_activation_required = required
+        self._successor_evaluation_receipt_hash = receipt_hash
+        # The current life kernel has already been rebuilt from the durable
+        # lifecycle table.  Keep it as the source of truth and only attach the
+        # coordinator's child sink after the cross-check above.
+        if coordinator.successor is not None:
+            # ``from_snapshot`` necessarily creates a fresh LifeKernel
+            # object.  The identity/hash cross-check above proves equivalence;
+            # use the coordinator's object so subsequent authorization and
+            # lifecycle transitions cannot accidentally split the child view.
+            self.life_kernel = coordinator.successor
+            self._life_sink_attached = False
+            if self.state_store is not None:
+                try:
+                    self._attach_life_sink(self.life_kernel)
+                except (LifecycleError, ValueError, TypeError) as exc:
+                    self._mark_life_restore_blocked(exc)
+                    raise LifecycleError("successor life ledger attachment failed") from exc
+        self._sync_life_projection()
+
+    def _restore_succession_from_durable_store(self) -> bool:
+        """Recover P5 state after loss of the bounded BrainState snapshot."""
+        store = self.state_store
+        load_records = getattr(store, "load_succession_record_objects", None) if store is not None else None
+        load_anchors = getattr(store, "load_anchor_set_objects", None) if store is not None else None
+        if not callable(load_records) or not callable(load_anchors):
+            return False
+        try:
+            records = list(load_records(lineage_id=self.life_kernel.lineage_id))
+            if not records:
+                return False
+            anchors = list(load_anchors(lineage_id=self.life_kernel.lineage_id))
+            if not anchors:
+                raise LifecycleError("durable succession records have no anchor vault")
+            latest = records[-1]
+            if latest.successor_instance_id != self.life_kernel.instance_id:
+                raise LifecycleError(
+                    "durable succession successor differs from current life instance"
+                )
+            load_parent_events = self._load_life_events(
+                instance_id=latest.parent_instance_id
+            )
+            if not load_parent_events:
+                raise LifecycleError("durable succession parent life ledger is missing")
+            parent = self._kernel_from_life_events(
+                load_parent_events,
+                preferred_instance_id=latest.parent_instance_id,
+            )
+            from brain.succession import AnchorVault, SuccessionLedger
+
+            vault = AnchorVault(anchor_sets=anchors)
+            ledger = SuccessionLedger(records=records)
+            coordinator = SuccessionCoordinator.from_components(
+                parent,
+                self.life_kernel,
+                anchor_vault=vault,
+                succession_ledger=ledger,
+                life_event_sink=self._life_event_sink if store is not None else None,
+                anchor_sink=self._succession_anchor_sink,
+                record_sink=self._succession_record_sink,
+                profile=self.succession_profile,
+                activation_attestor=self.succession_activation_attestor,
+            )
+            self.succession_coordinator = coordinator
+            self.anchor_vault = vault
+            self.succession_ledger = ledger
+            self.succession_profile = coordinator.activation_profile
+            self.succession_activation_attestor = coordinator.activation_attestor
+            self._successor_activation_required = (
+                self.life_kernel.state == LifecycleState.CREATED
+            )
+            self._successor_evaluation_receipt_hash = ""
+            self._life_sink_attached = False
+            self._attach_life_sink(self.life_kernel)
+            self._sync_life_projection()
+            return True
+        except Exception as exc:
+            self._mark_life_restore_blocked(exc)
+            raise LifecycleError(
+                f"durable succession restore is blocked: {str(exc)[:240]}"
+            ) from exc
 
     def _enter_life_sleep(self) -> None:
         """Record an orderly process stop without changing terminal states."""
@@ -663,12 +2447,29 @@ class BrainStem:
         if self._task and not self._task.done():
             return
         self._task = None
+        # A prior stopped/failed start may have left a process-local or
+        # durable lease on this exact object.  Release only our own proof
+        # before a durable snapshot rebuilds an equivalent kernel; another
+        # owner uses a different token and is unaffected.
+        self._release_life_control(self.life_kernel)
+        self._life_control_lost = False
 
         if self._life_restore_blocked:
             self._accepting_input = False
             raise LifecycleError(
                 self._life_restore_error or "life kernel restore is blocked"
             )
+
+        # Check the durable capability before replaying a snapshot into an
+        # adapter.  A partial/legacy persistent adapter must not receive a
+        # genesis event and only then discover that startup cannot claim a
+        # fenced owner.  Hosts that knowingly retain an old adapter may opt in
+        # to ``life_control_mode='legacy'``; that mode is process-local only.
+        try:
+            self._validate_life_control_policy()
+        except LifecycleError:
+            self._accepting_input = False
+            raise
 
         logger.info("brain-stem: consciousness loop starting")
         self._stop_event.clear()
@@ -681,7 +2482,10 @@ class BrainStem:
 
         # Restore state before starting the loop.  Starting the task first
         # allowed a tick to race with state replacement and lose continuity.
-        if self.state_store:
+        # Some persistence adapters intentionally implement ``__len__`` and
+        # are falsey while empty; configuration must be tested by identity,
+        # not truthiness, or restart snapshots/lease renewal silently vanish.
+        if self.state_store is not None:
             try:
                 restored = self.state_store.load_latest()
             except Exception as exc:
@@ -708,6 +2512,29 @@ class BrainStem:
                 self._restore_life(None)
         else:
             self._restore_life(None)
+
+        # When the bounded snapshot journal is empty, the permanent life
+        # ledger may still point at a gated successor.  Reconstruct that P5
+        # boundary before any ordinary wake edge is considered.
+        if self.succession_coordinator is None:
+            restored_succession = self._restore_succession_from_durable_store()
+            if (
+                not restored_succession
+                and self.life_kernel.generation > 0
+                and self.life_kernel.parent_instance_id
+            ):
+                # A generation-bearing kernel with a parent can only be a
+                # successor.  If the durable handover record/anchor proof is
+                # absent, do not let the ordinary CREATED -> ACTIVE wake path
+                # manufacture an apparently healthy child after a partial
+                # sink failure.  The operator must restore the missing proof
+                # or explicitly quarantine/recover the instance.
+                self._mark_life_restore_blocked(
+                    "successor continuity ledger has no complete succession boundary"
+                )
+                raise LifecycleError(
+                    "successor continuity proof is missing; startup is blocked"
+                )
 
         try:
             self._prepare_life_for_start()
@@ -805,6 +2632,7 @@ class BrainStem:
                 self._sync_life_projection()
                 raise
             self.state.awake = False
+            self._release_life_control(self.life_kernel)
             self._sync_life_projection()
             await self._snapshot_state()
             return self.life_kernel.public_snapshot()
@@ -844,6 +2672,12 @@ class BrainStem:
             # kernel state and surface a durable-sink failure in health data;
             # do not claim that sleep was committed when it was not.
             self._record_loop_error("life_sleep", exc)
+
+        # A stopped (SLEEPING) instance no longer owns the in-process control
+        # lease.  A later explicit start may reclaim this same instance; a
+        # second ACTIVE organism is still prevented by the claim in
+        # ``_prepare_life_for_start``.
+        self._release_life_control(self.life_kernel)
 
         # Final snapshot
         try:
@@ -1039,6 +2873,8 @@ class BrainStem:
         life_rejection = None
         if self._life_restore_blocked:
             life_rejection = self._life_restore_error or "life kernel restore is blocked"
+        elif getattr(self, "homeostasis", None) is not None and self.homeostasis.quarantine_latched:
+            life_rejection = "homeostasis quarantine is latched"
         elif self.life_kernel.is_terminal:
             life_rejection = f"life kernel is terminal ({self.life_kernel.state.value})"
         elif self._life_runtime_started and not self.life_kernel.accepts_input:
@@ -1134,6 +2970,12 @@ class BrainStem:
         logger.info("brain-stem: loop started")
 
         while not self._stop_event.is_set():
+            # Fencing is checked at the heartbeat boundary.  If another host
+            # has taken over an expired lease, stop admission before another
+            # cognitive/action cycle can run under stale authority.
+            if not self._renew_life_control():
+                self._stop_event.set()
+                break
             tick_start = datetime.now(timezone.utc)
 
             try:
@@ -1143,6 +2985,29 @@ class BrainStem:
             except Exception as e:
                 self._record_loop_error("tick", e)
                 self._fail_active_input(str(e)[:200])
+
+            # Account for the completed heartbeat as a bounded observation.
+            # This is deliberately logical accounting (elapsed compute time),
+            # not unrestricted host introspection.  A failure in the optional
+            # accounting seam must not crash the heartbeat; its controller
+            # remains fail-closed for explicitly supplied observations.
+            try:
+                elapsed_ms = max(
+                    0.0,
+                    (datetime.now(timezone.utc) - tick_start).total_seconds() * 1000.0,
+                )
+                # Keep a conservative bounded fallback when a wall-clock
+                # adjustment makes the measurement implausible.
+                if not math.isfinite(elapsed_ms) or elapsed_ms > 24 * 60 * 60 * 1000:
+                    elapsed_ms = 0.0
+                self.observe_resources(
+                    {"compute_ms": min(elapsed_ms, 60_000.0)},
+                    tick=self.state.total_ticks,
+                    source="heartbeat",
+                    context="completed heartbeat tick",
+                )
+            except Exception as exc:
+                self._record_loop_error("homeostasis_observe", exc)
 
             self.state.total_ticks += 1
             self.state.last_heartbeat_at = datetime.now(timezone.utc).isoformat()
@@ -2812,11 +4677,93 @@ class BrainStem:
         # BrainState has its own defensive decoder and is the source of truth
         # for self-model, curiosity, activation, and per-source sessions.
         self.state = BrainState.from_snapshot(snapshot)
+        # Restore only hash-addressed P3 evidence.  Host capabilities,
+        # evaluator instances and candidate paths are intentionally never
+        # reconstructed from a snapshot; every later evaluation/promotion
+        # must receive a fresh explicit host binding.
+        self._restore_iteration_pipeline(snapshot)
         # Restore the constitutional seam separately from mutable cognition.
         # A malformed life snapshot is never downgraded to a fresh identity;
         # ``_restore_life`` marks the stem blocked and raises instead.
         self._restore_life(snapshot)
+        self._restore_succession_runtime(snapshot)
+        # A controlled environment is an authority boundary, not ordinary
+        # mutable cognition.  Its root and network policy must be supplied by
+        # the host on every restart; a snapshot may restore only the
+        # hash-chained audit trail under that already-bound policy.  Refusing
+        # to invent an environment here prevents a tampered snapshot from
+        # redirecting the organism to an arbitrary host directory or enabling
+        # networking after restart.
+        raw_environment = snapshot.get("controlled_environment")
+        if raw_environment is not None:
+            if not isinstance(raw_environment, dict):
+                self._mark_life_restore_blocked(
+                    "controlled environment snapshot is invalid"
+                )
+                raise LifecycleError("controlled environment restore is blocked")
+            configured_environment = self.controlled_environment
+            if configured_environment is None:
+                self._mark_life_restore_blocked(
+                    "controlled environment must be injected before restore"
+                )
+                raise LifecycleError(
+                    "controlled environment must be injected before restore"
+                )
+            raw_kind = str(raw_environment.get("kind", "")).strip().lower()
+            raw_network = bool(raw_environment.get("network_enabled", False))
+            if (
+                raw_kind != configured_environment.kind.value
+                or raw_network != configured_environment.network_enabled
+            ):
+                self._mark_life_restore_blocked(
+                    "controlled environment policy differs from host binding"
+                )
+                raise LifecycleError(
+                    "controlled environment policy differs from host binding"
+                )
+            try:
+                self.controlled_environment = ControlledEnvironment.from_snapshot(
+                    raw_environment,
+                    approval_validator=configured_environment.approval_validator,
+                    expected_root=configured_environment.root,
+                )
+            except Exception as exc:
+                self._mark_life_restore_blocked(exc)
+                raise LifecycleError(
+                    f"controlled environment restore is blocked: {str(exc)[:240]}"
+                ) from exc
+        # Resource accounting is a safety boundary rather than an optional
+        # cosmetic component: if a present homeostasis ledger is malformed,
+        # fail closed instead of replacing it with a fresh budget.
+        raw_homeostasis = snapshot.get("homeostasis")
+        if isinstance(raw_homeostasis, dict) and {
+            "budget", "ledger"
+        }.issubset(raw_homeostasis):
+            try:
+                restored_homeostasis = HomeostasisController.from_snapshot(
+                    raw_homeostasis
+                )
+            except Exception as exc:
+                self._mark_life_restore_blocked(exc)
+                raise LifecycleError(
+                    f"homeostasis restore is blocked: {str(exc)[:240]}"
+                ) from exc
+            self.homeostasis = restored_homeostasis
+            self.homeostasis_controller = restored_homeostasis
+        # Motivation is a signal layer.  A damaged signal history may be
+        # discarded without granting authority, but the incident remains
+        # visible in the normal loop-error projection.
+        raw_motivation = snapshot.get("motivation")
+        if isinstance(raw_motivation, dict):
+            try:
+                self.motivation = MotivationalPressure.from_snapshot(raw_motivation)
+                self.motivational_pressure = self.motivation
+            except Exception as exc:
+                self._record_loop_error("motivation_restore", exc)
+                self.motivation = MotivationalPressure()
+                self.motivational_pressure = self.motivation
         self._sync_life_projection()
+        self._sync_self_maintenance_projection()
 
         raw_wm = snapshot.get("working_memory")
         if isinstance(raw_wm, dict):
@@ -4470,11 +6417,16 @@ Rules:
 
     async def _snapshot_state(self):
         """Persist brain state. V6: includes ActivationField."""
-        if self.state_store:
+        if self.state_store is not None:
             if self._life_restore_blocked:
                 self._sync_life_projection()
                 self._record_loop_error(
                     "snapshot_life", self._life_restore_error or "life restore is blocked"
+                )
+                return False
+            if not self._renew_life_control(force=True):
+                self._record_loop_error(
+                    "snapshot_life", "life-control lease could not be renewed"
                 )
                 return False
             try:
@@ -4486,6 +6438,7 @@ Rules:
             # Keep the compact BrainState fields and the lossless working
             # memory view in sync immediately before journaling.
             self._sync_life_projection()
+            self._sync_self_maintenance_projection()
             self.state.sleep_state = self.sleep_state
             self.state.active_thoughts = [dict(item) for item in self.working_memory.items]
             self.state.current_context = self.working_memory.get_context()
@@ -4494,6 +6447,33 @@ Rules:
             self.task_scheduler.sync(self.goal_system, self.state.total_ticks)
             snap = self.state.snapshot()  # State.snapshot() already includes activation
             snap["life_kernel"] = self.life_kernel.snapshot()
+            coordinator = getattr(self, "succession_coordinator", None)
+            if coordinator is not None:
+                try:
+                    snap["succession_runtime"] = coordinator.snapshot()
+                    snap["succession_activation"] = {
+                        "required": bool(self._successor_activation_required),
+                        "receipt_hash": self._successor_evaluation_receipt_hash,
+                    }
+                except Exception as exc:
+                    # A succession snapshot is an integrity boundary.  Do
+                    # not publish a partial brain snapshot that could make a
+                    # child look ordinary after restart.
+                    self._record_loop_error("snapshot_succession", exc)
+                    return False
+            # Keep the full safety/signal records outside the compact API
+            # projections so restart can verify their independent history.
+            snap["homeostasis"] = self.homeostasis.snapshot()
+            snap["motivation"] = self.motivation.snapshot()
+            # Persist only bounded, hash-addressed evidence metadata.  Host
+            # capabilities and candidate source paths are intentionally absent;
+            # a restart must receive a fresh explicit host binding.
+            snap["iteration_pipeline"] = self._iteration_snapshot_for_persistence()
+            if self.controlled_environment is not None:
+                # The host-bound root/approval validator are not serialized
+                # as capabilities.  Only the policy fingerprint and redacted
+                # audit chain cross the bounded snapshot boundary.
+                snap["controlled_environment"] = self.controlled_environment.snapshot()
             snap["working_memory"] = self.working_memory.snapshot()
             snap["last_archived_count"] = self._last_archived_count
             snap["maintenance"] = {

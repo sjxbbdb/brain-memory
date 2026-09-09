@@ -1,0 +1,4 @@
+# Runtime dependencies plus the local regression-test toolchain.
+# Use requirements-dev.lock for reproducible CI/developer setup.
+-r requirements.txt
+pytest>=9.1,<10

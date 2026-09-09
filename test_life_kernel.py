@@ -19,6 +19,7 @@ from brain.life_kernel import (
     AppendOnlyLedger,
     IdentityCore,
     LedgerEvent,
+    LedgerIntegrityError,
     LifeKernel,
     LifecycleError,
     LifecycleState,
@@ -128,6 +129,14 @@ class LifeKernelContractTests(unittest.TestCase):
         events = _events(kernel.ledger)
         self.assertGreaterEqual(len(events), len(path))
         self.assertTrue(_chain_is_valid(kernel.ledger))
+
+    def test_snapshot_parent_identity_is_pinned_by_genesis_metadata(self):
+        kernel = LifeKernel()
+        kernel.transition(LifecycleState.BOOTSTRAPPING, reason="boot")
+        payload = kernel.snapshot()
+        payload["identity"]["parent_instance_id"] = "forged-parent"
+        with self.assertRaises(LedgerIntegrityError):
+            LifeKernel.from_snapshot(payload)
 
     def test_invalid_transition_does_not_change_state(self):
         kernel = LifeKernel()
@@ -284,6 +293,26 @@ class BrainStemLifeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await stem.start()
         self.assertIsNone(stem._task)
 
+    async def test_orderly_retirement_stops_runtime_and_is_not_wakeable(self):
+        stem = BrainStem()
+        await stem.start()
+        self.assertEqual(stem.life_kernel.state, LifecycleState.ACTIVE)
+        await stem.retire("test orderly retirement")
+        self.assertEqual(stem.life_kernel.state, LifecycleState.RETIRED)
+        self.assertIsNone(stem._task)
+        with self.assertRaises(LifecycleError):
+            await stem.start()
+
+    async def test_death_is_terminal_and_rejects_new_input(self):
+        stem = BrainStem()
+        await stem.start()
+        await stem.mark_dead("test integrity fault")
+        self.assertEqual(stem.life_kernel.state, LifecycleState.DEAD)
+        _, future = stem.submit_input("after death")
+        result = await future
+        self.assertFalse(result["accepted"])
+        self.assertTrue(result["llm_error"])
+
     async def test_tampered_kernel_snapshot_blocks_restore(self):
         source = BrainStem()
         snapshot = source.life_kernel.snapshot()
@@ -375,6 +404,61 @@ class SQLiteLedgerContractTests(unittest.TestCase):
             self.assertEqual(restored.ledger.last_hash, source.ledger.last_hash)
             self.assertTrue(store.verify_life_ledger(instance_id=source.instance_id))
             store.close()
+
+    def test_sqlite_adapter_rejects_gaps_and_illegal_edges_before_insert(self):
+        with tempfile.TemporaryDirectory(prefix="brain-life-ledger-guard-") as temp_dir:
+            db_path = str(Path(temp_dir) / "life.sqlite")
+            source = LifeKernel()
+            genesis = _events(source.ledger)[0]
+            ledger = SQLiteLedger(db_path)
+            self.assertTrue(ledger.append(genesis))
+
+            # A sequence-3 event cannot be inserted while sequence-2 is
+            # absent, even if its own hash is valid.
+            gap = LedgerEvent.create(
+                sequence=3,
+                lineage_id=source.lineage_id,
+                generation=source.generation,
+                instance_id=source.instance_id,
+                event_type="lifecycle_transition",
+                from_state=LifecycleState.BOOTSTRAPPING,
+                to_state=LifecycleState.ACTIVE,
+                reason="gap",
+                previous_hash=genesis.event_hash,
+            )
+            self.assertFalse(ledger.append(gap))
+
+            # A correctly chained hash cannot bypass the lifecycle transition
+            # matrix (CREATED -> ACTIVE is not a legal edge).
+            illegal = LedgerEvent.create(
+                sequence=2,
+                lineage_id=source.lineage_id,
+                generation=source.generation,
+                instance_id=source.instance_id,
+                event_type="lifecycle_transition",
+                from_state=LifecycleState.CREATED,
+                to_state=LifecycleState.ACTIVE,
+                reason="illegal skip",
+                previous_hash=genesis.event_hash,
+            )
+            self.assertFalse(ledger.append(illegal))
+            self.assertEqual(len(ledger.events), 1)
+
+    def test_sqlite_table_is_insert_only_even_through_raw_connection(self):
+        with tempfile.TemporaryDirectory(prefix="brain-life-ledger-guard-") as temp_dir:
+            db_path = str(Path(temp_dir) / "life.sqlite")
+            source = LifeKernel()
+            ledger = SQLiteLedger(db_path)
+            self.assertTrue(ledger.append(_events(source.ledger)[0]))
+            conn = sqlite3.connect(db_path)
+            try:
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("UPDATE life_ledger SET reason = 'tampered'")
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("DELETE FROM life_ledger")
+                conn.rollback()
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":
