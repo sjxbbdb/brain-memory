@@ -245,6 +245,33 @@ ANCHOR_VAULT_GUARD_SQL = """
     END;
 """
 
+# A motivational source proof is a one-shot host capability.  The in-process
+# attestor cache is useful for fast duplicate rejection, but it cannot defend
+# a restarted process.  This append-only table stores only opaque SHA-256
+# identifiers: neither the source label, event payload, HMAC signature nor
+# signing secret crosses the persistence boundary.
+MOTIVATION_ATTESTATION_REPLAY_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS motivation_attestation_replay (
+        replay_key TEXT PRIMARY KEY,
+        attestation_hash TEXT NOT NULL,
+        consumed_at REAL NOT NULL,
+        expires_at REAL NOT NULL
+    )
+"""
+
+MOTIVATION_ATTESTATION_REPLAY_GUARD_SQL = """
+    CREATE TRIGGER IF NOT EXISTS motivation_attestation_replay_no_update
+    BEFORE UPDATE ON motivation_attestation_replay
+    BEGIN
+        SELECT RAISE(ABORT, 'motivation_attestation_replay is INSERT-only');
+    END;
+    CREATE TRIGGER IF NOT EXISTS motivation_attestation_replay_no_delete
+    BEFORE DELETE ON motivation_attestation_replay
+    BEGIN
+        SELECT RAISE(ABORT, 'motivation_attestation_replay is INSERT-only');
+    END;
+"""
+
 
 def _connect(path: str = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=DB_TIMEOUT)
@@ -312,6 +339,25 @@ def _lease_event_hash(value=None, *, name: str = "last_event_hash") -> str:
     if len(text) != 64 or re.fullmatch(r"[0-9a-f]{64}", text) is None:
         raise ValueError(f"{name} is invalid")
     return text
+
+
+def _motivation_replay_hash(value, *, name: str) -> str:
+    """Validate an opaque SHA-256 replay identifier without logging it."""
+
+    text = "" if value is None else str(value).strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", text) is None:
+        raise ValueError(f"{name} is invalid")
+    return text
+
+
+def _motivation_replay_time(value, *, name: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} is invalid") from exc
+    if parsed != parsed or parsed in {float("inf"), float("-inf")}:
+        raise ValueError(f"{name} is invalid")
+    return parsed
 
 
 def _ensure_life_control_schema(conn: sqlite3.Connection) -> None:
@@ -769,6 +815,8 @@ def init_db(db_path: str = DB_PATH):
         conn.executescript(SUCCESSION_LEDGER_GUARD_SQL)
         conn.execute(ANCHOR_VAULT_TABLE_SQL)
         conn.executescript(ANCHOR_VAULT_GUARD_SQL)
+        conn.execute(MOTIVATION_ATTESTATION_REPLAY_TABLE_SQL)
+        conn.executescript(MOTIVATION_ATTESTATION_REPLAY_GUARD_SQL)
         for col, ct in [
             ("embedding", "TEXT DEFAULT NULL"),
             ("is_identity_forming", "INTEGER DEFAULT 0"),
@@ -796,6 +844,7 @@ class StateStore:
         self._life_control_lock = RLock()
         self._succession_ledger_lock = RLock()
         self._anchor_vault_lock = RLock()
+        self._motivation_replay_lock = RLock()
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -847,6 +896,121 @@ class StateStore:
     def close(self):
         """Close the persistent connection, if it is open."""
         self._reset_connection()
+
+    # ── Durable motivational-attestation replay guard ──
+
+    @property
+    def durable_motivation_replay(self) -> bool:
+        """Advertise the concrete atomic replay capability to the host.
+
+        This is deliberately a boolean capability marker rather than a path
+        projection.  Diagnostics must not expose where constitutional state
+        is stored.
+        """
+
+        path = str(self.db_path or "").strip().lower()
+        return bool(
+            path
+            and path != ":memory:"
+            and not path.startswith("file::memory:")
+            and "mode=memory" not in path
+        )
+
+    def _motivation_replay_connection(self) -> sqlite3.Connection:
+        """Open a short-lived FULL-synchronous connection for one-shot proof use."""
+
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=DB_TIMEOUT,
+            check_same_thread=False,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute(MOTIVATION_ATTESTATION_REPLAY_TABLE_SQL)
+        conn.executescript(MOTIVATION_ATTESTATION_REPLAY_GUARD_SQL)
+        conn.commit()
+        return conn
+
+    def consume_motivation_attestation(
+        self,
+        *,
+        replay_key: str,
+        attestation_hash: str,
+        consumed_at: float,
+        expires_at: float,
+    ) -> bool:
+        """Atomically consume one opaque source proof exactly once.
+
+        ``False`` means the proof key already exists.  Storage/locking errors
+        raise instead of falling back to an in-memory cache; the attestor
+        converts that failure into a rejected observation.
+        """
+
+        key = _motivation_replay_hash(replay_key, name="replay_key")
+        proof_hash = _motivation_replay_hash(
+            attestation_hash, name="attestation_hash"
+        )
+        consumed = _motivation_replay_time(consumed_at, name="consumed_at")
+        expires = _motivation_replay_time(expires_at, name="expires_at")
+        with self._motivation_replay_lock:
+            conn = None
+            try:
+                conn = self._motivation_replay_connection()
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "INSERT INTO motivation_attestation_replay "
+                    "(replay_key, attestation_hash, consumed_at, expires_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (key, proof_hash, consumed, expires),
+                )
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                if conn is not None:
+                    conn.rollback()
+                return False
+            except sqlite3.Error as exc:
+                if conn is not None:
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass
+                logger.error("motivation replay ledger consume failed")
+                raise RuntimeError(
+                    "motivation replay ledger is unavailable"
+                ) from exc
+            finally:
+                if conn is not None:
+                    conn.close()
+
+    def is_motivation_attestation_consumed(self, *, replay_key: str) -> bool:
+        """Read whether an opaque proof key is already consumed.
+
+        An operational error is not equivalent to "not consumed" and is
+        therefore raised for the caller to handle fail-closed.
+        """
+
+        key = _motivation_replay_hash(replay_key, name="replay_key")
+        with self._motivation_replay_lock:
+            conn = None
+            try:
+                conn = self._motivation_replay_connection()
+                row = conn.execute(
+                    "SELECT 1 FROM motivation_attestation_replay "
+                    "WHERE replay_key = ? LIMIT 1",
+                    (key,),
+                ).fetchone()
+                return row is not None
+            except sqlite3.Error as exc:
+                logger.error("motivation replay ledger lookup failed")
+                raise RuntimeError(
+                    "motivation replay ledger is unavailable"
+                ) from exc
+            finally:
+                if conn is not None:
+                    conn.close()
 
     # ── Durable life-control lease ──
 
@@ -924,18 +1088,24 @@ class StateStore:
     def _validated_lineage_head(
         conn: sqlite3.Connection,
         lineage_id: str,
+        *,
+        instance_id: str | None = None,
+        generation: int | None = None,
     ):
-        """Return the verified newest lifecycle event for one lineage.
+        """Return a verified lifecycle head for one lineage/instance.
 
         Lease claims are a capability boundary, so an omitted/forged event
         head must not let a caller claim an arbitrary instance or generation.
         The permanent ledger is append-only, but it may contain several
-        succession generations; validate each instance chain and use the
-        final durable insertion as the lineage head.  ``None`` means the
+        succession generations.  Every instance chain is validated before a
+        head is returned.  When a concrete instance is requested, its own
+        chain is selected instead of the newest *row* in the lineage: a
+        terminal parent seal is intentionally inserted after a child genesis
+        while the lease head remains pinned to that child.  ``None`` means the
         lineage has no lifecycle history yet.
         """
 
-        from brain.life_kernel import AppendOnlyLedger, LifecycleEvent
+        from brain.life_kernel import AppendOnlyLedger, LifecycleEvent, LifecycleState
 
         rows = conn.execute(
             "SELECT event_id, lineage_id, generation, instance_id, sequence, "
@@ -952,11 +1122,55 @@ class StateStore:
             item = dict(row)
             item["metadata"] = json.loads(item["metadata"])
             event = LifecycleEvent.from_dict(item)
+            if event.lineage_id != lineage_id:
+                raise ValueError("life ledger lineage differs from query")
             grouped.setdefault(event.instance_id, AppendOnlyLedger()).append_event(event)
             newest = event
         for ledger in grouped.values():
             ledger.verify_chain()
-        return newest
+        if instance_id is None:
+            return newest
+
+        wanted_instance = str(instance_id)
+        selected = grouped.get(wanted_instance)
+        if selected is None or selected.head is None:
+            raise ValueError("requested lifecycle instance is absent")
+        selected_generation = int(selected.head.generation)
+        if generation is not None and selected_generation != int(generation):
+            raise ValueError("requested lifecycle generation differs from ledger")
+
+        # A generation-bearing child is claimable only after its parent has
+        # reached a terminal edge.  During a staged handover the parent is
+        # SUCCESSION_PENDING and the child genesis may already be durable, but
+        # allowing the child to claim at that point would bypass the remaining
+        # anchor/record/seal checks.  Older terminal handover databases did
+        # not carry a succession event type, so the compatibility rule here is
+        # deliberately state/identity based rather than metadata-name based.
+        if selected_generation > 0:
+            genesis = selected.events[0]
+            identity = genesis.metadata.get("identity", {})
+            if not isinstance(identity, Mapping):
+                raise ValueError("successor genesis identity is missing")
+            parent_instance = str(identity.get("parent_instance_id", "")).strip()
+            if not parent_instance:
+                raise ValueError("successor genesis parent identity is missing")
+            parent_ledger = grouped.get(parent_instance)
+            if parent_ledger is None or parent_ledger.head is None:
+                raise ValueError("successor parent lifecycle chain is missing")
+            if int(parent_ledger.head.generation) != selected_generation - 1:
+                raise ValueError("successor parent generation is invalid")
+            parent_state = LifecycleState.parse(parent_ledger.head.to_state)
+            if parent_state not in {LifecycleState.RETIRED, LifecycleState.DEAD}:
+                raise ValueError("successor parent is not terminal")
+            # If a modern seal records its designated child, bind the claim to
+            # that exact identity.  A legacy terminal handover without this
+            # metadata remains readable for backwards-compatible crash repair.
+            parent_metadata = dict(parent_ledger.head.metadata)
+            designated = str(parent_metadata.get("successor_instance_id", "")).strip()
+            if designated and designated != wanted_instance:
+                raise ValueError("successor parent names a different child")
+
+        return selected.head
 
     def claim_life_control(
         self,
@@ -1045,7 +1259,12 @@ class StateStore:
                 # Validate the append-only chains while the claim transaction
                 # is open, then require the caller's compare-and-set head to
                 # identify the newest durable event and its identity.
-                lineage_head = self._validated_lineage_head(conn, lineage)
+                lineage_head = self._validated_lineage_head(
+                    conn,
+                    lineage,
+                    instance_id=instance,
+                    generation=generation_value,
+                )
                 if lineage_head is None:
                     # A reserved-but-not-yet-published slot may be handed to
                     # another concrete instance after expiry (the historical
@@ -1805,11 +2024,18 @@ class StateStore:
         A succession boundary creates a new instance, so the child's genesis
         event cannot use the parent's ``last_event_hash`` as its predecessor.
         This dedicated seam proves the parent capability, verifies that the
-        parent is already terminal, inserts exactly one ``CREATED`` genesis,
-        and advances the lineage lease head to the child hash in one SQLite
-        transaction.  The parent lease remains fenced until the caller
-        explicitly releases it after the remaining succession records are
-        durable.
+        parent is explicitly in ``SUCCESSION_PENDING`` staging, inserts
+        exactly one ``CREATED`` genesis, and advances the lineage lease head
+        to the child hash in one SQLite transaction.  The parent lease remains
+        fenced until the caller explicitly seals/releases it after the
+        remaining succession records are durable.
+
+        Terminal-parent rows from pre-staging releases remain readable through
+        the normal lineage/claim migration path, but cannot be extended by
+        this write API.  Hosts that encounter such a legacy handover must
+        complete an explicit, separately audited migration before creating a
+        successor; accepting a terminal parent here would make the handover
+        seam a second, unsealed child-injection path.
 
         It is intentionally narrower than :meth:`append_life_event`: arbitrary
         cross-generation events and unleased writes are rejected.
@@ -1898,9 +2124,11 @@ class StateStore:
                     conn.rollback()
                     return False
 
-                # The parent's durable chain must already end in a terminal
-                # state.  This prevents the handover-only bypass from being
-                # reused as a general child-injection primitive.
+                # The parent's durable chain must still be in the
+                # coordinator's explicit SUCCESSION_PENDING staging phase.
+                # Terminal parents are a legacy read/migration boundary, not
+                # a writable handover state.  A pending phase is only accepted
+                # when its immutable metadata names this exact successor.
                 parent_rows = conn.execute(
                     "SELECT event_id, lineage_id, generation, instance_id, sequence, "
                     "timestamp, event_type, from_state, to_state, reason, metadata, "
@@ -1915,14 +2143,42 @@ class StateStore:
                     parent_events.append(item)
                 parent_ledger = AppendOnlyLedger(parent_events)
                 parent_ledger.verify_chain()
-                if (
-                    not parent_ledger.head
-                    or parent_ledger.last_hash != parent_head
-                    or LifecycleState.parse(parent_ledger.head.to_state)
-                    not in {LifecycleState.RETIRED, LifecycleState.DEAD}
-                ):
+                if not parent_ledger.head:
                     conn.rollback()
                     return False
+                parent_state = LifecycleState.parse(parent_ledger.head.to_state)
+                parent_metadata = dict(parent_ledger.head.metadata)
+                parent_head_matches = parent_ledger.last_hash == parent_head
+                pending_successor = str(
+                    parent_metadata.get("successor_instance_id", "")
+                ).strip()
+                if parent_head_matches:
+                    if parent_state is LifecycleState.SUCCESSION_PENDING:
+                        if pending_successor != parsed.instance_id:
+                            conn.rollback()
+                            return False
+                    else:
+                        conn.rollback()
+                        return False
+                else:
+                    # After the first child-genesis append the lease head is
+                    # intentionally the child's hash, while the parent's own
+                    # chain still ends at SUCCESSION_PENDING.  Permit only an
+                    # exact idempotent retry for that already-bound child.
+                    if parent_state is not LifecycleState.SUCCESSION_PENDING:
+                        conn.rollback()
+                        return False
+                    if pending_successor != parsed.instance_id:
+                        conn.rollback()
+                        return False
+                    child_row = conn.execute(
+                        "SELECT event_hash FROM life_ledger WHERE instance_id = ? "
+                        "AND generation = ? AND sequence = 1",
+                        (parsed.instance_id, int(parsed.generation)),
+                    ).fetchone()
+                    if child_row is None or str(child_row["event_hash"]) != parent_head:
+                        conn.rollback()
+                        return False
 
                 # Bind the child genesis to the same constitutional identity
                 # and explicit parent.  Merely holding a parent lease must
@@ -2064,9 +2320,275 @@ class StateStore:
             finally:
                 conn.close()
 
+    def append_life_event_handover_seal(
+        self,
+        event: dict,
+        parent_lease: LifeControlLease,
+        *,
+        successor_instance_id: str | None = None,
+        succession_record_id: str | None = None,
+        succession_record_hash: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """Append the parent's terminal seal after a staged handover.
+
+        ``append_life_event_handover`` advances the parent lease head to the
+        child's genesis while the parent remains ``SUCCESSION_PENDING``.  A
+        normal lifecycle append cannot then use the parent's own predecessor
+        hash.  This narrow, lease-gated seam validates the pending parent,
+        child genesis, anchor projection and succession record in one
+        transaction, appends the terminal parent event, and deliberately keeps
+        the lease head at the child hash so the next host can claim the child.
+        No generic cross-generation or unleased write is accepted here.
+        """
+
+        try:
+            from brain.life_kernel import AppendOnlyLedger, LifecycleEvent, LifecycleState
+
+            if not isinstance(parent_lease, LifeControlLease):
+                return False
+            parsed = (
+                event
+                if isinstance(event, LifecycleEvent)
+                else LifecycleEvent.from_dict(event)
+            )
+            payload = parsed.to_dict()
+            metadata = payload.get("metadata", {})
+            if not isinstance(metadata, Mapping):
+                return False
+            if (
+                parsed.event_type != "succession_parent_sealed"
+                or parsed.from_state != LifecycleState.SUCCESSION_PENDING.value
+                or parsed.to_state not in {LifecycleState.RETIRED.value, LifecycleState.DEAD.value}
+                or parsed.lineage_id != parent_lease.lineage_id
+                or parsed.instance_id != parent_lease.instance_id
+                or parsed.generation != parent_lease.generation
+            ):
+                return False
+            child_id = str(
+                successor_instance_id
+                if successor_instance_id is not None
+                else metadata.get("successor_instance_id", "")
+            ).strip()
+            record_id = str(
+                succession_record_id
+                if succession_record_id is not None
+                else metadata.get("succession_record_id", "")
+            ).strip()
+            record_hash = str(
+                succession_record_hash
+                if succession_record_hash is not None
+                else metadata.get("succession_record_hash", "")
+            ).strip().lower()
+            if not child_id or not record_id or not re.fullmatch(r"[0-9a-f]{64}", record_hash):
+                return False
+            parent_lineage, parent_instance, parent_owner, parent_token, parent_fence = (
+                self._lease_fields(parent_lease)
+            )
+            lease_head = _lease_event_hash(parent_lease.last_event_hash)
+            if not lease_head:
+                return False
+            current = None if now is None else _lease_clock(now)
+            metadata_json = json.dumps(
+                metadata,
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            values = (
+                payload["event_id"],
+                payload["lineage_id"],
+                int(payload["generation"]),
+                payload["instance_id"],
+                int(payload["sequence"]),
+                payload["timestamp"],
+                payload["event_type"],
+                payload.get("from_state"),
+                payload["to_state"],
+                payload["reason"],
+                metadata_json,
+                payload["previous_hash"],
+                payload["event_hash"],
+            )
+        except Exception:
+            return False
+
+        with self._life_control_lock, self._life_ledger_lock:
+            conn = self._life_connection()
+            try:
+                # The seal checks all three append-only projections while the
+                # write lock is held.  Creating the tables is idempotent and
+                # keeps older databases on the same explicit path.
+                conn.execute(SUCCESSION_LEDGER_TABLE_SQL)
+                conn.executescript(SUCCESSION_LEDGER_GUARD_SQL)
+                conn.execute(ANCHOR_VAULT_TABLE_SQL)
+                conn.executescript(ANCHOR_VAULT_GUARD_SQL)
+                conn.execute("BEGIN IMMEDIATE")
+                if current is None:
+                    current = _lease_clock()
+                lease_row = conn.execute(
+                    "SELECT * FROM life_control_lease WHERE lineage_id = ?",
+                    (parent_lineage,),
+                ).fetchone()
+                if (
+                    lease_row is None
+                    or float(lease_row["expires_at"]) <= current
+                    or int(lease_row["generation"]) != parent_lease.generation
+                    or not self._lease_matches(
+                        lease_row,
+                        instance_id=parent_instance,
+                        owner_id=parent_owner,
+                        lease_token=parent_token,
+                        fencing=parent_fence,
+                    )
+                    or _lease_event_hash(lease_row["last_event_hash"]) != lease_head
+                ):
+                    conn.rollback()
+                    return False
+
+                # An exact retry may arrive after the terminal event was
+                # committed but before the caller released its lease.  Check
+                # the immutable event identity before requiring the parent
+                # head to remain pending; rewrites still fail closed.
+                existing = conn.execute(
+                    "SELECT event_id, lineage_id, generation, instance_id, sequence, "
+                    "timestamp, event_type, from_state, to_state, reason, metadata, "
+                    "previous_hash, event_hash FROM life_ledger WHERE event_id = ?",
+                    (payload["event_id"],),
+                ).fetchone()
+                if existing is not None:
+                    existing_payload = dict(existing)
+                    try:
+                        existing_payload["metadata"] = json.loads(
+                            existing_payload["metadata"]
+                        )
+                        identical = (
+                            LifecycleEvent.from_dict(existing_payload).to_dict()
+                            == payload
+                        )
+                    except Exception:
+                        identical = False
+                    conn.rollback()
+                    return bool(identical)
+
+                parent_rows = conn.execute(
+                    "SELECT event_id, lineage_id, generation, instance_id, sequence, "
+                    "timestamp, event_type, from_state, to_state, reason, metadata, "
+                    "previous_hash, event_hash FROM life_ledger "
+                    "WHERE instance_id = ? ORDER BY sequence ASC",
+                    (parent_instance,),
+                ).fetchall()
+                parent_events = []
+                for row in parent_rows:
+                    item = dict(row)
+                    item["metadata"] = json.loads(item["metadata"])
+                    parent_events.append(item)
+                parent_ledger = AppendOnlyLedger(parent_events)
+                parent_ledger.verify_chain()
+                if (
+                    parent_ledger.head is None
+                    or parent_ledger.head.to_state != LifecycleState.SUCCESSION_PENDING.value
+                    or parent_ledger.last_hash != parsed.previous_hash
+                    or parsed.sequence != parent_ledger.last_sequence + 1
+                    or str(dict(parent_ledger.head.metadata).get("successor_instance_id", "")).strip()
+                    != child_id
+                ):
+                    conn.rollback()
+                    return False
+
+                # The lease head is the exact child genesis hash.  Require a
+                # single CREATED event with a matching parent identity; this
+                # closes the gap where a caller could seal a pending parent
+                # against an unrelated generation.
+                child_rows = conn.execute(
+                    "SELECT event_id, lineage_id, generation, instance_id, sequence, "
+                    "timestamp, event_type, from_state, to_state, reason, metadata, "
+                    "previous_hash, event_hash FROM life_ledger "
+                    "WHERE instance_id = ? ORDER BY sequence ASC",
+                    (child_id,),
+                ).fetchall()
+                if len(child_rows) != 1:
+                    conn.rollback()
+                    return False
+                child_payload = dict(child_rows[0])
+                child_payload["metadata"] = json.loads(child_payload["metadata"])
+                child_event = LifecycleEvent.from_dict(child_payload)
+                child_metadata = dict(child_event.metadata)
+                child_identity = child_metadata.get("identity")
+                if (
+                    child_event.sequence != 1
+                    or child_event.event_type != "created"
+                    or child_event.to_state != LifecycleState.CREATED.value
+                    or child_event.lineage_id != parent_lineage
+                    or child_event.generation != parent_lease.generation + 1
+                    or child_event.event_hash != lease_head
+                    or not isinstance(child_identity, Mapping)
+                    or str(child_identity.get("parent_instance_id", "")) != parent_instance
+                ):
+                    conn.rollback()
+                    return False
+                AppendOnlyLedger([child_event]).verify_chain()
+
+                record_row = conn.execute(
+                    "SELECT lineage_id, parent_instance_id, parent_generation, "
+                    "successor_instance_id, successor_generation, record_hash "
+                    "FROM succession_ledger WHERE record_id = ?",
+                    (record_id,),
+                ).fetchone()
+                if (
+                    record_row is None
+                    or str(record_row["lineage_id"]) != parent_lineage
+                    or str(record_row["parent_instance_id"]) != parent_instance
+                    or int(record_row["parent_generation"]) != parent_lease.generation
+                    or str(record_row["successor_instance_id"]) != child_id
+                    or int(record_row["successor_generation"]) != parent_lease.generation + 1
+                    or str(record_row["record_hash"]).lower() != record_hash
+                ):
+                    conn.rollback()
+                    return False
+                anchor_row = conn.execute(
+                    "SELECT 1 FROM anchor_vault WHERE lineage_id = ? "
+                    "AND generation = ? AND instance_id = ? LIMIT 1",
+                    (parent_lineage, parent_lease.generation + 1, child_id),
+                ).fetchone()
+                if anchor_row is None:
+                    conn.rollback()
+                    return False
+
+                probe = AppendOnlyLedger(parent_events)
+                probe.append_event(parsed)
+                probe.verify_chain()
+                conn.execute(
+                    "INSERT INTO life_ledger (event_id, lineage_id, generation, "
+                    "instance_id, sequence, timestamp, event_type, from_state, "
+                    "to_state, reason, metadata, previous_hash, event_hash) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    values,
+                )
+                # Keep last_event_hash pinned to the child genesis.  The
+                # lineage claim path selects a verified child head even though
+                # the parent seal is inserted later in table order.
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                return False
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                return False
+            finally:
+                conn.close()
+
     # Explicit aliases for adapters that call this a succession/child genesis.
     append_life_event_for_handover = append_life_event_handover
     append_successor_genesis = append_life_event_handover
+    append_life_event_handover_finalize = append_life_event_handover_seal
 
     # Alias keeps terminology discoverable for callers that say lifecycle.
     append_lifecycle_event = append_life_event
@@ -2133,7 +2655,10 @@ class StateStore:
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        # Succession history is constitutional state.  Once an append reports
+        # success it must have the same abrupt-power-loss durability as the
+        # lifecycle and replay ledgers.
+        conn.execute("PRAGMA synchronous=FULL")
         # Keep the lifecycle table available even for an older adapter that
         # opened a database before ``init_db`` was called.  The succession
         # append below reads this table inside the same IMMEDIATE transaction;
@@ -2152,17 +2677,22 @@ class StateStore:
         lineage_id: str,
         parent_instance_id: str,
         parent_generation: int,
+        successor_instance_id: str | None = None,
+        successor_generation: int | None = None,
+        inheritance_plan_hash: str | None = None,
     ) -> str:
-        """Return ``absent``, ``terminal`` or ``invalid`` for a parent chain.
+        """Return ``absent``, ``pending``, ``terminal`` or ``invalid``.
 
         Succession records historically supported a detached audit use-case:
         callers could append a record before a lifecycle ledger was attached.
-        That compatibility seam remains ``absent``.  Once *any* lifecycle
-        rows exist for the named parent, however, the record must be bound to
-        that exact lineage/generation and the verified chain must end in a
-        terminal state.  The query and verification run on the caller's open
-        transaction, so a concurrent lifecycle writer cannot change the
-        decision between checking and inserting the succession row.
+        That compatibility seam remains ``absent``.  A coordinator may append
+        the immutable record during its explicit ``SUCCESSION_PENDING``
+        staging phase, but only after an identity-bound child genesis and
+        anchor projection are already present in the same database.  All other
+        lifecycle-backed records must end at a verified terminal parent.  The
+        query and verification run on the caller's open transaction, so a
+        concurrent lifecycle writer cannot change the decision between
+        checking and inserting the succession row.
         """
 
         from brain.life_kernel import AppendOnlyLedger, LifecycleEvent, LifecycleState
@@ -2194,12 +2724,72 @@ class StateStore:
             head = ledger.head
             if head is None:
                 return "invalid"
-            return (
-                "terminal"
-                if LifecycleState.parse(head.to_state)
-                in {LifecycleState.RETIRED, LifecycleState.DEAD}
-                else "invalid"
-            )
+            head_state = LifecycleState.parse(head.to_state)
+            if head_state in {LifecycleState.RETIRED, LifecycleState.DEAD}:
+                return "terminal"
+            if head_state is not LifecycleState.SUCCESSION_PENDING:
+                return "invalid"
+            # Pending records are accepted only for the exact child that the
+            # immutable pending event prepared.  The child genesis and its
+            # sealed anchor set must already be present; otherwise a caller
+            # could append an audit row and later claim an unproven child.
+            if not successor_instance_id or successor_generation is None:
+                return "invalid"
+            pending_metadata = dict(head.metadata)
+            if str(pending_metadata.get("successor_instance_id", "")).strip() != str(
+                successor_instance_id
+            ).strip():
+                return "invalid"
+            child_rows = conn.execute(
+                "SELECT event_id, lineage_id, generation, instance_id, sequence, "
+                "timestamp, event_type, from_state, to_state, reason, metadata, "
+                "previous_hash, event_hash FROM life_ledger "
+                "WHERE instance_id = ? ORDER BY sequence ASC",
+                (str(successor_instance_id),),
+            ).fetchall()
+            if len(child_rows) != 1:
+                return "invalid"
+            child_payload = dict(child_rows[0])
+            child_payload["metadata"] = json.loads(child_payload["metadata"])
+            child = LifecycleEvent.from_dict(child_payload)
+            child_metadata = dict(child.metadata)
+            child_identity = child_metadata.get("identity")
+            if (
+                child.sequence != 1
+                or child.event_type != "created"
+                or child.to_state != LifecycleState.CREATED.value
+                or child.lineage_id != lineage_id
+                or child.generation != int(successor_generation)
+                or child.instance_id != str(successor_instance_id)
+                or not isinstance(child_identity, Mapping)
+                or str(child_identity.get("parent_instance_id", ""))
+                != parent_instance_id
+            ):
+                return "invalid"
+            AppendOnlyLedger([child]).verify_chain()
+            try:
+                anchor_row = conn.execute(
+                    "SELECT anchor_set_json FROM anchor_vault WHERE lineage_id = ? "
+                    "AND generation = ? AND instance_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (lineage_id, int(successor_generation), str(successor_instance_id)),
+                ).fetchone()
+            except sqlite3.Error:
+                return "invalid"
+            if anchor_row is None:
+                return "invalid"
+            try:
+                anchor_payload = json.loads(anchor_row["anchor_set_json"])
+            except (TypeError, json.JSONDecodeError):
+                return "invalid"
+            anchor_metadata = anchor_payload.get("metadata", {})
+            if not isinstance(anchor_metadata, Mapping):
+                return "invalid"
+            if inheritance_plan_hash and str(
+                anchor_metadata.get("inheritance_plan_hash", "")
+            ) != str(inheritance_plan_hash):
+                return "invalid"
+            return "pending"
         except Exception:
             # A malformed or tampered lifecycle chain must never be treated
             # as a missing chain, because that would re-open the bypass.
@@ -2306,8 +2896,11 @@ class StateStore:
                     lineage_id=parsed.lineage_id,
                     parent_instance_id=parsed.parent_instance_id,
                     parent_generation=parsed.parent_generation,
+                    successor_instance_id=parsed.successor_instance_id,
+                    successor_generation=parsed.successor_generation,
+                    inheritance_plan_hash=parsed.inheritance.plan_hash,
                 )
-                if parent_status != "absent" and parent_status != "terminal":
+                if parent_status not in {"absent", "pending", "terminal"}:
                     conn.rollback()
                     return False
 
@@ -2505,7 +3098,8 @@ class StateStore:
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        # A sealed anchor is part of the succession proof, not a cache.
+        conn.execute("PRAGMA synchronous=FULL")
         conn.execute(ANCHOR_VAULT_TABLE_SQL)
         conn.executescript(ANCHOR_VAULT_GUARD_SQL)
         return conn

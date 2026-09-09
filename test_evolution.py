@@ -881,7 +881,12 @@ class EvolutionHarnessTests(unittest.TestCase):
             candidate = self._tree(root, "candidate", quality="better")
             harness, receipt = self._receipt(root, active, candidate)
             before = directory_fingerprint(active)
-            controller = PromotionController(active, harness=harness)
+            controller = PromotionController(
+                active,
+                harness=harness,
+                ledger_path=root / "promotion.jsonl",
+                persistence_path=root / "brain.sqlite",
+            )
             self.assertEqual(controller.profile, "production")
             with self.assertRaises(SandboxAttestationError):
                 controller.promote(candidate, receipt, authorized=True)
@@ -898,7 +903,11 @@ class EvolutionHarnessTests(unittest.TestCase):
             attestor = SandboxAttestor(secret=b"host-attestor-secret-0123456789")
             attestation = attestor.issue_for_receipt(receipt)
             controller = PromotionController(
-                active, harness=harness, sandbox_attestor=attestor
+                active,
+                harness=harness,
+                sandbox_attestor=attestor,
+                ledger_path=root / "promotion.jsonl",
+                persistence_path=root / "brain.sqlite",
             )
             outcome = controller.promote(
                 candidate,
@@ -938,7 +947,11 @@ class EvolutionHarnessTests(unittest.TestCase):
             forged = attestation.to_dict()
             forged["signature"] = "0" * 64
             controller = PromotionController(
-                active, harness=harness, sandbox_attestor=attestor
+                active,
+                harness=harness,
+                sandbox_attestor=attestor,
+                ledger_path=root / "promotion.jsonl",
+                persistence_path=root / "brain.sqlite",
             )
             with self.assertRaises(SandboxAttestationError):
                 controller.promote(
@@ -962,7 +975,34 @@ class EvolutionHarnessTests(unittest.TestCase):
                     harness=harness,
                     profile="production",
                     require_sandbox_attestation=False,
+                    ledger_path=root / "production-ledger.jsonl",
+                    persistence_path=root / "production.sqlite",
                 )
+
+    def test_production_profile_requires_external_persistence_and_file_ledger(self):
+        with tempfile.TemporaryDirectory(prefix="promotion-production-config-") as temp:
+            root = Path(temp)
+            active = self._tree(root, "active")
+            external_db = root / "brain.sqlite"
+            ledger_path = root / "promotion.jsonl"
+            with self.assertRaisesRegex(PromotionError, "persistence_path"):
+                PromotionController(active, ledger_path=ledger_path)
+            with self.assertRaisesRegex(PromotionError, "file-backed"):
+                PromotionController(active, persistence_path=external_db)
+            with self.assertRaisesRegex(PromotionError, "file-backed"):
+                PromotionController(
+                    active,
+                    ledger=PromotionLedger(),
+                    persistence_path=external_db,
+                )
+            controller = PromotionController(
+                active,
+                ledger_path=ledger_path,
+                persistence_path=external_db,
+            )
+            self.assertEqual(controller.profile, "production")
+            self.assertEqual(controller.ledger.path, ledger_path.resolve())
+            self.assertEqual(controller.persistence_path, external_db.resolve())
 
     def test_recovery_accepts_baseline_metrics_but_evolution_receipt_cannot_cross_modes(self):
         with tempfile.TemporaryDirectory() as temp:

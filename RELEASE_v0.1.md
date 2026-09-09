@@ -15,7 +15,8 @@
 - `LifeKernel` 身份与生命周期边界，以及 file-backed SQLite lease/fencing 的单 active
   协调（需受信宿主配置）
 - `MotivationalPressure` 的冲动频次/烈度阈值；阈值只生成 `IterationNeed`，不直接授权
-  自修改
+  自修改；生产候选链使用宿主 HMAC 来源证明和 append-only SQLite replay ledger 原子
+  一次性消费，重启/并发重放及持久账本故障均 fail-closed
 - `HomeostasisController` / `ControlledEnvironment` 的资源预算、quarantine 和显式恢复
 - `EvaluationHarness` + `PromotionController` 的候选隔离、固定评估、append-only ledger、
   外置交易 manifest、崩溃恢复、回滚与显式 discard
@@ -24,8 +25,9 @@
 
 ## 版本号边界
 
-历史文档和代码中的 `V4`–`V13` 继续保留，用于表示能力层、API 路由或兼容性代际，
-不是产品发行号。数据库 schema、快照版本、身份演化计数也保持原有语义，避免破坏
+历史文档和代码中的 `V3`–`V13` 继续保留，用于表示能力层、API 路由或兼容性代际；其中
+`V3` 仅表示旧管线/存储迁移语义，公开 API 兼容面从 `V4` 起。它们不是产品发行号。数据库
+schema、快照版本、身份演化计数也保持原有语义，避免破坏
 已有数据和客户端。
 
 本版本的候选迭代和代际接替均是宿主显式接线的本地能力，不通过 HTTP 暴露代码写入，
@@ -44,11 +46,16 @@ file-backed `PromotionLedger`；仅内存账本不能跨进程证明晋升收据
 同时收到带 `db_path` 的 `StateStore` 时会自动执行这项校验，即使 SQLite 文件尚未创建也会
 拒绝树内路径。没有 `db_path` 的旧式适配器仅保留兼容接口，不构成已验证的持久化连续性。
 
-代际接替的持久化边界是：若父 lineage 已有生命周期历史，父实例必须先进入终态才能写入
-接替记录；仅有旧式、无生命周期行的离线审计记录保留兼容读取路径，运行时协调器不会把它
-当作正常生产晋升依据。
+代际接替采用 `SUCCESSION_PENDING` 两阶段封口：父实例先进入非终态 pending，再按顺序持久化
+child genesis、继承锚点和 SuccessionRecord；三类证据均绑定同一 lineage/generation/plan
+并核验通过后，才写入父实例终态封口。pending 阶段的跨 sink 写入不是单一数据库事务，任何
+中断都必须安全停机并由宿主显式 repair/resume，不能把部分记录当作已完成接替。
+生产 `SuccessionCoordinator` 因此要求三类持久 sink 同时存在；内存/离线演练须显式标为
+`profile="legacy"`。
 
 本版本不宣称已实现主观意识；“数字生命”是工程目标和研究语境。可复现测试记录见
-[`docs/verification/p6-long-run-2026-09-09.md`](docs/verification/p6-long-run-2026-09-09.md)。
+[`docs/verification/p6-long-run-2026-09-09.md`](docs/verification/p6-long-run-2026-09-09.md)；
+有限 LivingWorld 本地 soak 见
+[`docs/verification/p6-living-world-soak-2026-09-09.md`](docs/verification/p6-living-world-soak-2026-09-09.md)。
 
 历史发行记录见 [RELEASE_v10.0.md](RELEASE_v10.0.md)。

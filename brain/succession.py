@@ -32,12 +32,53 @@ from threading import RLock
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping
 import uuid
+import re
 
 
 SUCCESSION_SCHEMA_VERSION = 1
 ANCHOR_SCHEMA_VERSION = 1
 VAULT_SCHEMA_VERSION = 1
 SUCCESSION_RECORD_SCHEMA_VERSION = 1
+
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|"
+    r"authorization|bearer|cookie|credential|private[_-]?key|session|token|"
+    r"(?:^|[_-])(?:path|url|cwd|working[_-]?directory)(?:$|[_-]))",
+    re.I,
+)
+_SENSITIVE_VALUE_RE = re.compile(
+    r"(?:https?://|file://|[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/]|"
+    r"/(?:Users|home|root|tmp|var|etc|mnt|opt|srv)(?:[\\/]|$)|"
+    r"\b(?:gh[pousr]|sk)[_-][A-Za-z0-9_-]{12,}\b|"
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b|"
+    r"(?:api[_-]?key|access[_-]?token|password|secret|authorization|bearer|cookie)\s*[:=])",
+    re.I,
+)
+
+
+def _contains_sensitive_anchor_data(value: Any, *, key: str = "", depth: int = 0) -> bool:
+    """Reject secret/path-bearing payloads without copying their contents."""
+    if depth > 8:
+        return True
+    if _SENSITIVE_KEY_RE.search(str(key)):
+        return True
+    if isinstance(value, Mapping):
+        for raw_key, raw_value in list(value.items())[:256]:
+            # The key itself is sensitive even when its value happens to be
+            # empty/benign (for example ``{"api_key": ""}``).
+            if _SENSITIVE_KEY_RE.search(str(raw_key)):
+                return True
+            if _contains_sensitive_anchor_data(
+                raw_value, key=str(raw_key), depth=depth + 1
+            ):
+                return True
+        return False
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_contains_sensitive_anchor_data(item, key=key, depth=depth + 1) for item in list(value)[:256])
+    try:
+        return bool(_SENSITIVE_VALUE_RE.search(str(value)))
+    except Exception:
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -1554,24 +1595,30 @@ class InheritancePlan:
         return plan
 
 
-def _evaluation_receipt_valid(receipt: Any) -> tuple[bool, str | None]:
+def _evaluation_receipt_valid(
+    receipt: Any, *, strict: bool = False
+) -> tuple[bool, str | None]:
     """Validate a caller-supplied independent evaluation receipt.
 
     The module does not trust arbitrary payloads as proof.  A receipt is
     accepted only when it explicitly says accepted/pass and, when it exposes a
     ``verify`` method, that method succeeds.  A bare ID in
-    ``reevaluated_anchor_ids`` is treated as a host-attested reference and is
-    recorded as ``external-attestation``; the later evaluator remains
-    responsible for issuing that attestation.
+    In strict mode a receipt must expose a successful verifier and a concrete
+    hash-pinned identity.  A bare boolean/ID is accepted only by an explicit
+    legacy caller; it is never an independent evaluation proof.
     """
 
     if isinstance(receipt, bool):
+        if strict:
+            return False, None
         return bool(receipt), "external-attestation" if receipt else None
     if isinstance(receipt, Mapping):
         accepted = receipt.get("accepted", receipt.get("verified", receipt.get("passed", False)))
         if not _bool(accepted):
             return False, None
         verifier = receipt.get("verify")
+        if strict and not callable(verifier):
+            return False, None
         if callable(verifier):
             try:
                 if not bool(verifier()):
@@ -1579,11 +1626,24 @@ def _evaluation_receipt_valid(receipt: Any) -> tuple[bool, str | None]:
             except Exception:
                 return False, None
         receipt_id = receipt.get("receipt_id", receipt.get("id", "external-attestation"))
-        return True, _text(receipt_id, 180).strip() or "external-attestation"
+        clean_id = _text(receipt_id, 180).strip()
+        if strict:
+            receipt_hash = _text(
+                receipt.get("receipt_hash", receipt.get("hash", "")), 128
+            ).strip().lower()
+            if (
+                not clean_id
+                or clean_id == "external-attestation"
+                or not re.fullmatch(r"[0-9a-f]{64}", receipt_hash)
+            ):
+                return False, None
+        return True, clean_id or "external-attestation"
     accepted = _bool(getattr(receipt, "accepted", getattr(receipt, "verified", getattr(receipt, "passed", False))))
     if not accepted:
         return False, None
     verifier = getattr(receipt, "verify", None)
+    if strict and not callable(verifier):
+        return False, None
     if callable(verifier):
         try:
             if not bool(verifier()):
@@ -1591,7 +1651,18 @@ def _evaluation_receipt_valid(receipt: Any) -> tuple[bool, str | None]:
         except Exception:
             return False, None
     receipt_id = getattr(receipt, "receipt_id", getattr(receipt, "id", "external-attestation"))
-    return True, _text(receipt_id, 180).strip() or "external-attestation"
+    clean_id = _text(receipt_id, 180).strip()
+    if strict:
+        receipt_hash = _text(
+            getattr(receipt, "receipt_hash", getattr(receipt, "hash", "")), 128
+        ).strip().lower()
+        if (
+            not clean_id
+            or clean_id == "external-attestation"
+            or not re.fullmatch(r"[0-9a-f]{64}", receipt_hash)
+        ):
+            return False, None
+    return True, clean_id or "external-attestation"
 
 
 def filter_inheritance(
@@ -1600,13 +1671,17 @@ def filter_inheritance(
     successor_generation: int | None = None,
     reevaluated_anchor_ids: Iterable[str] | None = None,
     evaluation_receipts: Mapping[str, Any] | None = None,
+    allow_legacy_attestation: bool = False,
 ) -> InheritancePlan:
     """Apply the ADR-0003 inheritance boundary to a sealed anchor set.
 
     ``evaluation_receipts`` is optional because a plan can intentionally hold
-    skills/strategies for later review.  Supplying only an ID set is a
-    host-attested reference, not an evaluator implementation; integrations
-    requiring stronger proof should pass receipt objects with ``verify``.
+    skills/strategies for later review.  In the default (production-safe)
+    mode, naming an ID is never evidence: each requested skill/strategy must
+    carry a concrete receipt with a successful verifier and a 64-character
+    content hash.  ``allow_legacy_attestation=True`` is an explicit adapter
+    escape hatch for old offline callers and must not be used by production
+    succession.
     """
 
     if isinstance(source, AnchorSet):
@@ -1635,6 +1710,20 @@ def filter_inheritance(
 
     reevaluated = {str(item) for item in (reevaluated_anchor_ids or ())}
     receipts = evaluation_receipts or {}
+    reevaluation_targets = {
+        anchor.anchor_id for anchor in anchor_set.anchors if anchor.kind in _RE_EVALUATE_KINDS
+    }
+    if reevaluated & reevaluation_targets and not allow_legacy_attestation:
+        # Every explicitly requested skill/strategy must have its own
+        # hash-pinned, independently verifiable receipt.  Merely naming an ID
+        # (or supplying a receipt for a different anchor) is not evidence.
+        for anchor_id in sorted(reevaluated & reevaluation_targets):
+            receipt = receipts.get(anchor_id) if isinstance(receipts, Mapping) else None
+            valid, _ = _evaluation_receipt_valid(receipt, strict=True)
+            if not valid:
+                raise SuccessionPolicyError(
+                    "reevaluation requires a verifiable receipt for " + anchor_id
+                )
     inherited: list[Anchor] = []
     pending: list[Anchor] = []
     decisions: list[InheritanceDecision] = []
@@ -1642,7 +1731,10 @@ def filter_inheritance(
         disposition: InheritanceDisposition
         reason: str
         receipt_id: str | None = None
-        if anchor.kind in _CONSTITUTIONAL_KINDS:
+        if _contains_sensitive_anchor_data(anchor.value, key="value") or _contains_sensitive_anchor_data(anchor.metadata, key="metadata") or _contains_sensitive_anchor_data(anchor.evidence_refs, key="evidence") or _contains_sensitive_anchor_data(anchor.source, key="source"):
+            disposition = InheritanceDisposition.EXCLUDED
+            reason = "anchor payload failed sensitive-data policy"
+        elif anchor.kind in _CONSTITUTIONAL_KINDS:
             # ``validate_for_succession`` already established this invariant.
             disposition = InheritanceDisposition.INHERITED
             reason = "constitutional anchor required for lineage continuity"
@@ -1659,7 +1751,9 @@ def filter_inheritance(
             receipt = receipts.get(anchor.anchor_id)
             receipt_ok = False
             if receipt is not None:
-                receipt_ok, receipt_id = _evaluation_receipt_valid(receipt)
+                receipt_ok, receipt_id = _evaluation_receipt_valid(
+                    receipt, strict=not allow_legacy_attestation
+                )
             elif anchor.anchor_id in reevaluated:
                 receipt_ok, receipt_id = True, "external-attestation"
             if receipt_ok:
@@ -1714,9 +1808,11 @@ class InheritanceFilter:
         *,
         reevaluated_anchor_ids: Iterable[str] | None = None,
         evaluation_receipts: Mapping[str, Any] | None = None,
+        allow_legacy_attestation: bool = False,
     ) -> None:
         self._reevaluated_anchor_ids = tuple(str(item) for item in (reevaluated_anchor_ids or ()))
         self._evaluation_receipts = dict(evaluation_receipts or {})
+        self._allow_legacy_attestation = bool(allow_legacy_attestation)
 
     def apply(
         self,
@@ -1729,6 +1825,7 @@ class InheritanceFilter:
             successor_generation=successor_generation,
             reevaluated_anchor_ids=self._reevaluated_anchor_ids,
             evaluation_receipts=self._evaluation_receipts,
+            allow_legacy_attestation=self._allow_legacy_attestation,
         )
 
     filter = apply

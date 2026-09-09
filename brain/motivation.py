@@ -30,11 +30,13 @@ from __future__ import annotations
 
 import math
 import hashlib
+import hmac
 import json
+import re
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import wraps
 from threading import RLock
@@ -42,6 +44,364 @@ from typing import Any, Callable, Iterable, Mapping
 
 
 MOTIVATION_SCHEMA_VERSION = 1
+
+MOTIVATION_ATTESTATION_SCHEMA_VERSION = 1
+MOTIVATION_ATTESTATION_MAX_TTL = 3600.0
+MOTIVATION_ATTESTATION_REPLAY_LIMIT = 4096
+
+
+@dataclass(frozen=True)
+class MotivationSourceAttestation:
+    """Host-issued proof that one impulse came from a stable source.
+
+    The signature is deliberately absent from the public snapshot projection;
+    a restored event is historical evidence only and must receive a fresh
+    host attestation before it can unlock a production iteration need.
+    ``nonce`` is retained for compatibility with older callers that did not
+    provide one, but newly issued proofs always contain a random nonce.
+    """
+
+    attestation_id: str
+    issuer_id: str
+    source_id: str
+    source_kind: str
+    event_id: str
+    payload_hash: str
+    issued_at: float
+    expires_at: float
+    signature: str = ""
+    nonce: str = ""
+
+    def __post_init__(self) -> None:
+        for name, limit in (
+            ("attestation_id", 160),
+            ("issuer_id", 160),
+            ("source_id", 160),
+            ("source_kind", 40),
+            ("event_id", 120),
+            ("payload_hash", 128),
+            ("signature", 128),
+            ("nonce", 160),
+        ):
+            value = str(getattr(self, name) or "").replace("\x00", "")[:limit].strip()
+            if name == "source_kind":
+                value = value.lower()
+            object.__setattr__(self, name, value)
+        try:
+            issued = float(self.issued_at)
+            expires = float(self.expires_at)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("source attestation timestamps are invalid") from exc
+        if not math.isfinite(issued) or not math.isfinite(expires) or expires <= issued:
+            raise ValueError("source attestation expiry is invalid")
+        object.__setattr__(self, "issued_at", issued)
+        object.__setattr__(self, "expires_at", expires)
+        if not self.attestation_id or not self.issuer_id or not self.source_id:
+            raise ValueError("source attestation identifiers are required")
+        if not self.event_id or not re.fullmatch(r"[A-Za-z0-9._:-]{1,120}", self.event_id):
+            raise ValueError("source attestation event id is invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.payload_hash.lower()):
+            raise ValueError("source attestation payload hash is invalid")
+        if self.signature and not re.fullmatch(r"[0-9a-f]{64}", self.signature.lower()):
+            raise ValueError("source attestation signature is invalid")
+        object.__setattr__(self, "payload_hash", self.payload_hash.lower())
+        object.__setattr__(self, "signature", self.signature.lower())
+        if not self.nonce:
+            # Legacy unsigned objects may omit a nonce.  They can never pass
+            # ``validate`` because a signed proof is required there.
+            object.__setattr__(self, "nonce", "legacy-no-nonce")
+
+    def _payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": MOTIVATION_ATTESTATION_SCHEMA_VERSION,
+            "attestation_id": self.attestation_id,
+            "issuer_id": self.issuer_id,
+            "source_id": self.source_id,
+            "source_kind": self.source_kind,
+            "event_id": self.event_id,
+            "payload_hash": self.payload_hash,
+            "issued_at": self.issued_at,
+            "expires_at": self.expires_at,
+            "nonce": self.nonce,
+        }
+
+    def signing_payload(self) -> bytes:
+        return json.dumps(
+            self._payload(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+
+    @property
+    def attestation_hash(self) -> str:
+        return hashlib.sha256(
+            json.dumps(self.to_dict(include_signature=True), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    @property
+    def replay_key(self) -> str:
+        """Opaque durable identity for one issuer/attestation pair."""
+
+        canonical = json.dumps(
+            {
+                "issuer_id": self.issuer_id,
+                "attestation_id": self.attestation_id,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def to_dict(self, *, include_signature: bool = False) -> dict[str, Any]:
+        if include_signature:
+            payload = dict(self._payload())
+            payload["signature"] = self.signature
+            return payload
+        # A public/durable projection must not expose arbitrary host/source
+        # labels merely because they do not match a credential-looking regex.
+        # The complete signed payload remains process-local for verification;
+        # this projection is descriptive and non-authorizing only.
+        return {
+            "schema_version": MOTIVATION_ATTESTATION_SCHEMA_VERSION,
+            "attestation_id": _snapshot_identifier(
+                self.attestation_id, "attestation_id", limit=160
+            ),
+            "issuer_id": _opaque_snapshot_text(self.issuer_id, "issuer_id", limit=160),
+            "source_id": _opaque_snapshot_text(self.source_id, "source_id", limit=160),
+            "source_kind": _snapshot_category(self.source_kind, "source_kind", limit=40),
+            "event_id": _snapshot_identifier(self.event_id, "event_id", limit=120),
+            "payload_hash": self.payload_hash,
+            "issued_at": self.issued_at,
+            "expires_at": self.expires_at,
+            "nonce": _opaque_snapshot_text(self.nonce, "nonce", limit=160),
+            # Public projections carry a hash, never the signing material.
+            "attestation_hash": self.attestation_hash,
+        }
+
+    public_dict = to_dict
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "MotivationSourceAttestation":
+        if not isinstance(data, Mapping):
+            raise ValueError("source attestation must be an object")
+        if "schema_version" in data and data.get("schema_version") != MOTIVATION_ATTESTATION_SCHEMA_VERSION:
+            raise ValueError("unsupported source attestation schema")
+        payload = dict(data)
+        payload.pop("schema_version", None)
+        payload.pop("attestation_hash", None)
+        if "signature" not in payload:
+            raise ValueError("source attestation signature is required")
+        return cls(**payload)
+
+    def verify_signature(self, secret: bytes | bytearray) -> bool:
+        if not self.signature or not isinstance(secret, (bytes, bytearray)):
+            return False
+        expected = hmac.new(bytes(secret), self.signing_payload(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, self.signature)
+
+
+class MotivationSourceAttestor:
+    """Host-held HMAC issuer and replay guard for motivational sources."""
+
+    def __init__(
+        self,
+        secret: bytes | str,
+        issuer_id: str = "host",
+        *,
+        clock: Callable[[], float] | None = None,
+        max_ttl: float = MOTIVATION_ATTESTATION_MAX_TTL,
+        replay_limit: int = MOTIVATION_ATTESTATION_REPLAY_LIMIT,
+        replay_store: Any = None,
+    ) -> None:
+        self._secret = secret.encode("utf-8") if isinstance(secret, str) else bytes(secret)
+        if len(self._secret) < 16:
+            raise ValueError("source attestor secret must be at least 16 bytes")
+        self.issuer_id = str(issuer_id or "").replace("\x00", "")[:160].strip() or "host"
+        self._clock = clock or time.time
+        self.max_ttl = float(max_ttl)
+        if not math.isfinite(self.max_ttl) or self.max_ttl <= 0:
+            raise ValueError("source attestor max_ttl must be positive and finite")
+        self._replay_limit = max(16, int(replay_limit))
+        self._used_order: deque[str] = deque(maxlen=self._replay_limit)
+        self._used: set[str] = set()
+        self._lock = RLock()
+        if replay_store is not None:
+            consume = getattr(replay_store, "consume_motivation_attestation", None)
+            lookup = getattr(
+                replay_store, "is_motivation_attestation_consumed", None
+            )
+            if not callable(consume) or not callable(lookup):
+                raise TypeError(
+                    "replay_store must implement durable motivation replay methods"
+                )
+        self._replay_store = replay_store
+
+    @staticmethod
+    def _coerce_now(value: Any, fallback: Callable[[], float]) -> float:
+        if value is None:
+            value = fallback()
+        try:
+            current = float(value)
+        except (TypeError, ValueError, OverflowError):
+            current = float(fallback())
+        if not math.isfinite(current):
+            raise ValueError("source attestor clock is not finite")
+        return current
+
+    def _remember(self, attestation_id: str) -> None:
+        if attestation_id in self._used:
+            return
+        if len(self._used_order) >= self._used_order.maxlen:
+            old = self._used_order.popleft()
+            self._used.discard(old)
+        self._used_order.append(attestation_id)
+        self._used.add(attestation_id)
+
+    def issue(
+        self,
+        *,
+        source_id: str,
+        source_kind: str,
+        event_id: str,
+        payload_hash: str,
+        ttl: float = 60.0,
+        now: Any = None,
+        nonce: str | None = None,
+    ) -> MotivationSourceAttestation:
+        current = self._coerce_now(now, self._clock)
+        ttl_value = float(ttl)
+        if not math.isfinite(ttl_value) or ttl_value <= 0 or ttl_value > self.max_ttl:
+            raise ValueError("source attestation ttl is outside the host policy")
+        unsigned = MotivationSourceAttestation(
+            attestation_id=f"mot-att-{uuid.uuid4().hex}",
+            issuer_id=self.issuer_id,
+            source_id=str(source_id),
+            source_kind=str(source_kind),
+            event_id=str(event_id),
+            payload_hash=str(payload_hash),
+            issued_at=current,
+            expires_at=current + ttl_value,
+            nonce=str(nonce or uuid.uuid4().hex),
+            signature="",
+        )
+        signature = hmac.new(self._secret, unsigned.signing_payload(), hashlib.sha256).hexdigest()
+        signed_payload = dict(unsigned._payload())
+        signed_payload.pop("schema_version", None)
+        signed_payload["signature"] = signature
+        return MotivationSourceAttestation(**signed_payload)
+
+    def issue_for_event(
+        self,
+        event: "ImpulseEvent",
+        *,
+        source_id: str,
+        ttl: float = 60.0,
+        now: Any = None,
+    ) -> MotivationSourceAttestation:
+        return self.issue(
+            source_id=source_id,
+            source_kind=event.source_kind,
+            event_id=event.event_id,
+            payload_hash=MotivationalPressure.event_payload_hash(event),
+            ttl=ttl,
+            now=now,
+        )
+
+    def validate(
+        self,
+        value: MotivationSourceAttestation | Mapping[str, Any],
+        *,
+        event_id: str,
+        payload_hash: str,
+        source_id: str | None = None,
+        source_kind: str | None = None,
+        now: Any = None,
+        consume: bool = True,
+    ) -> MotivationSourceAttestation:
+        attestation = (
+            value
+            if isinstance(value, MotivationSourceAttestation)
+            else MotivationSourceAttestation.from_dict(value)
+        )
+        current = self._coerce_now(now, self._clock)
+        with self._lock:
+            if attestation.issuer_id != self.issuer_id:
+                raise ValueError("source attestation issuer is not trusted")
+            if attestation.attestation_id in self._used:
+                raise ValueError("source attestation has already been consumed")
+            if current < attestation.issued_at - 5.0 or current > attestation.expires_at + 5.0:
+                raise ValueError("source attestation is expired or not yet valid")
+            if str(event_id) != attestation.event_id or str(payload_hash).lower() != attestation.payload_hash:
+                raise ValueError("source attestation event binding mismatch")
+            if source_id is not None and str(source_id) != attestation.source_id:
+                raise ValueError("source attestation source binding mismatch")
+            if source_kind is not None and str(source_kind).strip().lower() != attestation.source_kind:
+                raise ValueError("source attestation kind binding mismatch")
+            if not attestation.verify_signature(self._secret):
+                raise ValueError("source attestation signature mismatch")
+            if consume:
+                if self._replay_store is not None:
+                    try:
+                        consumed = self._replay_store.consume_motivation_attestation(
+                            replay_key=attestation.replay_key,
+                            attestation_hash=attestation.attestation_hash,
+                            consumed_at=current,
+                            expires_at=attestation.expires_at,
+                        )
+                    except Exception as exc:
+                        raise ValueError(
+                            "durable source attestation replay ledger failed"
+                        ) from exc
+                    if consumed is not True:
+                        raise ValueError(
+                            "source attestation has already been consumed"
+                        )
+                self._remember(attestation.attestation_id)
+            elif self._replay_store is not None:
+                try:
+                    already_consumed = (
+                        self._replay_store.is_motivation_attestation_consumed(
+                            replay_key=attestation.replay_key
+                        )
+                    )
+                except Exception as exc:
+                    raise ValueError(
+                        "durable source attestation replay ledger failed"
+                    ) from exc
+                if already_consumed is not False:
+                    raise ValueError(
+                        "source attestation has already been consumed"
+                    )
+        return attestation
+
+    def verify(self, value: MotivationSourceAttestation | Mapping[str, Any], **kwargs: Any) -> bool:
+        try:
+            self.validate(value, **kwargs, consume=False)
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    @property
+    def consumed_ids(self) -> frozenset[str]:
+        with self._lock:
+            return frozenset(self._used)
+
+    @property
+    def replay_store(self) -> Any:
+        """Return the host replay capability without exposing it in snapshots."""
+
+        return self._replay_store
+
+    @property
+    def durable_replay_enabled(self) -> bool:
+        """Whether the host supplied an explicitly durable atomic ledger."""
+
+        return bool(
+            self._replay_store is not None
+            and getattr(
+                self._replay_store, "durable_motivation_replay", False
+            )
+            is True
+        )
 
 
 def _synchronized(method: Callable[..., Any]) -> Callable[..., Any]:
@@ -274,6 +634,262 @@ def _json_safe(value: Any, *, depth: int = 0) -> Any:
     return _text(value, 240)
 
 
+# Motivation observations can originate in user text, tool output, or a
+# host adapter.  They are useful as live signals, but raw source/context and
+# metadata must not cross the durable snapshot boundary.  Keep this policy
+# local to the signal layer so every serializer (including ``ImpulseEvent``
+# and ``IterationNeed``) shares the same conservative rules.
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|"
+    r"authorization|bearer|cookie|credential|private[_-]?key|session|capability|"
+    r"path|root|cwd|working[_-]?directory|source[_-]?path|candidate[_-]?path|url)",
+    re.IGNORECASE,
+)
+_SENSITIVE_VALUE_RE = re.compile(
+    r"(?:https?://|file://|[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/]|"
+    r"/(?:Users|home|root|tmp|var|etc|mnt|opt|srv)(?:[\\/]|$)|"
+    r"\b(?:gh[pousr][_-]|sk[_-])[A-Za-z0-9_-]{12,}\b|"
+    r"\bAKIA[0-9A-Z]{16}\b|"
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b|"
+    r"(?:api[_-]?key|access[_-]?token|password|secret|authorization|bearer|cookie)\s*[:=])",
+    re.IGNORECASE,
+)
+
+
+def _sensitive_text(value: Any, *, key: str = "") -> bool:
+    try:
+        text = str(value)
+    except Exception:
+        return True
+    return bool(_SENSITIVE_KEY_RE.search(str(key)) or _SENSITIVE_VALUE_RE.search(text))
+
+
+def _redaction_marker(value: Any, label: str) -> str:
+    try:
+        raw = str(value)
+    except Exception:
+        raw = "<unprintable>"
+    # Keep a 128-bit digest: it fits the narrowest categorical field (while
+    # remaining restart-stable) and avoids the much weaker 64-bit marker that
+    # older snapshots used.  The category is normalized through a closed
+    # allowlist and can never carry arbitrary caller text.
+    digest = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:32]
+    return f"<redacted:{_marker_label(label)}:{digest}>"
+
+
+_REDACTION_MARKER_RE = re.compile(
+    # Accept the legacy 64-bit marker and the current 128-bit marker for
+    # restart compatibility; a longer caller-supplied digest is intentionally
+    # not trusted and will be re-opaque'd.
+    r"^<redacted:([a-z][a-z0-9_.-]{0,39}):((?:[0-9a-f]{16}|[0-9a-f]{32}))>$",
+    re.IGNORECASE,
+)
+# Marker labels are part of the durable projection.  They are categories,
+# not a channel for caller-supplied text; keep a closed set so a forged marker
+# such as ``<redacted:private-token:...>`` cannot be accepted verbatim.
+_SAFE_REDACTION_LABELS = frozenset(
+    {
+        "source",
+        "context",
+        "issuer_id",
+        "source_id",
+        "source_kind",
+        "event_id",
+        "attestation_id",
+        "nonce",
+        "impulse_type",
+        "motive",
+        "trigger",
+        "need_id",
+        "reason",
+        "evidence",
+        "source_label",
+        "key",
+        "value",
+        "field",
+        "identifier",
+        "category",
+    }
+)
+_MAX_SNAPSHOT_MARKER_LENGTH = 128
+_IDENTIFIER_SENSITIVE_RE = re.compile(
+    r"(?:raw|user|payload|private|secret|token|credential|password|passwd|"
+    r"apikey|api[_-]?key|access[_-]?key|authorization|bearer|cookie|"
+    r"source[_-]?path|candidate[_-]?path|working[_-]?directory|url)",
+    re.IGNORECASE,
+)
+
+
+def _is_redaction_marker(value: Any) -> bool:
+    """Whether ``value`` is one of our opaque, restart-stable markers."""
+
+    try:
+        match = _REDACTION_MARKER_RE.fullmatch(str(value).strip())
+        if not match:
+            return False
+        label = match.group(1).lower()
+        return label in _SAFE_REDACTION_LABELS
+    except Exception:
+        return False
+
+
+def _marker_label(value: Any, *, default: str = "value") -> str:
+    """Normalize a marker category without retaining arbitrary label text."""
+
+    try:
+        label = str(value).strip().lower()
+    except Exception:
+        label = ""
+    return label if label in _SAFE_REDACTION_LABELS else default
+
+
+def _opaque_snapshot_text(value: Any, label: str, *, limit: int = 500) -> str:
+    """Hash a free-form value before it crosses a durable snapshot boundary.
+
+    The older ``_safe_snapshot_text`` helper only redacts values that *look*
+    like paths or credentials.  Motivational context is user/tool supplied,
+    though, so an ordinary sentence is sensitive too.  This helper preserves
+    only a deterministic marker (and does not re-hash a marker restored from a
+    previous snapshot), allowing bounded metrics and replay bookkeeping while
+    keeping the original text out of SQLite/JSON snapshots.
+    """
+
+    # Inspect a little beyond the field's normal limit so a valid opaque
+    # marker (which contains a 128-bit digest) is not truncated and
+    # repeatedly re-hashed on restart.  Non-marker input is still bounded to
+    # the requested field limit below.
+    raw = _text(value, max(limit, _MAX_SNAPSHOT_MARKER_LENGTH)).strip()
+    if _is_redaction_marker(raw):
+        return raw
+    text = raw[:limit]
+    if not text:
+        return ""
+    return text if _is_redaction_marker(text) else _redaction_marker(text, label)
+
+
+def _snapshot_identifier(value: Any, label: str, *, limit: int = 120) -> str:
+    """Keep machine-shaped IDs readable; hash caller prose or secret-shaped IDs."""
+
+    raw = _text(value, max(limit, _MAX_SNAPSHOT_MARKER_LENGTH)).strip()
+    if _is_redaction_marker(raw):
+        return raw
+    text = raw[:limit]
+    if not text:
+        return ""
+    # Existing integrations use short IDs such as ``c1`` and ``impulse-...``
+    # for replay and resolution.  Preserve that narrow grammar while making
+    # arbitrary user text, paths, and credential-shaped IDs opaque.
+    # Uppercase/ mixed-case IDs are not needed by the built-in replay path and
+    # are a common way for opaque payloads (for example ``RAW_USER_DATA`` or
+    # cloud key prefixes) to masquerade as identifiers.  Keep the established
+    # lowercase machine-ID grammar only.
+    if (
+        text == text.lower()
+        and re.fullmatch(r"[a-z0-9][a-z0-9_.:-]{0,119}", text)
+        and not _sensitive_text(text, key=label)
+        and not _IDENTIFIER_SENSITIVE_RE.search(text)
+    ):
+        return text
+    return _redaction_marker(text, label)
+
+
+def _snapshot_category(value: Any, label: str, *, limit: int = 80) -> str:
+    """Serialize a bounded categorical label without retaining free-form prose."""
+
+    raw = _text(value, max(limit, _MAX_SNAPSHOT_MARKER_LENGTH)).strip()
+    if _is_redaction_marker(raw):
+        return raw
+    original = raw[:limit]
+    text = original.lower()
+    if not text:
+        return "unknown"
+    if (
+        original == text
+        and re.fullmatch(r"[a-z0-9][a-z0-9_.:-]{0,79}", text)
+        and not _sensitive_text(text, key=label)
+        and not _IDENTIFIER_SENSITIVE_RE.search(text)
+    ):
+        return text
+    return _redaction_marker(text, label)
+
+
+def _snapshot_metadata_summary(value: Any) -> dict[str, Any]:
+    """Return structure-only metadata plus a digest of the discarded values."""
+
+    normalized = _metadata_dict(_safe_metadata(value))
+    # Preserve an already-redacted summary across repeated restart cycles.
+    digest = normalized.get("digest")
+    if (
+        normalized.get("redacted") is True
+        and isinstance(normalized.get("item_count"), int)
+        and isinstance(digest, str)
+        and re.fullmatch(r"[0-9a-f]{64}", digest.lower())
+    ):
+        return {
+            "redacted": True,
+            "item_count": max(0, min(10000, int(normalized["item_count"]))),
+            "digest": digest.lower(),
+        }
+    if not normalized:
+        return {}
+    canonical = json.dumps(
+        _json_safe(normalized),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return {
+        "redacted": True,
+        "item_count": len(normalized),
+        "digest": hashlib.sha256(canonical).hexdigest(),
+    }
+
+
+def _safe_snapshot_value(
+    value: Any,
+    *,
+    key: str = "",
+    depth: int = 0,
+    max_items: int = 24,
+) -> Any:
+    """Return bounded JSON data with secret/path-shaped values removed."""
+
+    if depth > 4:
+        return "<depth-limit>"
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else 0.0
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for raw_key, raw_value in list(value.items())[:max_items]:
+            clean_key = _text(raw_key, 80).strip()
+            if not clean_key:
+                continue
+            if _sensitive_text(clean_key, key=clean_key):
+                result[_redaction_marker(clean_key, "key")] = _redaction_marker(raw_value, "value")
+            else:
+                result[clean_key] = _safe_snapshot_value(
+                    raw_value, key=clean_key, depth=depth + 1, max_items=max_items
+                )
+        return result
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [
+            _safe_snapshot_value(item, key=key, depth=depth + 1, max_items=max_items)
+            for item in list(value)[:max_items]
+        ]
+    text = _text(value, 500)
+    return _redaction_marker(text, _marker_label(key, default="value")) if _sensitive_text(text, key=key) else text
+
+
+def _safe_snapshot_text(value: Any, *, key: str = "", limit: int = 500) -> str:
+    text = _text(value, limit).strip()
+    return _redaction_marker(text, _marker_label(key, default="value")) if text and _sensitive_text(text, key=key) else text
+
+
 def _integrity_digest(payload: Mapping[str, Any]) -> str:
     """Compute a deterministic, non-secret corruption/tamper marker."""
 
@@ -346,17 +962,24 @@ class ImpulseEvent:
     reliability: float = 1.0
     self_generated: bool = False
     metadata: tuple[tuple[str, Any], ...] = field(default_factory=tuple)
+    provenance: MotivationSourceAttestation | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "impulse_type", _text(self.impulse_type, 80).strip().lower() or "unknown")
         object.__setattr__(self, "intensity", _number(self.intensity, 0.0, 0.0, 1.0))
-        object.__setattr__(self, "source", _text(self.source, 120).strip() or "unknown")
+        # Preserve an explicitly empty source so structural-support checks can
+        # reject it instead of turning missing provenance into a real label.
+        object.__setattr__(self, "source", _text(self.source, 120).strip())
         object.__setattr__(self, "context", _text(self.context, 240).strip())
         # Keep the caller's ISO/epoch timestamp where possible.  Invalid
         # timestamps are replaced rather than leaking malformed values into
         # persistence.
         object.__setattr__(self, "timestamp", _valid_timestamp_text(self.timestamp))
-        object.__setattr__(self, "event_id", _text(self.event_id, 100).strip() or f"impulse-{uuid.uuid4().hex[:16]}")
+        event_id = _text(self.event_id, 100).strip() or f"impulse-{uuid.uuid4().hex[:16]}"
+        if _sensitive_text(event_id, key="event_id"):
+            digest = hashlib.sha256(event_id.encode("utf-8", errors="replace")).hexdigest()[:32]
+            event_id = f"redacted-event-{digest}"
+        object.__setattr__(self, "event_id", event_id)
         object.__setattr__(self, "persistence", _number(self.persistence, 0.0, 0.0, 1.0))
         object.__setattr__(self, "unresolved", bool(self.unresolved))
         source_kind = _infer_source_kind(self.source, self.source_kind, bool(self.self_generated))
@@ -365,6 +988,17 @@ class ImpulseEvent:
         object.__setattr__(self, "self_generated", self_flag)
         object.__setattr__(self, "reliability", _number(self.reliability, 1.0, 0.0, 1.0))
         object.__setattr__(self, "metadata", _safe_metadata(self.metadata))
+        if self.provenance is not None and not isinstance(self.provenance, MotivationSourceAttestation):
+            try:
+                object.__setattr__(
+                    self,
+                    "provenance",
+                    MotivationSourceAttestation.from_dict(self.provenance),
+                )
+            except Exception:
+                # Public snapshots intentionally omit signatures; they restore
+                # as historical, non-authorizing events.
+                object.__setattr__(self, "provenance", None)
 
     @property
     def kind(self) -> str:
@@ -389,24 +1023,40 @@ class ImpulseEvent:
         return self.source
 
     def to_dict(self) -> dict[str, Any]:
+        # ``to_dict`` is the public/persistence representation.  The live
+        # frozen object may retain richer context for the current process,
+        # but serialized observations never carry free-form source/context or
+        # metadata.  This is deliberately stricter than pattern-only secret
+        # redaction: an ordinary user sentence is still private data.
+        safe_source = _opaque_snapshot_text(self.source, "source", limit=120)
+        safe_context = _opaque_snapshot_text(self.context, "context", limit=240)
+        safe_event_id = _snapshot_identifier(self.event_id, "event_id", limit=100)
+        # Use the same opaque category namespace as the accumulator's state
+        # keys.  If a sensitive motive is hashed with a different label here,
+        # a restored event would no longer match its restored pressure state.
+        safe_impulse_type = _snapshot_category(self.impulse_type, "motive", limit=80)
         return {
             "schema_version": MOTIVATION_SCHEMA_VERSION,
-            "event_id": self.event_id,
-            "impulse_type": self.impulse_type,
-            "type": self.impulse_type,
+            "event_id": safe_event_id,
+            "impulse_type": safe_impulse_type,
+            "type": safe_impulse_type,
             "intensity": round(self.intensity, 6),
             "strength": round(self.intensity, 6),
-            "source": self.source,
-            "source_label": self.source,
+            "source": safe_source,
+            "source_label": safe_source,
             "source_kind": self.source_kind,
             "self_generated": self.self_generated,
             "reliability": round(self.reliability, 6),
-            "context": self.context,
+            "context": safe_context,
             "timestamp": self.timestamp,
             "persistence": round(self.persistence, 6),
             "unresolved": self.unresolved,
             "resolved": not self.unresolved,
-            "metadata": _json_safe(_metadata_dict(self.metadata)),
+            "metadata": _snapshot_metadata_summary(self.metadata),
+            # Only a non-authorizing public projection crosses persistence.
+            # The signing material remains process-local and is required again
+            # for a production event after restart.
+            "provenance": self.provenance.public_dict() if self.provenance else None,
         }
 
     @classmethod
@@ -447,6 +1097,7 @@ class ImpulseEvent:
             reliability=kwargs.pop("reliability", kwargs.pop("confidence", 1.0)),
             self_generated=kwargs.pop("self_generated", kwargs.pop("self_vote", False)),
             metadata=kwargs.pop("metadata", kwargs.pop("meta", {})),
+            provenance=kwargs.pop("provenance", kwargs.pop("attestation", None)),
         )
 
     @classmethod
@@ -475,6 +1126,7 @@ class ImpulseEvent:
             reliability=data.get("reliability", data.get("confidence", 1.0)),
             self_generated=data.get("self_generated", data.get("self_vote", False)),
             metadata=data.get("metadata", data.get("meta", {})),
+            provenance=data.get("provenance", data.get("attestation")),
         )
 
 
@@ -510,7 +1162,11 @@ class IterationNeed:
         object.__setattr__(self, "urgency", _number(self.urgency, 0.0, 0.0, 1.0))
         object.__setattr__(self, "confidence", _number(self.confidence, 0.0, 0.0, 1.0))
         stamp = _text(self.created_at, 100).strip()
-        if not stamp:
+        if stamp:
+            parsed_stamp = _epoch(stamp, default=float("nan"))
+            if not math.isfinite(parsed_stamp):
+                stamp = _iso_from_epoch(_now_epoch())
+        else:
             stamp = _iso_from_epoch(_now_epoch())
         object.__setattr__(self, "created_at", stamp)
         object.__setattr__(self, "need_id", _text(self.need_id, 100).strip() or f"need-{uuid.uuid4().hex[:16]}")
@@ -536,14 +1192,20 @@ class IterationNeed:
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": MOTIVATION_SCHEMA_VERSION,
-            "need_id": self.need_id,
-            "motive": self.motive,
+            "need_id": _snapshot_identifier(self.need_id, "need_id", limit=100),
+            "motive": _snapshot_category(self.motive, "motive", limit=80),
             "pressure": round(self.pressure, 6),
-            "trigger": self.trigger,
-            "kind": self.trigger,
-            "reason": self.reason,
-            "evidence": list(self.evidence),
-            "source_labels": list(self.source_labels),
+            "trigger": _snapshot_category(self.trigger, "trigger", limit=60),
+            "kind": _snapshot_category(self.trigger, "trigger", limit=60),
+            "reason": _opaque_snapshot_text(self.reason, "reason", limit=500),
+            "evidence": [
+                _opaque_snapshot_text(item, "evidence", limit=300)
+                for item in self.evidence
+            ],
+            "source_labels": [
+                _opaque_snapshot_text(item, "source_label", limit=120)
+                for item in self.source_labels
+            ],
             "urgency": round(self.urgency, 6),
             "confidence": round(self.confidence, 6),
             "created_at": self.created_at,
@@ -870,6 +1532,9 @@ class MotivationalPressure:
         event_gain: float = DEFAULT_EVENT_GAIN,
         event_gain_cap: float = DEFAULT_EVENT_GAIN_CAP,
         clock: Callable[[], float] | None = None,
+        source_attestor: MotivationSourceAttestor | None = None,
+        require_source_attestation: bool = False,
+        source_verifier: Callable[..., bool] | None = None,
         **aliases: Any,
     ) -> None:
         # All mutable pressure state below is guarded by this per-instance
@@ -877,6 +1542,24 @@ class MotivationalPressure:
         # decay -> prune -> record and snapshot -> update atomic to callers
         # from the BrainStem thread or an embedding worker thread.
         self._lock = RLock()
+        required = bool(require_source_attestation)
+        if source_attestor is not None and not isinstance(
+            source_attestor, MotivationSourceAttestor
+        ):
+            raise TypeError(
+                "source_attestor must be a MotivationSourceAttestor"
+            )
+        if required and source_verifier is not None:
+            raise TypeError(
+                "strict source attestation does not accept an arbitrary source_verifier"
+            )
+        # These are policy capabilities, not live tuning knobs.  Keep the
+        # backing values private and expose read-only properties below so an
+        # embedding caller cannot downgrade a production accumulator after
+        # construction.
+        self._source_attestor = source_attestor
+        self._require_source_attestation = required
+        self._source_verifier = source_verifier
         # Accept names used by a few embedders without making policy mutable
         # through arbitrary kwargs.
         if "trigger_threshold" in aliases:
@@ -914,6 +1597,11 @@ class MotivationalPressure:
         self._seen_ids: deque[str] = deque(maxlen=max(self.max_events * 2, 16))
         self._seen_id_set: set[str] = set()
         self._resolved_ids: set[str] = set()
+        # A consumed attestation is remembered by event id for the lifetime of
+        # this accumulator.  It lets structural-support metrics use the
+        # attested source identity without asking the host attestor to consume
+        # (and therefore reject) the same one-shot proof a second time.
+        self._verified_provenance: dict[str, MotivationSourceAttestation] = {}
         self._last_update = _number(self._clock(), _now_epoch())
         self.total_received = 0
         self.total_accepted = 0
@@ -925,6 +1613,18 @@ class MotivationalPressure:
         # an authorization path.
         self.snapshot_rejected = False
         self.restore_error = ""
+
+    @property
+    def source_attestor(self) -> MotivationSourceAttestor | None:
+        return self._source_attestor
+
+    @property
+    def require_source_attestation(self) -> bool:
+        return self._require_source_attestation
+
+    @property
+    def source_verifier(self) -> Callable[..., bool] | None:
+        return self._source_verifier
 
     # -- basic state -----------------------------------------------------
 
@@ -1008,6 +1708,89 @@ class MotivationalPressure:
             return self.self_weight
         return _number(self.SOURCE_WEIGHTS.get(kind, self.SOURCE_WEIGHTS["unknown"]), 0.35, 0.0, 1.0)
 
+    @staticmethod
+    def event_payload_hash(event: ImpulseEvent) -> str:
+        """Hash the complete normalized, provenance-free live event.
+
+        Hosts issue a source attestation against this exact canonical payload;
+        changing even one field (including source/context, source kind or
+        reliability) makes the proof unusable.  This payload is hashed only in
+        memory and is never persisted; the public serializer remains strictly
+        redacted, so paths/tokens cannot cross the snapshot boundary.
+        """
+
+        # Do not hash the public redacted projection here.  Doing so would
+        # make a visible marker an interchangeable substitute for the hidden
+        # source/context that the host actually attested.  Keep the canonical
+        # fields bounded by ``ImpulseEvent``'s constructor, but retain their
+        # live values for the HMAC binding only.
+        payload = {
+            "schema_version": MOTIVATION_SCHEMA_VERSION,
+            "event_id": event.event_id,
+            "impulse_type": event.impulse_type,
+            "intensity": round(event.intensity, 6),
+            "source": event.source,
+            "source_kind": event.source_kind,
+            "self_generated": bool(event.self_generated),
+            "reliability": round(event.reliability, 6),
+            "context": event.context,
+            "timestamp": event.timestamp,
+            "persistence": round(event.persistence, 6),
+            "unresolved": bool(event.unresolved),
+            "metadata": _json_safe(_metadata_dict(event.metadata)),
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _canonical_source(event: ImpulseEvent) -> str:
+        """Return the normalized caller label for explicit legacy mode.
+
+        This branch is retained solely for old embedders.  A production
+        ``BrainStem`` enables ``require_source_attestation`` and never calls
+        it for structural support; labels such as ``verified`` are not proof.
+        """
+
+        return event.source.strip().casefold()
+
+    def _attested_source(self, event: ImpulseEvent) -> str:
+        proof = self._verified_provenance.get(event.event_id)
+        if proof is None:
+            return ""
+        if proof.event_id != event.event_id:
+            return ""
+        if proof.payload_hash != self.event_payload_hash(event):
+            return ""
+        if proof.source_kind != event.source_kind:
+            return ""
+        return proof.source_id.strip().casefold()
+
+    def _is_independent_support(self, item: _StoredImpulse) -> bool:
+        """Whether one retained event can provide structural support.
+
+        Zero-trust or already-resolved observations may remain useful for
+        frequency/history, but they cannot unlock an iteration need.  The
+        effective weight incorporates source policy and reliability.
+        """
+
+        event = item.event
+        if self.require_source_attestation:
+            source_identity = self._attested_source(event)
+        else:
+            source_identity = self._attested_source(event) or self._canonical_source(event)
+        return bool(
+            not event.self_generated
+            and event.source_kind
+            in {"external", "user", "environment", "verified", "system"}
+            and event.intensity > 0.0
+            and item.effective_weight > 0.0
+            and event.unresolved
+            and event.event_id not in self._resolved_ids
+            and source_identity
+        )
+
     def _recent_for(self, motive: str, now: float) -> list[_StoredImpulse]:
         cutoff = now - self.frequency_window
         return [item for item in self._events if item.event.impulse_type == motive and item.accepted_at >= cutoff]
@@ -1052,15 +1835,15 @@ class MotivationalPressure:
             if item.event.unresolved and item.event.event_id not in self._resolved_ids
         )
         unresolved = min(1.0, unresolved_count / float(self.unresolved_target))
-        independent_source_count = sum(
-            1
-            for item in recent
-            if (
-                not item.event.self_generated
-                and item.event.source_kind
-                in {"external", "user", "environment", "verified", "system"}
+        independent_sources = {
+            (
+                self._attested_source(item.event)
+                if self.require_source_attestation
+                else self._attested_source(item.event) or self._canonical_source(item.event)
             )
-        )
+            for item in recent
+            if self._is_independent_support(item)
+        }
         return {
             "frequency": round(frequency, 6),
             "event_count": len(recent),
@@ -1070,7 +1853,7 @@ class MotivationalPressure:
             "unresolved_count": unresolved_count,
             "cross_context": round(cross_context, 6),
             "context_count": len(contexts),
-            "independent_source_count": independent_source_count,
+            "independent_source_count": len(independent_sources),
         }
 
     def _remember_id(self, event_id: str) -> None:
@@ -1085,7 +1868,13 @@ class MotivationalPressure:
     # -- recording -------------------------------------------------------
 
     @_synchronized
-    def record(self, event: ImpulseEvent | Mapping[str, Any], now: Any = None) -> float:
+    def record(
+        self,
+        event: ImpulseEvent | Mapping[str, Any],
+        now: Any = None,
+        *,
+        provenance: MotivationSourceAttestation | Mapping[str, Any] | None = None,
+    ) -> float:
         """Record one impulse and return its motive's current pressure.
 
         ``False``-like malformed/duplicate/rate-capped observations are
@@ -1099,6 +1888,12 @@ class MotivationalPressure:
         if impulse is None:
             self.total_rejected = min(10**12, self.total_rejected + 1)
             return 0.0
+        if provenance is not None and impulse.provenance is None:
+            try:
+                impulse = replace(impulse, provenance=provenance)
+            except Exception:
+                self.total_rejected = min(10**12, self.total_rejected + 1)
+                return 0.0
         stamp = self._time(now)
         self._decay(stamp)
         motive = impulse.impulse_type
@@ -1135,8 +1930,59 @@ class MotivationalPressure:
                 return state.pressure
             weight = min(weight, remaining / max(impulse.intensity, 1e-9))
         weight = _number(weight, 0.0, 0.0, 1.0)
+
+        # Perform all cheap admission checks before consuming a one-shot host
+        # proof.  A duplicate, rate-capped, or self-cap event must not let an
+        # untrusted caller burn a valid attestation (a denial-of-service
+        # vector).  The proof is consumed only immediately before the bounded
+        # append below.
+        verified_proof: MotivationSourceAttestation | None = None
+        if self.require_source_attestation or impulse.provenance is not None:
+            if impulse.provenance is None:
+                if self.require_source_attestation:
+                    self.total_rejected = min(10**12, self.total_rejected + 1)
+                    return state.pressure
+            elif self.source_attestor is None and self.source_verifier is None:
+                if self.require_source_attestation:
+                    self.total_rejected = min(10**12, self.total_rejected + 1)
+                    return state.pressure
+            else:
+                try:
+                    if self.source_attestor is not None:
+                        verified_proof = self.source_attestor.validate(
+                            impulse.provenance,
+                            event_id=impulse.event_id,
+                            payload_hash=self.event_payload_hash(impulse),
+                            source_kind=impulse.source_kind,
+                            now=stamp,
+                            consume=True,
+                        )
+                    else:
+                        verifier = self.source_verifier
+                        assert verifier is not None
+                        try:
+                            verified = bool(verifier(impulse, impulse.provenance))
+                        except TypeError:
+                            verified = bool(verifier(impulse))
+                        if not verified:
+                            raise ValueError("source verifier rejected event")
+                        verified_proof = impulse.provenance
+                except Exception:
+                    if self.require_source_attestation:
+                        self.total_rejected = min(10**12, self.total_rejected + 1)
+                        return state.pressure
+                    # An optional/legacy proof that cannot be verified is
+                    # treated as an ordinary legacy observation; it never
+                    # becomes an independent principal.
+                    verified_proof = None
+
         stored = _StoredImpulse(impulse, stamp, weight)
         self._events.append(stored)
+        if verified_proof is not None:
+            self._verified_provenance[impulse.event_id] = verified_proof
+            while len(self._verified_provenance) > self.max_events:
+                oldest_id = next(iter(self._verified_provenance))
+                self._verified_provenance.pop(oldest_id, None)
         self._remember_id(impulse.event_id)
         self.total_accepted = min(10**12, self.total_accepted + 1)
         if is_self:
@@ -1168,11 +2014,17 @@ class MotivationalPressure:
         return state.pressure
 
     @_synchronized
-    def accept(self, event: ImpulseEvent | Mapping[str, Any], now: Any = None) -> bool:
+    def accept(
+        self,
+        event: ImpulseEvent | Mapping[str, Any],
+        now: Any = None,
+        *,
+        provenance: MotivationSourceAttestation | Mapping[str, Any] | None = None,
+    ) -> bool:
         """Record an event and report whether it was accepted."""
 
         before = self.total_accepted
-        self.record(event, now=now)
+        self.record(event, now=now, provenance=provenance)
         return self.total_accepted > before
 
     add_event = record
@@ -1307,11 +2159,27 @@ class MotivationalPressure:
     def _need_for(self, motive: str, *, trigger: str, reason: str, now: float) -> IterationNeed:
         state = self._state(motive)
         recent = self._recent_for(motive, now)
+        tail = recent[-8:]
+        support = [item for item in recent if self._is_independent_support(item)]
+        # Keep the bounded recent tail for observability, but append any
+        # structural-support events that fell just outside it so the emitted
+        # need explains the same evidence used by ``trigger_ready``.
+        evidence_items = list(tail)
+        for item in support:
+            if item not in evidence_items:
+                evidence_items.append(item)
+        evidence_items = evidence_items[-16:]
         evidence = tuple(
             f"impulse:{item.event.event_id}:{item.event.source}"
-            for item in recent[-8:]
+            for item in evidence_items
         )
-        sources = tuple(dict.fromkeys(item.event.source for item in recent[-8:]))
+        sources = tuple(
+            dict.fromkeys(
+                item.event.source.strip()
+                for item in evidence_items
+                if item.event.source.strip()
+            )
+        )
         urgency = min(1.0, state.pressure * (1.2 if trigger in {"incident", "safety"} else 1.0))
         confidence = min(
             1.0,
@@ -1428,17 +2296,27 @@ class MotivationalPressure:
                 "self_contribution_cap": self.self_contribution_cap,
                 "event_gain": self.event_gain,
                 "event_gain_cap": self.event_gain_cap,
+                # This policy flag is data, not authority.  A production host
+                # may override it on restore; the snapshot can never turn a
+                # strict instance into a permissive one implicitly.
+                "require_source_attestation": self.require_source_attestation,
             },
             "states": {
-                key: {
+                _snapshot_category(key, "motive", limit=80): {
                     **state.to_dict(),
                     "metrics": self._components_for(key, self._last_update),
                 }
                 for key, state in self._states.items()
             },
             "events": [item.to_dict() for item in self._events],
-            "resolved_ids": list(self._resolved_ids)[-self.max_events:],
-            "seen_ids": list(self._seen_ids)[-self._seen_ids.maxlen :],
+            "resolved_ids": [
+                _snapshot_identifier(item, "event_id", limit=100)
+                for item in list(self._resolved_ids)[-self.max_events :]
+            ],
+            "seen_ids": [
+                _snapshot_identifier(item, "event_id", limit=100)
+                for item in list(self._seen_ids)[-self._seen_ids.maxlen :]
+            ],
             "last_update": self._last_update,
             "total_received": self.total_received,
             "total_accepted": self.total_accepted,
@@ -1449,6 +2327,11 @@ class MotivationalPressure:
         payload["integrity_hash"] = _integrity_digest(payload)
         return payload
 
+    def snapshot_for_persistence(self) -> dict[str, Any]:
+        """Explicit name for the redacted durable representation."""
+
+        return self.snapshot()
+
     to_dict = snapshot
 
     @classmethod
@@ -1457,21 +2340,61 @@ class MotivationalPressure:
         data: Mapping[str, Any] | None,
         *,
         clock: Callable[[], float] | None = None,
+        source_attestor: MotivationSourceAttestor | None = None,
+        source_verifier: Callable[..., bool] | None = None,
+        require_source_attestation: bool | None = None,
     ) -> "MotivationalPressure":
+        raw_config_hint = (
+            data.get("config") if isinstance(data, Mapping) and isinstance(data.get("config"), Mapping) else {}
+        )
+        effective_required = (
+            bool(require_source_attestation)
+            if require_source_attestation is not None
+            # Binding the concrete HMAC attestor is an explicit production
+            # capability.  An arbitrary verifier remains a legacy/offline
+            # adapter and must not silently upgrade itself to strict mode.
+            # Persisted config is data and cannot turn a bound attestor
+            # permissive merely by changing a flag.
+            else (
+                True
+                if source_attestor is not None
+                else bool(raw_config_hint.get("require_source_attestation", False))
+            )
+        )
         if not isinstance(data, Mapping):
-            return cls(clock=clock)
+            return cls(
+                clock=clock,
+                source_attestor=source_attestor,
+                source_verifier=source_verifier,
+                require_source_attestation=effective_required,
+            )
         supplied_hash = _text(data.get("integrity_hash", ""), 128).lower()
+        if effective_required and not supplied_hash:
+            rejected = cls(
+                clock=clock,
+                source_attestor=source_attestor,
+                source_verifier=source_verifier,
+                require_source_attestation=effective_required,
+            )
+            rejected.snapshot_rejected = True
+            rejected.restore_error = "integrity_hash_missing"
+            return rejected
         if supplied_hash:
             payload = {key: value for key, value in data.items() if key != "integrity_hash"}
             expected_hash = _integrity_digest(payload)
             if supplied_hash != expected_hash:
-                rejected = cls(clock=clock)
+                rejected = cls(
+                    clock=clock,
+                    source_attestor=source_attestor,
+                    source_verifier=source_verifier,
+                    require_source_attestation=effective_required,
+                )
                 rejected.snapshot_rejected = True
                 rejected.restore_error = "integrity_hash_mismatch"
                 return rejected
         raw_config = data.get("config") if isinstance(data.get("config"), Mapping) else {}
         # Unknown/malicious config values are clamped by __init__.
-        pressure = cls(clock=clock, **{
+        config_kwargs = {
             key: raw_config[key]
             for key in (
                 "threshold", "release_threshold", "decay_rate", "frequency_window",
@@ -1480,13 +2403,24 @@ class MotivationalPressure:
                 "self_weight", "self_contribution_cap", "event_gain", "event_gain_cap",
             )
             if key in raw_config
-        })
+        }
+        config_kwargs["require_source_attestation"] = effective_required
+        pressure = cls(
+            clock=clock,
+            source_attestor=source_attestor,
+            source_verifier=source_verifier,
+            **config_kwargs,
+        )
         raw_states = data.get("states", {})
         if isinstance(raw_states, Mapping):
             for raw_motive, raw_state in list(raw_states.items())[:128]:
                 if not isinstance(raw_state, Mapping):
                     continue
-                state = pressure._state(raw_motive)
+                # Snapshot input is untrusted data.  Normalize labels before
+                # exposing them through ``motives``/metrics; a legacy payload
+                # must not reintroduce arbitrary caller prose after restart.
+                safe_motive = _snapshot_category(raw_motive, "motive", limit=80)
+                state = pressure._state(safe_motive)
                 state.pressure = _number(raw_state.get("pressure", 0.0), 0.0, 0.0, 1.0)
                 state.triggered = bool(raw_state.get("triggered", False))
                 state.trigger_count = _integer(raw_state.get("trigger_count", 0), 0, 0, 10**9)
@@ -1501,13 +2435,44 @@ class MotivationalPressure:
                 state.total_persistence = _number(raw_state.get("total_persistence", 0.0), 0.0, 0.0, 10**12)
         raw_events = data.get("events", [])
         loaded_event_ids: set[str] = set()
+        event_id_map: dict[str, str] = {}
+        restored_resolved_ids: set[str] = set()
         if isinstance(raw_events, list):
             for raw_item in raw_events[-pressure.max_events :]:
                 if not isinstance(raw_item, Mapping):
                     continue
-                event = ImpulseEvent.from_dict(raw_item.get("event", raw_item))
+                raw_event_payload = raw_item.get("event", raw_item)
+                raw_original_id = ""
+                if isinstance(raw_event_payload, Mapping):
+                    raw_original_id = _text(
+                        raw_event_payload.get(
+                            "event_id", raw_event_payload.get("id", "")
+                        ),
+                        120,
+                    ).strip()
+                event = ImpulseEvent.from_dict(raw_event_payload)
                 if event is None or event.event_id in loaded_event_ids:
                     continue
+                pre_snapshot_id = event.event_id
+                # Re-serialize through the public redaction boundary before
+                # retaining an event restored from external storage.  This
+                # removes legacy raw source/context/metadata and deliberately
+                # drops any signed provenance supplied by an untrusted
+                # snapshot; only a fresh host attestation can authorize a
+                # post-restart observation.
+                try:
+                    safe_event_payload = event.to_dict()
+                    safe_event_payload["provenance"] = None
+                    event = ImpulseEvent.from_dict(safe_event_payload)
+                except Exception:
+                    event = None
+                if event is None or event.event_id in loaded_event_ids:
+                    continue
+                if raw_original_id:
+                    event_id_map[raw_original_id] = event.event_id
+                event_id_map[pre_snapshot_id] = event.event_id
+                if not event.unresolved:
+                    restored_resolved_ids.add(event.event_id)
                 accepted_at = _number(raw_item.get("accepted_at", _epoch(event.timestamp)), pressure._last_update)
                 weight = _number(raw_item.get("effective_weight", pressure._source_weight(event)), 0.0, 0.0, 1.0)
                 pressure._events.append(_StoredImpulse(event, accepted_at, weight))
@@ -1515,12 +2480,23 @@ class MotivationalPressure:
         raw_resolved = data.get("resolved_ids", [])
         if isinstance(raw_resolved, list):
             pressure._resolved_ids = {
-                _text(item, 100) for item in raw_resolved[-pressure.max_events :] if _text(item, 100)
+                event_id_map.get(
+                    _text(item, 120).strip(),
+                    _snapshot_identifier(item, "event_id", limit=100),
+                )
+                for item in raw_resolved[-pressure.max_events :]
+                if _text(item, 100)
             }
+            pressure._resolved_ids.update(restored_resolved_ids)
+        else:
+            pressure._resolved_ids = set(restored_resolved_ids)
         raw_seen = data.get("seen_ids", [])
         if isinstance(raw_seen, list):
             for item in raw_seen[-pressure._seen_ids.maxlen :]:
-                clean = _text(item, 100)
+                clean = event_id_map.get(
+                    _text(item, 120).strip(),
+                    _snapshot_identifier(item, "event_id", limit=100),
+                )
                 if clean:
                     pressure._remember_id(clean)
         # A legacy snapshot may not carry a replay-guard tail.  In that case,
@@ -1547,6 +2523,8 @@ __all__ = [
     "SOURCE_KINDS",
     "PROTECTED_PROPOSAL_SCOPES",
     "ImpulseEvent",
+    "MotivationSourceAttestation",
+    "MotivationSourceAttestor",
     "MotivationalPressure",
     "IterationNeed",
     "ChangeProposal",

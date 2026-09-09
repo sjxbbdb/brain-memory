@@ -24,7 +24,13 @@ from brain.evaluation_harness import (
 )
 from brain.evolution import PromotionController, SandboxAttestationError, SandboxAttestor
 from brain.life_kernel import LifeKernel, LifecycleError, LifecycleState
-from brain.motivation import ChangeProposal, IterationNeed
+from brain.motivation import (
+    ChangeProposal,
+    ImpulseEvent,
+    IterationNeed,
+    MotivationSourceAttestor,
+    MotivationalPressure,
+)
 from brain.succession_runtime import SuccessionCoordinator, SuccessionRuntimeError
 from storage.database import MemoryStore, StateStore, init_db
 
@@ -114,6 +120,88 @@ class BrainStemIterationTests(unittest.TestCase):
         self.assertIsNone(stem.evaluation_harness)
         self.assertIsNone(stem.promotion_controller)
 
+    def test_production_brain_stem_requires_host_bound_motivation_provenance(self):
+        stem = BrainStem()
+        # A caller-supplied ``source=verified`` label is only a signal and is
+        # rejected by the production default until a host proof is attached.
+        before = stem.motivation.total_accepted
+        stem.record_impulse(
+            "growth", intensity=1.0, source="verified", context="caller", now=0
+        )
+        self.assertEqual(stem.motivation.total_accepted, before)
+
+        attestor = MotivationSourceAttestor(
+            secret=b"brain-stem-motivation-test-secret", clock=lambda: 0.0
+        )
+        bound = BrainStem(motivation_source_attestor=attestor)
+        base = ImpulseEvent.create(
+            "growth",
+            1.0,
+            "sensor-a",
+            context="host observation",
+            source_kind="external",
+            event_id="stem-attested-1",
+            timestamp="0",
+        )
+        proof = attestor.issue_for_event(base, source_id="sensor-a", now=0.0)
+        event = ImpulseEvent.create(
+            "growth",
+            1.0,
+            "sensor-a",
+            context="host observation",
+            source_kind="external",
+            event_id="stem-attested-1",
+            timestamp="0",
+            provenance=proof,
+        )
+        self.assertGreaterEqual(bound.record_impulse(event, now=0), 0.0)
+        self.assertEqual(bound.motivation.total_accepted, 1)
+
+    def test_injected_motivation_policy_cannot_disagree_with_host_binding(self):
+        legacy = MotivationalPressure(decay_rate=0.0, clock=lambda: 0.0)
+        with self.assertRaises(ValueError):
+            BrainStem(motivation=legacy)
+        explicit_legacy = BrainStem(
+            motivation=legacy,
+            motivation_profile="legacy",
+        )
+        self.assertFalse(explicit_legacy.motivation.require_source_attestation)
+
+        with self.assertRaises(ValueError):
+            BrainStem(
+                motivation=legacy,
+                motivation_require_source_attestation=True,
+                motivation_profile="legacy",
+            )
+
+        attestor = MotivationSourceAttestor(
+            secret=b"brain-stem-policy-mismatch-secret", clock=lambda: 0.0
+        )
+        strict = MotivationalPressure(
+            decay_rate=0.0,
+            clock=lambda: 0.0,
+            source_attestor=attestor,
+            require_source_attestation=True,
+        )
+        with self.assertRaises(ValueError):
+            BrainStem(
+                motivation=strict,
+                motivation_source_attestor=MotivationSourceAttestor(
+                    secret=b"different-policy-secret", clock=lambda: 0.0
+                ),
+            )
+
+    def test_production_motivation_cannot_be_replaced_after_construction(self):
+        stem = BrainStem()
+        stem.motivation = MotivationalPressure(
+            decay_rate=0.0,
+            clock=lambda: 0.0,
+        )
+        with self.assertRaises(PermissionError):
+            stem.record_impulse(
+                "growth", intensity=1.0, source="forged", now=0.0
+            )
+
     def test_registration_and_evaluation_are_explicit_and_non_writing(self):
         with tempfile.TemporaryDirectory(prefix="brain-stem-p3-") as temp:
             root = Path(temp)
@@ -178,6 +266,8 @@ class BrainStemIterationTests(unittest.TestCase):
                 harness=harness,
                 protected_files=(),
                 sandbox_attestor=attestor,
+                ledger_path=root / "promotion-prod.jsonl",
+                persistence_path=root / "brain-prod.sqlite",
             )
             stem = BrainStem(
                 evaluation_harness=harness,
@@ -240,6 +330,8 @@ class BrainStemIterationTests(unittest.TestCase):
                 harness=harness,
                 protected_files=(),
                 sandbox_attestor=attestor,
+                ledger_path=root / "promotion-gate-prod.jsonl",
+                persistence_path=root / "brain-gate-prod.sqlite",
             )
             stem = BrainStem(
                 evaluation_harness=harness,

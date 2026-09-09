@@ -39,6 +39,12 @@ def _anchors(lineage: str, instance: str, generation: int) -> AnchorSet:
     )
 
 
+def _durable_sink(_payload: dict) -> bool:
+    """Test host adapter standing in for three durable append projections."""
+
+    return True
+
+
 def _rehash_runtime_snapshot(payload: dict) -> dict:
     """Recompute the unkeyed envelope hash for adversarial fixture data."""
 
@@ -68,7 +74,7 @@ class SuccessionCoordinatorTests(unittest.TestCase):
             evidence_refs=("proof-1",),
             confirmed=True,
         )
-        coordinator = SuccessionCoordinator(parent)
+        coordinator = SuccessionCoordinator(parent, profile="legacy")
         outcome = coordinator.succeed(failure=failure, anchors=anchors)
         self.assertEqual(parent.state, LifecycleState.DEAD)
         self.assertEqual(outcome.successor.lineage_id, parent.lineage_id)
@@ -92,7 +98,7 @@ class SuccessionCoordinatorTests(unittest.TestCase):
             recovery_attempted=False,
         )
         with self.assertRaises(SuccessionRuntimeError):
-            SuccessionCoordinator(parent).succeed(failure=not_ready, anchors=anchors)
+            SuccessionCoordinator(parent, profile="legacy").succeed(failure=not_ready, anchors=anchors)
         self.assertEqual(parent.state, LifecycleState.ACTIVE)
 
     def test_snapshot_roundtrip_and_single_active_guard(self):
@@ -108,10 +114,10 @@ class SuccessionCoordinatorTests(unittest.TestCase):
             recovery_attempted=True,
             recovery_failed=True,
         )
-        coordinator = SuccessionCoordinator(parent)
+        coordinator = SuccessionCoordinator(parent, profile="legacy")
         outcome = coordinator.succeed(failure=failure, anchors=anchors)
         payload = json.loads(json.dumps(coordinator.snapshot(), ensure_ascii=False))
-        restored = SuccessionCoordinator.from_snapshot(payload)
+        restored = SuccessionCoordinator.from_snapshot(payload, profile="legacy")
         self.assertEqual(restored.active_instance_id, outcome.successor.instance_id)
         self.assertTrue(restored.verify())
         with self.assertRaises(SuccessionRuntimeError):
@@ -126,12 +132,56 @@ class SuccessionCoordinatorTests(unittest.TestCase):
             failure_class=FailureClass.TRANSIENT,
             reason="temporary timeout",
         )
-        coordinator = SuccessionCoordinator(parent)
+        coordinator = SuccessionCoordinator(parent, profile="legacy")
         with self.assertRaises(SuccessionRuntimeError):
             coordinator.succeed(failure=failure, anchors=anchors)
         self.assertEqual(parent.state, LifecycleState.ACTIVE)
         self.assertIsNone(coordinator.successor)
         self.assertEqual(len(coordinator.succession_ledger.records), 0)
+
+    def test_production_requires_all_durable_sinks(self):
+        parent = LifeKernel()
+        with self.assertRaises(TypeError):
+            SuccessionCoordinator(parent, profile="production")
+        with self.assertRaises(TypeError):
+            SuccessionCoordinator(
+                parent,
+                profile="production",
+                life_event_sink=_durable_sink,
+                anchor_sink=_durable_sink,
+            )
+
+    def test_production_requires_explicit_sink_ack(self):
+        for response in (None, 1, "ok", object(), False):
+            with self.subTest(response_type=type(response).__name__):
+                parent = LifeKernel()
+                parent.transition(LifecycleState.BOOTSTRAPPING, "boot")
+                parent.transition(LifecycleState.ACTIVE, "ready")
+                failure = FailureAssessment(
+                    failure_class=FailureClass.HARD_INTEGRITY_FAILURE,
+                    reason="no-op sink probe",
+                )
+                anchors = _anchors(
+                    parent.lineage_id, parent.instance_id, parent.generation
+                )
+
+                def no_op(_payload, value=response):
+                    return value
+
+                coordinator = SuccessionCoordinator(
+                    parent,
+                    profile="production",
+                    life_event_sink=no_op,
+                    anchor_sink=no_op,
+                    record_sink=no_op,
+                )
+                with self.assertRaises(SuccessionRuntimeError):
+                    coordinator.succeed(failure=failure, anchors=anchors)
+                # The parent may be staged, but an ambiguous/no-op response
+                # must never let it cross the terminal seal or expose a
+                # successor as a completed handover.
+                self.assertEqual(parent.state, LifecycleState.SUCCESSION_PENDING)
+                self.assertIsNone(coordinator.successor)
 
     def test_production_rejects_bare_or_duck_reevaluation_attestations(self):
         parent = LifeKernel()
@@ -157,7 +207,13 @@ class SuccessionCoordinatorTests(unittest.TestCase):
             failure_class=FailureClass.HARD_INTEGRITY_FAILURE,
             reason="reevaluation gate",
         )
-        coordinator = SuccessionCoordinator(parent)
+        coordinator = SuccessionCoordinator(
+            parent,
+            profile="production",
+            life_event_sink=_durable_sink,
+            anchor_sink=_durable_sink,
+            record_sink=_durable_sink,
+        )
         with self.assertRaises(SuccessionRuntimeError):
             coordinator.succeed(
                 failure=failure,
@@ -209,7 +265,7 @@ class SuccessionCoordinatorTests(unittest.TestCase):
             failure_class=FailureClass.HARD_INTEGRITY_FAILURE,
             reason="corrupt history",
         )
-        outcome = SuccessionCoordinator(parent).succeed(
+        outcome = SuccessionCoordinator(parent, profile="legacy").succeed(
             failure=failure,
             anchors=anchors,
         )
@@ -221,7 +277,7 @@ class SuccessionCoordinatorTests(unittest.TestCase):
         parent = LifeKernel()
         parent.transition(LifecycleState.BOOTSTRAPPING, "boot")
         parent.transition(LifecycleState.ACTIVE, "ready")
-        coordinator = SuccessionCoordinator(parent)
+        coordinator = SuccessionCoordinator(parent, profile="legacy")
         coordinator.succeed(
             failure=FailureAssessment(
                 failure_class=FailureClass.HARD_INTEGRITY_FAILURE,
@@ -240,7 +296,7 @@ class SuccessionCoordinatorTests(unittest.TestCase):
         parent = LifeKernel()
         parent.transition(LifecycleState.BOOTSTRAPPING, "boot")
         parent.transition(LifecycleState.ACTIVE, "ready")
-        coordinator = SuccessionCoordinator(parent)
+        coordinator = SuccessionCoordinator(parent, profile="legacy")
         coordinator.succeed(
             failure=FailureAssessment(
                 failure_class=FailureClass.HARD_INTEGRITY_FAILURE,
@@ -259,7 +315,7 @@ class SuccessionCoordinatorTests(unittest.TestCase):
         parent = LifeKernel()
         parent.transition(LifecycleState.BOOTSTRAPPING, "boot")
         parent.transition(LifecycleState.ACTIVE, "ready")
-        coordinator = SuccessionCoordinator(parent)
+        coordinator = SuccessionCoordinator(parent, profile="legacy")
         outcome = coordinator.succeed(
             failure=FailureAssessment(
                 failure_class=FailureClass.HARD_INTEGRITY_FAILURE,
@@ -284,7 +340,7 @@ class SuccessionCoordinatorTests(unittest.TestCase):
         parent = LifeKernel()
         parent.transition(LifecycleState.BOOTSTRAPPING, "boot")
         parent.transition(LifecycleState.ACTIVE, "ready")
-        coordinator = SuccessionCoordinator(parent)
+        coordinator = SuccessionCoordinator(parent, profile="legacy")
         outcome = coordinator.succeed(
             failure=FailureAssessment(
                 failure_class=FailureClass.HARD_INTEGRITY_FAILURE,
@@ -337,7 +393,7 @@ class SuccessionCoordinatorTests(unittest.TestCase):
         parent.transition(LifecycleState.BOOTSTRAPPING, "boot")
         parent.transition(LifecycleState.ACTIVE, "ready")
         vault = __import__("brain.succession", fromlist=["AnchorVault"]).AnchorVault()
-        coordinator = SuccessionCoordinator(parent, anchor_vault=vault)
+        coordinator = SuccessionCoordinator(parent, anchor_vault=vault, profile="legacy")
         coordinator.succeed(
             failure=FailureAssessment(
                 failure_class=FailureClass.HARD_INTEGRITY_FAILURE,
@@ -356,7 +412,10 @@ class SuccessionCoordinatorTests(unittest.TestCase):
             failure_class=FailureClass.HARD_INTEGRITY_FAILURE,
             reason="concurrent fault",
         )
-        coordinators = [SuccessionCoordinator(parent), SuccessionCoordinator(parent)]
+        coordinators = [
+            SuccessionCoordinator(parent, profile="legacy"),
+            SuccessionCoordinator(parent, profile="legacy"),
+        ]
         results = []
         errors = []
 
@@ -404,7 +463,7 @@ class SuccessionCoordinatorTests(unittest.TestCase):
         self.assertEqual(len(coordinator.active_kernels), 1)
         self.assertTrue(coordinator.verify())
         with self.assertRaises(SuccessionRuntimeError):
-            SuccessionCoordinator(parent).activate_successor(Receipt())
+            SuccessionCoordinator(parent, profile="legacy").activate_successor(Receipt())
 
     def test_production_activation_attestation_binds_the_exact_successor_boundary(self):
         parent = LifeKernel()
@@ -412,6 +471,9 @@ class SuccessionCoordinatorTests(unittest.TestCase):
         parent.transition(LifecycleState.ACTIVE, "ready")
         coordinator = SuccessionCoordinator(
             parent,
+            life_event_sink=_durable_sink,
+            anchor_sink=_durable_sink,
+            record_sink=_durable_sink,
             activation_attestor=SuccessorActivationAttestor(
                 secret=b"successor-attestor-secret-012345"
             ),
@@ -473,10 +535,20 @@ class SuccessionCoordinatorTests(unittest.TestCase):
         SuccessionCoordinator.release_control(child)
         with self.assertRaises(SuccessionRuntimeError):
             SuccessionCoordinator.from_snapshot(
-                missing, activation_attestor=coordinator.activation_attestor
+                missing,
+                profile="production",
+                life_event_sink=_durable_sink,
+                anchor_sink=_durable_sink,
+                record_sink=_durable_sink,
+                activation_attestor=coordinator.activation_attestor,
             )
         restored = SuccessionCoordinator.from_snapshot(
-            payload, activation_attestor=coordinator.activation_attestor
+            payload,
+            profile="production",
+            life_event_sink=_durable_sink,
+            anchor_sink=_durable_sink,
+            record_sink=_durable_sink,
+            activation_attestor=coordinator.activation_attestor,
         )
         try:
             self.assertEqual(restored.successor.state, LifecycleState.ACTIVE)
@@ -491,6 +563,9 @@ class SuccessionCoordinatorTests(unittest.TestCase):
         other_parent.transition(LifecycleState.ACTIVE, "ready")
         other = SuccessionCoordinator(
             other_parent,
+            life_event_sink=_durable_sink,
+            anchor_sink=_durable_sink,
+            record_sink=_durable_sink,
             activation_attestor=coordinator.activation_attestor,
         )
         other_outcome = other.succeed(

@@ -194,14 +194,14 @@ class VerifiedLearningFeedbackTests(unittest.TestCase):
         self.assertEqual(duplicate_after_restart.disposition, LearningDisposition.DUPLICATE)
 
     def test_summary_is_bounded_and_credentials_are_redacted(self):
-        secret = "Authorization: Bearer abcdefghijklmnopqrstuvwxyz"
+        secret = "Authorization: Bearer test-token"
         receipt = self.apply(verified("outcome-secret", summary=secret))
         self.assertEqual(receipt.disposition, LearningDisposition.POSITIVE)
-        self.assertNotIn("abcdefghijklmnopqrstuvwxyz", self.procedural._experience_buffer[-1]["result"])
+        self.assertNotIn("test-token", self.procedural._experience_buffer[-1]["result"])
         row = self.memory.conn.execute(
             "SELECT content FROM memories WHERE id = ?", (receipt.memory_ids[0],)
         ).fetchone()
-        self.assertNotIn("abcdefghijklmnopqrstuvwxyz", row["content"])
+        self.assertNotIn("test-token", row["content"])
         self.assertIn("[REDACTED]", row["content"])
 
     def test_episode_record_is_accepted_without_importing_execution_module(self):

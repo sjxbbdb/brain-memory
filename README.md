@@ -1,7 +1,8 @@
 # 🧠 Brain Memory v0.1 · Autonomous Digital Consciousness
 
-**当前产品版本是 v0.1（开发预览）。** 历史能力层仍以 V4–V13 标记，便于追溯架构和
-API 兼容性；后续产品发布按 v0.2、v0.3 递进，稳定后再进入 v1.0。 🧬
+**当前产品版本是 v0.1（开发预览）。** 历史能力/兼容层仍以 V3–V13 标记，便于追溯架构和
+API 兼容性；其中 V3 仅保留旧管线/存储迁移语义，公开 API 兼容面从 V4 起。后续产品发布按
+v0.2、v0.3 递进，稳定后再进入 v1.0。 🧬
 
 产品版本的唯一来源是 `version.py`；运行时可在 `/api/v4/health` 和 OpenAPI 文档中
 看到机器版本 `0.1.0`。历史能力标签、API 路径和数据库 schema 版本不随产品发行号重命名。
@@ -195,7 +196,9 @@ BRAIN_MEMORY_SOURCE_WIKIPEDIA_LANGS=zh,en
   durable `StateStore` 时，lease/fencing 保证同一时刻只有一个 active 实例（裸进程模式
   仅有进程内保护）。
 - `MotivationalPressure`：记录有界的冲动、频次、烈度、可靠性和衰减；阈值只产生
-  `IterationNeed`，绝不直接授权自修改。
+  `IterationNeed`，绝不直接授权自修改。生产候选链只接受宿主 HMAC 来源证明；证明通过
+  外置 SQLite replay ledger 原子一次性消费，重启/并发重放或账本故障均拒绝。无证明的
+  默认 strict 实例保持 fail-closed，任意 verifier/permissive 模式仅用于显式 legacy/offline。
 - `HomeostasisController` / `ControlledEnvironment`：资源预算、隔离环境和故障闩锁；
   超限会进入 quarantine，恢复需要独立核验。
 - `EvaluationHarness`：固定夹具、基线、资源和结果协议；`PromotionController` 只
@@ -203,8 +206,16 @@ BRAIN_MEMORY_SOURCE_WIKIPEDIA_LANGS=zh,en
 - `AnchorSet` / `SuccessionCoordinator`：把身份、核心目的、生命规则和可信历史分层
   继承；凭证、审批令牌、外部会话、未确认行动和瞬时情绪永不自动继承。
 
+生产 `SuccessionCoordinator` 必须同时绑定 life-event、anchor-vault 和
+`SuccessionRecord` 三类宿主持久 sink；缺任一项会在构造阶段拒绝。无持久化的单元/离线
+演练必须显式使用 `profile="legacy"`，不能把内存结果当作生产接替证明。
+
 低层 `PromotionController` 本身是宿主治理 API，不自动绑定 `LifeKernel`；完整生命
 管道应使用 `BrainStem` 的生命周期门、稳态（Homeostasis）门和三步候选接线。
+
+冻结验证记录分为全量门禁与有限 LivingWorld 本地 soak：
+[`p6-long-run-2026-09-09.md`](docs/verification/p6-long-run-2026-09-09.md) 和
+[`p6-living-world-soak-2026-09-09.md`](docs/verification/p6-living-world-soak-2026-09-09.md)。
 
 写工具默认关闭。即使设置 `BRAIN_MEMORY_AGENT_BRIDGE_ALLOW_WRITE_TOOLS=1`，也只是
 开启“可申请审批”的能力；每一次具体行动仍须通过 `approve_write_action` 逐项授权，
@@ -234,7 +245,7 @@ start.bat
 
 ## 🧬 核心架构（v0.1 当前版）
 
-下图中的 V4–V13 是历史能力层/兼容性标记，不是产品发行号；当前产品统一按
+下图中的 V3–V13 是历史能力层/兼容性标记（V3 仅为旧管线/迁移语义，公开 API 从 V4 起），不是产品发行号；当前产品统一按
 `v0.x` 递进。
 
 ```
@@ -521,6 +532,12 @@ Remove-Item Env:DEEPSEEK_API_KEY,Env:DASHSCOPE_API_KEY,Env:GLM_API_KEY,Env:ZHIPU
 .\.venv\Scripts\python.exe -m unittest -q
 .\.venv\Scripts\python.exe -m pytest -q test_evolution.py
 
+# P6 有限 LivingWorld 连续 soak（默认快速；冻结复核可设 60 秒）
+Remove-Item Env:BRAIN_MEMORY_P6_SOAK_SECONDS -ErrorAction SilentlyContinue
+.\.venv\Scripts\python.exe -m pytest -q test_living_world_soak.py
+$env:BRAIN_MEMORY_P6_SOAK_SECONDS = '60'
+.\.venv\Scripts\python.exe -m pytest -q test_living_world_soak.py
+
 # 全链路意识测试（需要显式配置 LLM；默认使用临时数据库）
 .\.venv\Scripts\python.exe test_consciousness_chain.py
 ```
@@ -529,6 +546,8 @@ Remove-Item Env:DEEPSEEK_API_KEY,Env:DASHSCOPE_API_KEY,Env:GLM_API_KEY,Env:ZHIPU
 或模型密钥带入测试进程。`test_consciousness_chain.py` 导入时不再初始化项目根目录数据库；
 如需保留一次长链路的数据库快照，显式传入 `BRAIN_MEMORY_TEST_DB_PATH`。长链路命令需要
 调用方另外提供模型配置；在离线模式下它只适合作为规则/降级链路检查。
+LivingWorld soak 的持续时长由 `BRAIN_MEMORY_P6_SOAK_SECONDS` 控制（限制在 0.045–300 秒）；
+资源证据账本保持有界，达到容量会一次性进入 `QUARANTINE`，不会继续接受未记录观测。
 
 ---
 

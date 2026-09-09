@@ -140,6 +140,7 @@ def _call_sink(
     payload: dict[str, Any],
     *,
     label: str,
+    require_ack: bool = False,
 ) -> None:
     if sink is None:
         return
@@ -147,6 +148,15 @@ def _call_sink(
         result = sink(payload)
     except Exception as exc:  # pragma: no cover - adapter-specific exception
         raise SuccessionRuntimeError(f"{label} persistence failed") from exc
+    if require_ack:
+        # Production adapters must make the append acknowledgement explicit.
+        # Treating ``None`` or an arbitrary truthy object as success would let
+        # a no-op callable cross the durable handover boundary.
+        if result is not True:
+            raise SuccessionRuntimeError(
+                f"{label} persistence did not return explicit True"
+            )
+        return
     if result is not None and not bool(result):
         raise SuccessionRuntimeError(f"{label} persistence rejected the record")
 
@@ -859,9 +869,11 @@ class SuccessionCoordinator:
     """Serialize one irreversible parent-to-successor lifecycle boundary.
 
     The coordinator owns no process, network, tool or filesystem capability.
-    Optional sinks are host-controlled append functions.  It is safe to omit
-    them for an in-memory evaluation; a production host should supply durable
-    sinks and treat any rejection as a fail-closed incident.
+    Sinks are host-controlled append functions.  The explicit ``legacy``
+    profile may omit them for an in-memory evaluation.  A ``production``
+    coordinator requires all three durable projections (life event, anchor,
+    and succession record) to be bound before it can cross a succession
+    boundary; a sink rejection remains a fail-closed incident.
     """
 
     __slots__ = (
@@ -1002,6 +1014,13 @@ class SuccessionCoordinator:
 
         selected_profile = activation_profile if activation_profile is not None else profile
         profile_text = _normalise_activation_profile(selected_profile)
+        if profile_text == "production" and any(
+            sink is None
+            for sink in (life_event_sink, anchor_sink, record_sink)
+        ):
+            raise TypeError(
+                "production succession requires durable life, anchor, and record sinks"
+            )
         if require_activation_attestation is not None and not isinstance(
             require_activation_attestation, bool
         ):
@@ -1339,15 +1358,22 @@ class SuccessionCoordinator:
             )
         return ids, normalized or (dict(evaluation_receipts) if evaluation_receipts else None)
 
-    def _freeze_parent(
+    def _prepare_parent(
         self,
         *,
         failure: FailureAssessment,
-        terminal_state: LifecycleState,
         successor_instance_id: str,
         inheritance: InheritancePlan,
-        record: SuccessionRecord,
     ) -> None:
+        """Move the parent to the non-terminal succession staging state.
+
+        A durable sink is allowed to fail while the handover is being
+        published.  Therefore the terminal edge is deliberately kept out of
+        this phase: a rejected child/anchor/record append leaves the parent in
+        ``SUCCESSION_PENDING`` (or its original ``CREATED`` state), never in a
+        terminal state without a complete successor proof.
+        """
+
         parent = self._parent
         compact_evidence = {
             "incident_id": failure.incident_id,
@@ -1389,6 +1415,30 @@ class SuccessionCoordinator:
                     raise SuccessionRuntimeError(
                         "parent did not reach SUCCESSION_PENDING"
                     )
+        except SuccessionRuntimeError:
+            raise
+        except LifecycleError as exc:
+            raise SuccessionRuntimeError("parent could not enter succession staging") from exc
+
+    def _seal_parent(
+        self,
+        *,
+        failure: FailureAssessment,
+        terminal_state: LifecycleState,
+        successor_instance_id: str,
+        record: SuccessionRecord,
+    ) -> None:
+        """Commit the terminal parent edge after every handover sink passed."""
+
+        parent = self._parent
+        compact_evidence = {
+            "incident_id": failure.incident_id,
+            "failure_class": failure.failure_class.value,
+            "assessment_hash": failure.assessment_hash,
+        }
+        try:
+            if parent.state in _TERMINAL_STATES:
+                raise SuccessionRuntimeError("parent is already terminal")
 
             parent.transition(
                 terminal_state,
@@ -1404,7 +1454,35 @@ class SuccessionCoordinator:
         except SuccessionRuntimeError:
             raise
         except LifecycleError as exc:
-            raise SuccessionRuntimeError("parent could not be frozen safely") from exc
+            raise SuccessionRuntimeError("parent could not be sealed safely") from exc
+
+    # Kept as a narrow compatibility seam for embedders that used the private
+    # helper in an older release.  New code must call the two phases explicitly
+    # so sink failures cannot cross the terminal boundary prematurely.
+    def _freeze_parent(
+        self,
+        *,
+        failure: FailureAssessment,
+        terminal_state: LifecycleState,
+        successor_instance_id: str,
+        inheritance: InheritancePlan,
+        record: SuccessionRecord,
+    ) -> None:
+        if self._activation_profile != "legacy":
+            raise SuccessionRuntimeError(
+                "legacy freeze helper cannot bypass production staged handover"
+            )
+        self._prepare_parent(
+            failure=failure,
+            successor_instance_id=successor_instance_id,
+            inheritance=inheritance,
+        )
+        self._seal_parent(
+            failure=failure,
+            terminal_state=terminal_state,
+            successor_instance_id=successor_instance_id,
+            record=record,
+        )
 
     def succeed(
         self,
@@ -1455,6 +1533,11 @@ class SuccessionCoordinator:
                 successor_generation=self._parent.generation + 1,
                 reevaluated_anchor_ids=reevaluation_ids,
                 evaluation_receipts=reevaluation_receipts,
+                # Legacy coordinators are an explicit compatibility mode for
+                # old host adapters.  Production has already normalized to
+                # concrete EvaluationReceipt objects above and must never
+                # treat a bare ID as an independent attestation.
+                allow_legacy_attestation=self._activation_profile == "legacy",
             )
             plan.verify()
             if not plan.ready:
@@ -1505,37 +1588,47 @@ class SuccessionCoordinator:
             )
             candidate_outcome._verify_bindings()
 
-            # This is the irreversible point.  The parent loses its control
-            # lease before any child ledger, anchor or record is published.
-            self._freeze_parent(
+            # Stage the parent first, but keep it non-terminal until every
+            # durable handover sink has accepted its immutable projection.
+            # This makes a sink outage a recoverable/safe-stop state instead
+            # of a terminal parent with an unproven child.
+            self._prepare_parent(
+                failure=parsed_failure,
+                successor_instance_id=child_id,
+                inheritance=plan,
+            )
+
+            # Publish the child first so a lease-aware store can bind the
+            # pending parent and successor identity.  Anchors and the record
+            # follow, and only then is the parent terminal edge committed.
+            _call_sink(
+                self._life_event_sink,
+                successor.ledger.events[0].to_dict(),
+                label="successor genesis",
+                require_ack=self._activation_profile == "production",
+            )
+            _call_sink(
+                self._anchor_sink,
+                successor_anchors.to_dict(),
+                label="successor anchor",
+                require_ack=self._activation_profile == "production",
+            )
+            _call_sink(
+                self._record_sink,
+                record.to_dict(),
+                label="succession record",
+                require_ack=self._activation_profile == "production",
+            )
+            self._seal_parent(
                 failure=parsed_failure,
                 terminal_state=terminal,
                 successor_instance_id=child_id,
-                inheritance=plan,
                 record=record,
             )
             # The parent has no further control lease once terminal.  The
             # child is not claimed yet because it is still an unactivated
             # audit artifact; activation performs the next explicit claim.
             self.release_control(self._parent)
-
-            # Durable adapters are called before their in-memory projections.
-            # Any failure leaves a terminal parent and an unexposed child.
-            _call_sink(
-                self._life_event_sink,
-                successor.ledger.events[0].to_dict(),
-                label="successor genesis",
-            )
-            _call_sink(
-                self._anchor_sink,
-                successor_anchors.to_dict(),
-                label="successor anchor",
-            )
-            _call_sink(
-                self._record_sink,
-                record.to_dict(),
-                label="succession record",
-            )
 
             # Attach without replay because genesis was persisted explicitly.
             if self._life_event_sink is not None:
@@ -1833,6 +1926,7 @@ class SuccessionCoordinator:
         require_activation_attestation: bool | None = None,
         activation_attestor: SuccessorActivationAttestor | None = None,
         attestor: SuccessorActivationAttestor | None = None,
+        replay_life_events: bool = True,
     ) -> "SuccessionCoordinator":
         if not isinstance(data, Mapping):
             raise SuccessionRuntimeError("succession runtime snapshot is missing")
@@ -1976,7 +2070,10 @@ class SuccessionCoordinator:
                     cls.claim_control(successor)
                     child_claimed = True
                 if life_event_sink is not None:
-                    successor.attach_event_sink(life_event_sink, replay=True)
+                    successor.attach_event_sink(
+                        life_event_sink,
+                        replay=bool(replay_life_events),
+                    )
             if raw.get("active_instance_id") != coordinator.active_instance_id:
                 raise SuccessionRuntimeError("active instance projection mismatch")
             if (
@@ -2153,9 +2250,15 @@ def coordinate_succession(
     anchors: AnchorSet | Mapping[str, Any],
     **kwargs: Any,
 ) -> SuccessionOutcome:
-    """Small functional façade for an in-memory, one-shot handover."""
+    """Small legacy/in-memory façade for a one-shot handover.
 
-    return SuccessionCoordinator(parent).succeed(
+    Durable hosts must construct ``SuccessionCoordinator`` with all three
+    append sinks and the ``production`` profile explicitly.  Keeping this
+    convenience wrapper in the named legacy mode prevents an accidental
+    in-memory result from being mistaken for a persisted production handover.
+    """
+
+    return SuccessionCoordinator(parent, profile="legacy").succeed(
         failure=failure,
         anchors=anchors,
         **kwargs,

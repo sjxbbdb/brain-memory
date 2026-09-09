@@ -2555,8 +2555,10 @@ class PromotionController:
         "test_evolution_protected_surface.py",
         "test_homeostasis.py",
         "test_life_kernel.py",
+        "test_living_world_soak.py",
         "test_long_run_invariants.py",
         "test_motivation.py",
+        "test_motivation_replay.py",
         "test_self_maintenance_integration.py",
         "test_succession.py",
         "test_succession_runtime.py",
@@ -2657,6 +2659,23 @@ class PromotionController:
         if selected_budget is not None and not isinstance(selected_budget, ResourceBudget):
             raise PromotionError("resource_budget must be a ResourceBudget")
         self.resource_budget = selected_budget or ResourceBudget()
+        profile_text = _bounded_text(profile, 40).strip().lower() or "production"
+        profile_aliases = {
+            "prod": "production",
+            "strict": "production",
+            "host": "production",
+            "test": "legacy",
+            "dev": "legacy",
+            "local": "legacy",
+        }
+        profile_text = profile_aliases.get(profile_text, profile_text)
+        if profile_text not in {"production", "legacy"}:
+            raise PromotionError("profile must be 'production' or explicit 'legacy'")
+        self.profile = profile_text
+        if profile_text == "production" and persistence_path is None:
+            raise PromotionError(
+                "production profile requires an explicit external persistence_path"
+            )
         self.persistence_path: Path | None = None
         if persistence_path is not None:
             self.persistence_path = self._validate_persistence_location(persistence_path)
@@ -2706,25 +2725,16 @@ class PromotionController:
             )
         if ledger_location is not None:
             self._assert_ledger_location(Path(ledger_location))
+        if profile_text == "production" and ledger_location is None:
+            raise PromotionError(
+                "production profile requires an external file-backed promotion ledger"
+            )
         self.ledger = selected_ledger
         self.host_authorized = host_authorized is True
-        profile_text = _bounded_text(profile, 40).strip().lower() or "production"
-        profile_aliases = {
-            "prod": "production",
-            "strict": "production",
-            "host": "production",
-            "test": "legacy",
-            "dev": "legacy",
-            "local": "legacy",
-        }
-        profile_text = profile_aliases.get(profile_text, profile_text)
-        if profile_text not in {"production", "legacy"}:
-            raise PromotionError("profile must be 'production' or explicit 'legacy'")
         if require_sandbox_attestation is not None and not isinstance(require_sandbox_attestation, bool):
             raise PromotionError("require_sandbox_attestation must be a boolean")
         if profile_text == "production" and require_sandbox_attestation is False:
             raise PromotionError("production profile cannot disable sandbox attestation")
-        self.profile = profile_text
         self.require_sandbox_attestation = (
             profile_text == "production"
             if require_sandbox_attestation is None

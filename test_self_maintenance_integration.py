@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from brain.homeostasis import (
     HomeostasisAction,
 )
 from brain.life_kernel import LifecycleError, LifecycleState
+from brain.motivation import MotivationalPressure
 from storage.database import MemoryStore, StateStore, init_db
 
 
@@ -97,6 +99,50 @@ class SelfMaintenanceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await restored.stop()
             restored_store.close()
             restored_memory.close()
+
+    async def test_durable_motivation_snapshot_redacts_untrusted_observation_text(self):
+        with tempfile.TemporaryDirectory(prefix="brain-motivation-snapshot-") as temp:
+            db_path = str(Path(temp) / "brain.sqlite")
+            init_db(db_path)
+            store = StateStore(db_path)
+            memory = MemoryStore(db_path)
+            # An explicitly injected legacy accumulator lets this test place a
+            # hostile observation in the live buffer; BrainStem's persistence
+            # boundary must still redact it before SQLite receives the snap.
+            motivation = MotivationalPressure(decay_rate=0.0, clock=lambda: 0.0)
+            stem = BrainStem(
+                store,
+                memory,
+                motivation=motivation,
+                motivation_profile="legacy",
+            )
+            try:
+                await stem.start()
+                stem.record_impulse(
+                    "growth",
+                    intensity=1.0,
+                    source=r"C:\Users\24763\Desktop\motivation-secret.txt",
+                    context="ordinary-private-context https://example.invalid/?access_token=never-store",
+                    metadata={
+                        "api_key": "motivation-secret-value",
+                        "ordinary": "ordinary-private-metadata",
+                    },
+                    event_id="motivation-sensitive-1",
+                    timestamp="0",
+                    now=0,
+                )
+                self.assertTrue(await stem._snapshot_state())
+                saved = store.load_latest()
+                encoded = json.dumps(saved or {}, ensure_ascii=False)
+                self.assertNotIn("motivation-secret.txt", encoded)
+                self.assertNotIn("never-store", encoded)
+                self.assertNotIn("motivation-secret-value", encoded)
+                self.assertNotIn("ordinary-private-context", encoded)
+                self.assertNotIn("ordinary-private-metadata", encoded)
+            finally:
+                await stem.stop()
+                store.close()
+                memory.close()
 
     async def test_controlled_environment_audit_restores_only_under_host_binding(self):
         """A snapshot cannot mint a new root or enable networking."""

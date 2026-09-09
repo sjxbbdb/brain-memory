@@ -699,7 +699,7 @@ class LifeControlLeaseTests(unittest.TestCase):
             store.close()
 
     def test_handover_genesis_advances_fenced_head_for_crash_recovery(self):
-        """A crash after child genesis can still be taken over safely."""
+        """Staged child genesis is durable, but cannot claim before sealing."""
 
         with tempfile.TemporaryDirectory(prefix="life-control-handover-") as temp:
             path = str(Path(temp) / "brain.sqlite")
@@ -708,9 +708,18 @@ class LifeControlLeaseTests(unittest.TestCase):
             parent = LifeKernel()
             parent.transition(LifecycleState.BOOTSTRAPPING, "boot")
             parent.transition(LifecycleState.ACTIVE, "ready")
+            child = LifeKernel(
+                identity_core=parent.identity_core,
+                generation=parent.generation + 1,
+                parent_instance_id=parent.instance_id,
+            )
             parent.transition(LifecycleState.QUARANTINED, "fault")
-            parent.transition(LifecycleState.SUCCESSION_PENDING, "handover")
-            parent.transition(LifecycleState.DEAD, "sealed")
+            parent.transition(
+                LifecycleState.SUCCESSION_PENDING,
+                "handover",
+                metadata={"successor_instance_id": child.instance_id},
+                event_type="succession_pending",
+            )
             self.assertTrue(store.append_life_event(parent.ledger.events[0].to_dict()))
             lease = store.claim_life_control(
                 parent.lineage_id,
@@ -735,11 +744,6 @@ class LifeControlLeaseTests(unittest.TestCase):
                 self.assertIsNotNone(refreshed_parent)
                 assert refreshed_parent is not None
                 lease = refreshed_parent
-            child = LifeKernel(
-                identity_core=parent.identity_core,
-                generation=parent.generation + 1,
-                parent_instance_id=parent.instance_id,
-            )
             child_genesis = child.ledger.events[0]
             self.assertTrue(
                 store.append_life_event_handover(
@@ -753,8 +757,8 @@ class LifeControlLeaseTests(unittest.TestCase):
             self.assertIsNotNone(persisted)
             assert persisted is not None
             self.assertEqual(persisted.last_event_hash, child_genesis.event_hash)
-            # Simulate the original host disappearing before it releases the
-            # parent row.  The next host can fence it with the child head.
+            # A child head is fenced durably, but the remaining anchor/record/
+            # seal proof is still required before a new host may claim it.
             successor_lease = store.claim_life_control(
                 parent.lineage_id,
                 child.instance_id,
@@ -768,11 +772,51 @@ class LifeControlLeaseTests(unittest.TestCase):
                 now=266,
                 expected_last_event_hash=child_genesis.event_hash,
             )
-            self.assertIsNotNone(successor_lease)
-            assert successor_lease is not None
-            self.assertEqual(successor_lease.fencing, lease.fencing + 1)
+            self.assertIsNone(successor_lease)
             self.assertFalse(store.assert_life_control(lease, now=266.1))
-            self.assertTrue(store.release_life_control(successor_lease, now=267))
+            store.close()
+
+    def test_handover_rejects_terminal_parent_direct_write(self):
+        """Pre-staging terminal rows remain a read/migration boundary only."""
+
+        with tempfile.TemporaryDirectory(prefix="life-control-terminal-write-") as temp:
+            path = str(Path(temp) / "brain.sqlite")
+            init_db(path)
+            store = StateStore(path)
+            parent = LifeKernel()
+            parent.transition(LifecycleState.BOOTSTRAPPING, "boot")
+            parent.transition(LifecycleState.ACTIVE, "ready")
+            parent.transition(LifecycleState.QUARANTINED, "fault")
+            parent.transition(LifecycleState.SUCCESSION_PENDING, "handover")
+            parent.transition(LifecycleState.DEAD, "sealed")
+            for event in parent.ledger.events:
+                self.assertTrue(store.append_life_event(event.to_dict()))
+            lease = store.claim_life_control(
+                parent.lineage_id,
+                parent.instance_id,
+                "owner-terminal-write",
+                generation=parent.generation,
+                ttl_sec=5,
+                now=200,
+                expected_last_event_hash=parent.ledger.events[-1].event_hash,
+            )
+            self.assertIsNotNone(lease)
+            assert lease is not None
+            child = LifeKernel(
+                identity_core=parent.identity_core,
+                generation=parent.generation + 1,
+                parent_instance_id=parent.instance_id,
+            )
+            self.assertFalse(
+                store.append_life_event_handover(
+                    child.ledger.events[0].to_dict(),
+                    lease,
+                    successor_instance_id=child.instance_id,
+                    now=201,
+                )
+            )
+            self.assertEqual(store.load_life_events(instance_id=child.instance_id), [])
+            self.assertTrue(store.release_life_control(lease, now=202))
             store.close()
 
 

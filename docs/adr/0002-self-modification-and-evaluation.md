@@ -8,6 +8,8 @@ Status: accepted
 
 动机和情感可以产生 IterationNeed，但单次冲动不能直接授权代码变更；代码级迭代还需要独立客观证据。稳定时不迭代，主动 `EVOLUTION` 必须改善，紧急 `RECOVERY/SUCCESSION` 只需恢复最后可信基线。低层 `PromotionController` 是宿主治理 API，不自动绑定 `LifeKernel` 或 lineage；完整生命管道应由 `BrainStem` 先通过生命周期、稳态和权限门。修改宪法/生命周期路径或产生外部副作用仍需外部批准，系统不自动推送远程仓库。
 
+生产 `BrainStem` 不把调用方填写的 `source`、`source_kind="verified"` 或可靠度当成独立来源证明。每个可参与触发判断的 impulse 必须带由宿主 `MotivationSourceAttestor` 签发的短时 HMAC 证明，证明绑定稳定 `source_id`、事件 ID、完整规范化的内存事件载荷哈希（包含 source/context/metadata，但原文不落盘）、来源类型和有效期；独立来源计数使用证明中的稳定 `source_id`。接入生产 `PromotionController` 时，attestor 还必须绑定当前 `BrainStem` 的同一 durable `StateStore` 作为 append-only SQLite replay ledger，以 `BEGIN IMMEDIATE` 原子消费不含原文的 opaque proof hash；重启或并发进程不能再次消费同一证明，账本不可用时 fail-closed。签发密钥只留在宿主进程，快照只保存公开证明摘要，恢复后的历史事件不能凭旧快照重新获得触发权。strict 快照缺少或不匹配完整性标记时恢复为空状态；该非密钥哈希只负责发现意外篡改，不取代宿主签名或数据库 ACL。低层 `MotivationalPressure(require_source_attestation=False)` 与任意 `source_verifier` 仅为显式 legacy/offline 适配保留，不能接到生产自迭代授权链；绑定具体 HMAC attestor 的恢复即使快照改写 policy flag 也保持 strict。
+
 ### BrainStem 接线约束（P3）
 
 `BrainStem` 只提供显式的三步接线：`register_iteration_proposal` →
@@ -20,8 +22,7 @@ Status: accepted
 
 生产 `PromotionController` 的 sandbox attestation 门槛不能由脑干降级或绕过；没有
 宿主签发的一次性 `SandboxAttestation`，晋升必须失败且活动树保持不变。快照最多保存
-有界的提案、收据哈希和结果摘要，不保存 `host`、能力对象、候选路径或密钥；重启后
-宿主必须重新显式绑定并重新确认授权。
+有界且经过敏感字段/绝对路径/URL 检查的提案、收据和结果摘要，不保存 `host`、能力对象、候选路径或密钥。由于修改 `EvaluationReceipt` 任一字段都会使哈希失效，只要完整收据含敏感内容，快照就只保留非授权摘要与收据哈希，不保存可恢复的完整收据；重启后必须重新评估。动机事件的 `source`、`context`、metadata 和事件 ID 同样在持久化边界脱敏，签名原文和签发密钥永不进入快照。重启后宿主必须重新显式绑定并重新确认授权。
 
 ### 持久交换与恢复约束
 
@@ -49,9 +50,11 @@ attestor 秘密、容器/作业权限和远程仓库凭据放在候选不可访�
 SQLite 数据库及其 `-wal`、`-shm`、`-journal` 状态属于持久生命状态，不得放进可整树交换
 的 active/candidate 目录；生产宿主应通过活动树之外的绝对 `BRAIN_MEMORY_DB_PATH` 绑定
 它们，并在构造 `PromotionController` 时传入 `persistence_path`。控制器在初始化、暂存和
-恢复阶段都会拒绝发现这类文件；显式绑定还能在文件尚未创建时提前拒绝树内路径。代际接替记录同样遵循父级
-生命周期边界：已有 `life_ledger` 历史时，父实例必须是终态；只有没有父生命周期行的旧式
-离线审计记录保留兼容追加语义，不能绕过运行时 coordinator 的正常接替门。
+恢复阶段都会拒绝发现这类文件；显式绑定还能在文件尚未创建时提前拒绝树内路径。代际接替
+采用 staged handover：父实例必须先进入 `SUCCESSION_PENDING` 并绑定目标 child，随后才允许
+追加 child genesis、anchor set 与 SuccessionRecord；三者核验通过后才追加父代终态封口。
+没有父生命周期行的旧式离线审计记录只保留兼容追加语义，不能绕过运行时 coordinator 的
+pending、证据和封口门。
 
 ## Consequences
 

@@ -128,11 +128,11 @@ def _read_only_task_scheduler_snapshot(scheduler: Any, goal_system: Any) -> dict
     """Read scheduler state without running a mutating synchronization pass.
 
     ``LongTermTaskScheduler.sync`` normalizes legacy goals and may evict,
-    expire, or otherwise rewrite queue state.  V13 endpoints are GET-only
-    observability surfaces, so they use the explicit read-only method when
-    available and fall back to the historically pure ``snapshot`` method for
-    older scheduler implementations.  A failing optional diagnostic must not
-    turn the endpoint into a write path or make it unavailable.
+    expire, or otherwise rewrite queue state.  GET observability surfaces use
+    the explicit read-only method when available and fall back to the
+    historically pure ``snapshot`` method for older scheduler
+    implementations.  A failing optional diagnostic must not turn the
+    endpoint into a write path or make it unavailable.
     """
     if scheduler is None:
         return {}
@@ -641,16 +641,11 @@ async def health():
     loop_task = brain.brain_stem._task
     loop_running = bool(loop_task and not loop_task.done())
     task_scheduler = getattr(brain.brain_stem, "task_scheduler", None)
-    if task_scheduler is not None:
-        try:
-            task_scheduler.sync(brain.brain_stem.goal_system, state.get("total_ticks", 0))
-        except Exception:
-            # Health reporting must never make a healthy heartbeat look down.
-            pass
-    task_snapshot = (
-        task_scheduler.snapshot(brain.brain_stem.goal_system)
-        if task_scheduler is not None
-        else {}
+    # Health is a GET/observability path.  Synchronization belongs to the
+    # heartbeat/tick owner; invoking it here could expire goals, evict queue
+    # entries, or rewrite goal status as a side effect of an HTTP read.
+    task_snapshot = _read_only_task_scheduler_snapshot(
+        task_scheduler, getattr(brain.brain_stem, "goal_system", None)
     )
     return {
         "status": (
@@ -711,8 +706,7 @@ async def get_goals():
     snapshot = gs.snapshot()
     scheduler = getattr(brain.brain_stem, "task_scheduler", None)
     if scheduler is not None:
-        scheduler.sync(gs, brain.brain_stem.state.total_ticks)
-        snapshot["task_scheduler"] = scheduler.snapshot(gs)
+        snapshot["task_scheduler"] = _read_only_task_scheduler_snapshot(scheduler, gs)
     return snapshot
 
 
@@ -723,8 +717,7 @@ async def get_long_term_tasks():
     scheduler = getattr(brain.brain_stem, "task_scheduler", None)
     if scheduler is None:
         return {"enabled": False, "queue": []}
-    scheduler.sync(brain.brain_stem.goal_system, brain.brain_stem.state.total_ticks)
-    return scheduler.snapshot(brain.brain_stem.goal_system)
+    return _read_only_task_scheduler_snapshot(scheduler, brain.brain_stem.goal_system)
 
 
 @app.get("/api/v11/autonomy")

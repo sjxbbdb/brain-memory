@@ -126,6 +126,41 @@ class HomeostasisContractTests(unittest.TestCase):
         self.assertEqual(controller.last_decision.tick, 1)
         self.assertTrue(all(math.isfinite(value) for value in controller.usage.values()))
 
+    def test_ledger_capacity_quarantines_once_and_stays_bounded(self):
+        """A long-lived loop must not spin on capacity exceptions."""
+        controller = HomeostasisController(
+            ResourceBudget(limits={"compute_ms": 100.0}),
+            max_events=3,
+        )
+        first = controller.observe(
+            ResourceObservation(tick=1, usage={"compute_ms": 1.0})
+        )
+        second = controller.observe(
+            ResourceObservation(tick=2, usage={"compute_ms": 1.0})
+        )
+        terminal = controller.observe(
+            ResourceObservation(tick=3, usage={"compute_ms": 1.0})
+        )
+        self.assertEqual(first.action, HomeostasisAction.CONTINUE)
+        self.assertEqual(second.action, HomeostasisAction.CONTINUE)
+        self.assertEqual(terminal.action, HomeostasisAction.QUARANTINE)
+        self.assertIn("ledger_events", terminal.exceeded)
+        self.assertTrue(controller.quarantine_latched)
+        self.assertEqual(len(controller.ledger.events), 3)
+
+        # Subsequent heartbeats receive the same safe decision without trying
+        # to append beyond the cap or emitting an exception.
+        repeat = controller.observe(
+            ResourceObservation(tick=4, usage={"compute_ms": 1.0})
+        )
+        self.assertEqual(repeat.action, HomeostasisAction.QUARANTINE)
+        self.assertEqual(repeat, terminal)
+        self.assertEqual(len(controller.ledger.events), 3)
+
+        restored = HomeostasisController.from_snapshot(controller.snapshot())
+        self.assertTrue(restored.quarantine_latched)
+        self.assertEqual(len(restored.ledger.events), 3)
+
     def test_snapshot_rejects_non_finite_usage_projection(self):
         controller = HomeostasisController(self.budget)
         # Simulate a corrupted in-memory adapter without allowing the bad

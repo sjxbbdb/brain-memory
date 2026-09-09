@@ -238,10 +238,17 @@ class InheritanceContractsTests(unittest.TestCase):
 
     def test_independently_reevaluated_skill_can_be_inherited(self):
         skill = _anchor(AnchorKind.SKILL, "parser-v2", anchor_id="skill")
+        receipt = {
+            "accepted": True,
+            "receipt_id": "host-eval-skill",
+            "receipt_hash": "a" * 64,
+            "verify": lambda: True,
+        }
         plan = filter_inheritance(
             _anchor_set(skill),
             successor_generation=4,
             reevaluated_anchor_ids={"skill"},
+            evaluation_receipts={"skill": receipt},
         )
         self.assertIn("skill", plan.inherited_anchor_ids)
         self.assertEqual(
@@ -252,6 +259,15 @@ class InheritanceContractsTests(unittest.TestCase):
         self.assertEqual(successor.lineage_id, LINEAGE)
         self.assertEqual(successor.generation, 4)
         self.assertEqual(successor.instance_id, "instance-successor")
+
+    def test_bare_reevaluation_id_is_rejected_without_explicit_legacy_opt_in(self):
+        skill = _anchor(AnchorKind.SKILL, "parser-v2", anchor_id="skill")
+        with self.assertRaises(SuccessionError):
+            filter_inheritance(
+                _anchor_set(skill),
+                successor_generation=4,
+                reevaluated_anchor_ids={"skill"},
+            )
 
     def test_secret_task_session_and_unconfirmed_action_never_cross_boundary(self):
         forbidden = [
@@ -283,6 +299,35 @@ class InheritanceContractsTests(unittest.TestCase):
         )
         with self.assertRaises(AnchorIntegrityError):
             filter_inheritance(partial, successor_generation=4)
+
+    def test_verified_history_and_memory_with_embedded_secret_or_path_are_excluded(self):
+        sensitive_history = _anchor(
+            AnchorKind.LIFE_HISTORY,
+            {"episode": "learned", "metadata": {"access_token": "token-never-crosses"}},
+            anchor_id="sensitive-history",
+        )
+        sensitive_memory = _anchor(
+            AnchorKind.MEMORY,
+            r"C:\Users\24763\Desktop\private-memory.txt",
+            anchor_id="sensitive-memory",
+        )
+        plan = filter_inheritance(
+            _anchor_set(sensitive_history, sensitive_memory), successor_generation=4
+        )
+        self.assertNotIn("sensitive-history", plan.inherited_anchor_ids)
+        self.assertNotIn("sensitive-memory", plan.inherited_anchor_ids)
+        self.assertEqual(
+            plan.decision_for("sensitive-history").disposition,
+            InheritanceDisposition.EXCLUDED,
+        )
+        self.assertEqual(
+            plan.decision_for("sensitive-memory").disposition,
+            InheritanceDisposition.EXCLUDED,
+        )
+        successor = plan.build_successor_anchor_set("instance-successor")
+        serialized = json.dumps(successor.to_dict(), ensure_ascii=False)
+        self.assertNotIn("token-never-crosses", serialized)
+        self.assertNotIn("private-memory.txt", serialized)
 
 
 class FailureAndSuccessionRecordTests(unittest.TestCase):

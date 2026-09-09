@@ -537,6 +537,14 @@ class HomeostasisController:
         # silently claiming a different accounting state.
         for event in self.ledger.events:
             self._replay_event(event)
+        # A legacy snapshot may already have filled the bounded ledger without
+        # recording an explicit capacity event.  Treat that as a conservative
+        # quarantine on restore; never keep accepting unjournaled observations.
+        if len(self.ledger.events) >= self.ledger.max_events and not self._quarantine_latched:
+            self._quarantine_latched = True
+            self._last_decision = self._capacity_decision(
+                tick=self._last_tick if self._last_tick is not None else 0
+            )
 
     @property
     def quarantine_latched(self) -> bool:
@@ -641,12 +649,40 @@ class HomeostasisController:
             exceeded=tuple(exceeded),
         )
 
+    def _capacity_decision(self, *, tick: int) -> HomeostasisDecision:
+        """Return the stable fail-closed decision used after ledger saturation."""
+
+        ratios = {
+            name: (self._usage.get(name, 0.0) / limit)
+            for name, limit in self.budget.limits.items()
+        }
+        return HomeostasisDecision(
+            action=HomeostasisAction.QUARANTINE,
+            reason="resource evidence ledger capacity exhausted; quarantine required",
+            tick=_bounded_int(tick, name="tick", minimum=0),
+            ratios=ratios,
+            exceeded=("ledger_events",),
+        )
+
     def observe(self, observation: ResourceObservation) -> HomeostasisDecision:
         if not isinstance(observation, ResourceObservation):
             raise TypeError("observe expects ResourceObservation")
         with self._lock:
             if self._last_tick is not None and observation.tick < self._last_tick:
                 raise ValueError("resource observations must be monotonic")
+            # Reserve the final slot for a terminal capacity observation.  A
+            # bounded ledger must fail closed exactly once, not raise on every
+            # subsequent heartbeat and flood logs while leaving the lifecycle
+            # unaware of the safety condition.
+            if len(self.ledger.events) >= self.ledger.max_events:
+                if not self._quarantine_latched:
+                    self._quarantine_latched = True
+                    self._last_decision = self._capacity_decision(
+                        tick=observation.tick
+                    )
+                return self._last_decision or self._capacity_decision(
+                    tick=observation.tick
+                )
             previous_usage = dict(self._usage)
             previous_window = self._window_start_tick
             previous_last_tick = self._last_tick
@@ -657,7 +693,12 @@ class HomeostasisController:
                     self._usage = {}
                     self._window_start_tick = observation.tick
                 self._apply_usage(observation.usage)
-                decision = self._decide(observation)
+                capacity_terminal = len(self.ledger.events) >= self.ledger.max_events - 1
+                if capacity_terminal:
+                    self._quarantine_latched = True
+                    decision = self._capacity_decision(tick=observation.tick)
+                else:
+                    decision = self._decide(observation)
                 self.ledger.append(observation, decision)
             except Exception:
                 # Ledger persistence is part of the safety decision.  Do not

@@ -185,6 +185,32 @@ class BrainStemSuccessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stem.life_kernel.state, LifecycleState.ACTIVE)
         await stem.stop()
 
+    async def test_production_stem_without_state_store_rejects_noop_succession_sinks(self):
+        stem = BrainStem(succession_profile="production")
+        await stem.start()
+        try:
+            with self.assertRaises(TypeError):
+                stem._get_succession_coordinator()
+        finally:
+            await stem.stop()
+
+    async def test_production_stem_rejects_partial_durable_handover_api(self):
+        with tempfile.TemporaryDirectory(prefix="brain-succession-partial-api-") as temp:
+            db_path = str(Path(temp) / "brain.sqlite")
+            init_db(db_path)
+            store = StateStore(db_path)
+            # Simulate an adapter that exposes the ordinary lease seam but
+            # omits one of the immutable succession projections.  A missing
+            # anchor append must not be converted into the wrapper's legacy
+            # ``True`` result.
+            store.append_anchor_set = None
+            stem = BrainStem(store, succession_profile="production")
+            try:
+                with self.assertRaises(LifecycleError):
+                    stem._get_succession_coordinator()
+            finally:
+                store.close()
+
     async def test_partial_durable_handover_blocks_restart_without_activation_proof(self):
         """A child genesis without P5 records can never auto-start after a crash."""
 
@@ -199,19 +225,26 @@ class BrainStemSuccessionTests(unittest.IsolatedAsyncioTestCase):
             memory = MemoryStore(db_path)
             stem = BrainStem(store, memory, succession_profile="legacy")
             await stem.start()
-            with self.assertRaises(Exception):
-                await stem.succeed_to_next_generation(
-                    failure=FailureAssessment(
-                        failure_class=FailureClass.HARD_INTEGRITY_FAILURE,
-                        reason="anchor sink outage",
-                    ),
-                    anchors=_anchors(stem),
+            try:
+                with self.assertRaises(Exception):
+                    await stem.succeed_to_next_generation(
+                        failure=FailureAssessment(
+                            failure_class=FailureClass.HARD_INTEGRITY_FAILURE,
+                            reason="anchor sink outage",
+                        ),
+                        anchors=_anchors(stem),
+                    )
+                # The parent remains in the explicit non-terminal staging
+                # state until the child, anchors, record and terminal seal all
+                # commit.  A sink outage is therefore recoverable/safe-stop,
+                # with no succession record claiming completion.
+                self.assertEqual(
+                    stem.life_kernel.state, LifecycleState.SUCCESSION_PENDING
                 )
-            # The parent was sealed before the failing sink, while no child is
-            # exposed by the coordinator.  This is a safe-stop state.
-            self.assertEqual(stem.life_kernel.state, LifecycleState.DEAD)
-            store.close()
-            memory.close()
+                self.assertEqual(store.load_succession_records(), [])
+            finally:
+                store.close()
+                memory.close()
 
             restored_store = StateStore(db_path)
             restored_memory = MemoryStore(db_path)
@@ -222,7 +255,10 @@ class BrainStemSuccessionTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(LifecycleError):
                     await restored.start()
                 self.assertTrue(restored._life_restore_blocked)
-                self.assertIn("continuity", restored._life_restore_error)
+                self.assertTrue(
+                    "continuity" in restored._life_restore_error
+                    or "non-terminal" in restored._life_restore_error
+                )
             finally:
                 restored_store.close()
                 restored_memory.close()

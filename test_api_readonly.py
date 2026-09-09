@@ -168,6 +168,68 @@ class V13ReadOnlyApiTests(unittest.TestCase):
         )
         self.assertEqual(self.ledger.snapshot(), ledger_before)
 
+    def test_health_goals_and_v11_get_routes_do_not_sync_scheduler(self):
+        """All documented GET observability routes must remain side-effect free."""
+        goal_before = copy.deepcopy(self.goal.to_dict())
+        scheduler_before = copy.deepcopy(
+            {
+                key: value
+                for key, value in self.scheduler.__dict__.items()
+                if key != "sync_calls"
+            }
+        )
+
+        memory = types.SimpleNamespace(
+            count=lambda: 0,
+            get_identity_memories=lambda _limit: [],
+        )
+
+        async def _state():
+            return {"total_ticks": 42, "uptime_seconds": 1.0}
+
+        stem = types.SimpleNamespace(
+            _task=None,
+            state=types.SimpleNamespace(
+                total_ticks=42,
+                session_manager=types.SimpleNamespace(get_session_count=lambda: 0),
+            ),
+            goal_system=self.goals,
+            task_scheduler=self.scheduler,
+            task_execution=None,
+            learning_feedback=None,
+            drive_engine=None,
+            boundary=None,
+            sleep_state="awake",
+        )
+        fake_brain = types.SimpleNamespace(
+            brain_stem=stem,
+            get_state=_state,
+            is_awake=False,
+            memory_store=memory,
+        )
+        previous_brain = api_main._brain
+        api_main._brain = fake_brain
+        try:
+            health = self._call(api_main.health())
+            goals = self._call(api_main.get_goals())
+            tasks = self._call(api_main.get_long_term_tasks())
+        finally:
+            api_main._brain = previous_brain
+
+        self.assertIn("tasks", health)
+        self.assertIn("task_scheduler", goals)
+        self.assertEqual(tasks["last_tick"], 7)
+        self.assertEqual(self.scheduler.sync_calls, 0)
+        self.assertEqual(self.goal.to_dict(), goal_before)
+        self.assertEqual(
+            {
+                key: value
+                for key, value in self.scheduler.__dict__.items()
+                if key != "sync_calls"
+            },
+            scheduler_before,
+        )
+
     def test_v13_listing_does_not_evict_an_overfull_legacy_queue(self):
         """A GET must not enforce capacity; eviction belongs to sync/tick."""
         self.scheduler.max_queue = 1

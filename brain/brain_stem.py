@@ -103,6 +103,7 @@ from brain.motivation import (
     ChangeProposal,
     ImpulseEvent,
     IterationNeed,
+    MotivationSourceAttestor,
     MotivationalPressure,
 )
 from brain.succession import (
@@ -180,6 +181,40 @@ class BrainStem:
     # Keeping the limit here prevents a long-running subject from turning an
     # otherwise safe proposal seam into an unbounded memory sink.
     _ITERATION_RECORD_LIMIT = 32
+    _ITERATION_SENSITIVE_KEYS = frozenset(
+        {
+            "api_key",
+            "apikey",
+            "access_token",
+            "refresh_token",
+            "password",
+            "passwd",
+            "secret",
+            "authorization",
+            "cookie",
+            "credential",
+            "private_key",
+            "host_capability",
+            "attestation_secret",
+            "path",
+            "cwd",
+            "working_directory",
+            "source_path",
+            "candidate_path",
+            "url",
+        }
+    )
+    _ITERATION_ABSOLUTE_PATH_RE = re.compile(
+        r"(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/]|/(?:Users|home|root|tmp|var|etc|mnt|opt|srv)(?:[\\/]|$))",
+        re.IGNORECASE,
+    )
+    _ITERATION_SECRET_VALUE_RE = re.compile(
+        r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|authorization|bearer|cookie|credential|private[_-]?key)\s*[:=]"
+        r"|\bgh[pousr]_[A-Za-z0-9_]{12,}\b"
+        r"|\bsk-[A-Za-z0-9_-]{16,}\b"
+        r"|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -189,6 +224,10 @@ class BrainStem:
         life_kernel=None,
         homeostasis=None,
         motivation=None,
+        motivation_profile: str = "production",
+        motivation_source_attestor=None,
+        motivation_source_verifier=None,
+        motivation_require_source_attestation: bool | None = None,
         controlled_environment=None,
         succession_coordinator=None,
         anchor_vault=None,
@@ -299,6 +338,72 @@ class BrainStem:
             raise TypeError("homeostasis must be a HomeostasisController")
         if motivation is not None and not isinstance(motivation, MotivationalPressure):
             raise TypeError("motivation must be a MotivationalPressure")
+        motivation_mode = str(motivation_profile or "production").strip().lower()
+        motivation_mode = {
+            "strict": "production",
+            "offline": "legacy",
+            "compatibility": "legacy",
+        }.get(motivation_mode, motivation_mode)
+        if motivation_mode not in {"production", "legacy"}:
+            raise ValueError(
+                "motivation_profile must be 'production' or explicit 'legacy'"
+            )
+        self.motivation_profile = motivation_mode
+        if motivation is not None:
+            # An injected accumulator is already a live policy object.  Do
+            # not let separate constructor arguments describe a different
+            # attestor/verifier/strictness than the object that will actually
+            # admit events; that would run permissively until the first
+            # restart and then silently restore under another policy.
+            if (
+                motivation_source_attestor is not None
+                and getattr(motivation, "source_attestor", None)
+                is not motivation_source_attestor
+            ):
+                raise ValueError(
+                    "motivation source attestor does not match injected motivation"
+                )
+            if (
+                motivation_source_verifier is not None
+                and getattr(motivation, "source_verifier", None)
+                is not motivation_source_verifier
+            ):
+                raise ValueError(
+                    "motivation source verifier does not match injected motivation"
+                )
+            if (
+                motivation_require_source_attestation is not None
+                and bool(
+                    getattr(motivation, "require_source_attestation", False)
+                )
+                != bool(motivation_require_source_attestation)
+            ):
+                raise ValueError(
+                    "motivation attestation policy does not match injected motivation"
+                )
+            if (
+                self.motivation_profile == "production"
+                and not bool(
+                    getattr(motivation, "require_source_attestation", False)
+                )
+            ):
+                raise ValueError(
+                    "permissive motivation requires explicit legacy profile"
+                )
+        if (
+            self.motivation_profile == "production"
+            and motivation_require_source_attestation is False
+        ):
+            raise ValueError(
+                "production motivation cannot disable source attestation"
+            )
+        if (
+            self.motivation_profile == "production"
+            and motivation_source_verifier is not None
+        ):
+            raise ValueError(
+                "arbitrary source_verifier requires explicit legacy profile"
+            )
         if controlled_environment is not None and not isinstance(
             controlled_environment, ControlledEnvironment
         ):
@@ -313,8 +418,33 @@ class BrainStem:
             else HomeostasisController(HomeostasisBudget())
         )
         self.homeostasis_controller = self.homeostasis
-        self.motivation = (
-            motivation if motivation is not None else MotivationalPressure()
+        self._motivation_source_attestor = (
+            motivation_source_attestor
+            if motivation_source_attestor is not None
+            else getattr(motivation, "source_attestor", None)
+        )
+        self._motivation_source_verifier = (
+            motivation_source_verifier
+            if motivation_source_verifier is not None
+            else getattr(motivation, "source_verifier", None)
+        )
+        if motivation is not None:
+            self._motivation_require_source_attestation = bool(
+                getattr(motivation, "require_source_attestation", False)
+            )
+        elif motivation_require_source_attestation is not None:
+            self._motivation_require_source_attestation = bool(
+                motivation_require_source_attestation
+            )
+        else:
+            self._motivation_require_source_attestation = bool(
+                self.motivation_profile == "production"
+                or self._motivation_source_attestor is not None
+            )
+        self.motivation = motivation if motivation is not None else MotivationalPressure(
+            source_attestor=self._motivation_source_attestor,
+            source_verifier=self._motivation_source_verifier,
+            require_source_attestation=self._motivation_require_source_attestation,
         )
         self.motivational_pressure = self.motivation
         self.controlled_environment = controlled_environment
@@ -408,6 +538,7 @@ class BrainStem:
         # Readable aliases for embedders that use evaluator/evolution terms.
         self.evaluator = self.evaluation_harness
         self.evolution_controller = self.promotion_controller
+        self._assert_production_motivation_policy()
         if self.promotion_controller is not None and self.state_store is not None:
             # A database path can be created lazily by SQLite.  Bind it now so
             # a not-yet-created ``.sqlite`` file cannot later appear inside the
@@ -621,7 +752,7 @@ class BrainStem:
             self.state.motivation = {
                 "schema_version": 1,
                 "pressures": {
-                    str(key)[:80]: float(value)
+                    self._safe_motivation_label(key): float(value)
                     for key, value in list(pressures.items())[:128]
                 },
                 "total_received": int(self.motivation.total_received),
@@ -629,6 +760,21 @@ class BrainStem:
                 "total_rejected": int(self.motivation.total_rejected),
                 "total_self_rejected": int(self.motivation.total_self_rejected),
                 "total_needs_emitted": int(self.motivation.total_needs_emitted),
+                "source_attestation_required": bool(
+                    getattr(self.motivation, "require_source_attestation", False)
+                ),
+                "profile": self.motivation_profile,
+                "source_attestor_bound": bool(
+                    getattr(self.motivation, "source_attestor", None) is not None
+                    or getattr(self.motivation, "source_verifier", None) is not None
+                ),
+                "source_replay_durable": bool(
+                    getattr(
+                        getattr(self.motivation, "source_attestor", None),
+                        "durable_replay_enabled",
+                        False,
+                    )
+                ),
                 "snapshot_rejected": bool(
                     getattr(self.motivation, "snapshot_rejected", False)
                 ),
@@ -649,6 +795,74 @@ class BrainStem:
             }
         self._sync_life_projection()
 
+    @staticmethod
+    def _safe_motivation_label(value: Any) -> str:
+        """Keep the compact state projection free of caller-supplied prose."""
+
+        try:
+            raw = str(value).replace("\x00", "").strip()[:80]
+            text = raw.lower()
+        except Exception:
+            raw = ""
+            text = ""
+        if not text:
+            return "unknown"
+        if (
+            raw == text
+            and re.fullmatch(r"[a-z0-9][a-z0-9_.:-]{0,79}", text)
+            and not re.search(
+                r"(?:raw|user|payload|private|api[_-]?key|token|password|secret|"
+                r"credential|path|root|cwd|url)",
+                text,
+                re.IGNORECASE,
+            )
+        ):
+            return text
+        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+        return f"<redacted:motive:{digest}>"
+
+    def _assert_production_motivation_policy(self) -> None:
+        """Keep permissive motivation out of the production P3 seam."""
+
+        controller = getattr(self, "promotion_controller", None)
+        production_controller = bool(
+            controller is not None
+            and getattr(controller, "profile", "") == "production"
+        )
+        if (
+            getattr(self, "motivation_profile", "production") != "production"
+            and not production_controller
+        ):
+            return
+        motivation = getattr(self, "motivation", None)
+        if not isinstance(motivation, MotivationalPressure):
+            raise PermissionError("production iteration requires MotivationalPressure")
+        if not bool(getattr(motivation, "require_source_attestation", False)):
+            raise PermissionError(
+                "production iteration cannot use permissive motivation policy"
+            )
+        attestor = getattr(motivation, "source_attestor", None)
+        verifier = getattr(motivation, "source_verifier", None)
+        if verifier is not None or (
+            attestor is not None and not isinstance(attestor, MotivationSourceAttestor)
+        ):
+            raise PermissionError(
+                "production iteration requires a MotivationSourceAttestor"
+            )
+        if production_controller and attestor is not None and not bool(
+            getattr(attestor, "durable_replay_enabled", False)
+        ):
+            raise PermissionError(
+                "production iteration requires durable source-attestation replay protection"
+            )
+        if production_controller and attestor is not None and (
+            getattr(attestor, "replay_store", None)
+            is not getattr(self, "state_store", None)
+        ):
+            raise PermissionError(
+                "production source attestation must use the BrainStem StateStore replay ledger"
+            )
+
     def record_impulse(
         self,
         impulse: ImpulseEvent | dict[str, Any] | str,
@@ -658,6 +872,7 @@ class BrainStem:
         **kwargs: Any,
     ) -> float:
         """Record a motivational observation without granting change rights."""
+        self._assert_production_motivation_policy()
         now = kwargs.pop("now", None)
         if isinstance(impulse, ImpulseEvent):
             event = impulse
@@ -686,6 +901,7 @@ class BrainStem:
         now: Any = None,
     ) -> IterationNeed | None:
         """Return a bounded need record; never mutate source or authorize it."""
+        self._assert_production_motivation_policy()
         need = self.motivation.poll_iteration_need(motive=motive, now=now)
         if need is not None:
             self._last_iteration_need = need
@@ -767,18 +983,233 @@ class BrainStem:
             raise ValueError("proposal does not match the registered immutable record")
         return registered
 
-    @staticmethod
-    def _safe_iteration_proposal_dict(proposal: ChangeProposal) -> dict[str, Any]:
-        """Redact path-like candidate labels at the snapshot boundary."""
+    @classmethod
+    def _iteration_redaction_marker(cls, value: Any, label: str) -> str:
+        """Return a stable, non-reversible marker without retaining ``value``."""
 
-        payload = proposal.to_dict()
-        label = str(payload.get("candidate_revision", ""))[:180]
-        # ``candidate_revision`` is an opaque revision label, never a source
-        # path.  A host that accidentally supplies a path should not leak it
-        # through BrainState/SQLite; the candidate is re-bound explicitly on
-        # the next evaluation call.
-        if any(token in label for token in ("/", "\\", ":")):
-            payload["candidate_revision"] = ""
+        try:
+            raw = str(value)
+        except Exception:
+            raw = "<unprintable>"
+        digest = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
+        return f"<redacted:{label}:{digest}>"
+
+    @classmethod
+    def _iteration_text_is_sensitive(cls, value: Any, *, key: str = "") -> bool:
+        try:
+            text = str(value)
+        except Exception:
+            return True
+        lowered_key = key.casefold().replace("-", "_").replace(" ", "_")
+        if any(marker in lowered_key for marker in cls._ITERATION_SENSITIVE_KEYS):
+            return True
+        if any(token in lowered_key for token in ("candidate", "revision")) and any(
+            separator in text for separator in ("/", "\\", ":")
+        ):
+            return True
+        if cls._ITERATION_ABSOLUTE_PATH_RE.search(text):
+            return True
+        # URLs can carry credentials/query tokens and are host capabilities,
+        # not durable proposal evidence.
+        if "://" in text or cls._ITERATION_SECRET_VALUE_RE.search(text):
+            return True
+        return False
+
+    @classmethod
+    def _safe_iteration_text(
+        cls,
+        value: Any,
+        *,
+        key: str = "",
+        limit: int = 500,
+        empty: str = "",
+    ) -> str:
+        try:
+            text = "" if value is None else str(value)
+        except Exception:
+            text = ""
+        text = text.replace("\x00", " ")[:limit]
+        if not text:
+            return empty
+        if cls._iteration_text_is_sensitive(text, key=key):
+            return cls._iteration_redaction_marker(text, key or "value")
+        return text
+
+    @classmethod
+    def _safe_iteration_value(cls, value: Any, *, key: str = "", depth: int = 0) -> Any:
+        """Bound and redact arbitrary metadata before it reaches a snapshot."""
+
+        if depth > 3:
+            return "<depth-limit>"
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else 0.0
+        if isinstance(value, Mapping):
+            bounded: dict[str, Any] = {}
+            for raw_key, raw_value in list(value.items())[:24]:
+                safe_key = cls._safe_iteration_text(raw_key, key="metadata-key", limit=80)
+                if not safe_key:
+                    continue
+                if cls._iteration_text_is_sensitive(raw_key, key=str(raw_key)):
+                    bounded[safe_key] = cls._iteration_redaction_marker(raw_value, safe_key)
+                else:
+                    bounded[safe_key] = cls._safe_iteration_value(
+                        raw_value, key=str(raw_key), depth=depth + 1
+                    )
+            return bounded
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [
+                cls._safe_iteration_value(item, key=key, depth=depth + 1)
+                for item in list(value)[:24]
+            ]
+        return cls._safe_iteration_text(value, key=key, limit=500)
+
+    @classmethod
+    def _iteration_payload_contains_sensitive(
+        cls, value: Any, *, key: str = "", depth: int = 0
+    ) -> bool:
+        """Check a receipt before persisting its hash-addressed full payload.
+
+        An EvaluationReceipt cannot be field-redacted and remain verifiable.
+        When any nested field contains a host path, URL, or secret-shaped
+        value, the durable snapshot therefore keeps only a non-authorizing
+        summary and receipt hash; restoration deliberately skips that receipt.
+        """
+
+        if depth > 5:
+            return True
+        if cls._iteration_text_is_sensitive(key, key=key):
+            return True
+        if isinstance(value, Mapping):
+            return any(
+                cls._iteration_payload_contains_sensitive(
+                    raw_value, key=str(raw_key), depth=depth + 1
+                )
+                for raw_key, raw_value in list(value.items())[:128]
+            )
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return any(
+                cls._iteration_payload_contains_sensitive(
+                    item, key=key, depth=depth + 1
+                )
+                for item in list(value)[:256]
+            )
+        if isinstance(value, str):
+            return cls._iteration_text_is_sensitive(value, key=key)
+        return False
+
+    @classmethod
+    def _safe_iteration_receipt_summary(
+        cls, receipt: EvaluationReceipt
+    ) -> dict[str, Any]:
+        """Return the capability-free subset safe for API and persistence."""
+
+        raw = receipt.to_dict()
+        return {
+            "receipt_id": cls._safe_iteration_text(
+                raw.get("receipt_id", ""), key="receipt_id", limit=160
+            ),
+            "receipt_hash": (
+                str(raw.get("receipt_hash", "")).strip().lower()
+                if re.fullmatch(r"[0-9a-f]{64}", str(raw.get("receipt_hash", "")).strip().lower())
+                else ""
+            ),
+            "candidate_revision_id": cls._safe_iteration_text(
+                raw.get("candidate_revision_id", ""),
+                key="candidate_revision_id",
+                limit=160,
+            ),
+            "candidate_fingerprint": (
+                str(raw.get("candidate_fingerprint", "")).strip().lower()
+                if re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(raw.get("candidate_fingerprint", "")).strip().lower(),
+                )
+                else ""
+            ),
+            "mode": cls._safe_iteration_text(
+                raw.get("mode", ""), key="mode", limit=40
+            ),
+            "accepted": bool(raw.get("accepted", False)),
+            "outcome": cls._safe_iteration_text(
+                raw.get("outcome", ""), key="outcome", limit=120
+            ),
+            "isolated": bool(raw.get("isolated", False)),
+            "result_verified": bool(raw.get("result_verified", False)),
+        }
+
+    @classmethod
+    def _safe_iteration_receipt_envelope(
+        cls, proposal_id: str, receipt: EvaluationReceipt
+    ) -> dict[str, Any]:
+        raw = receipt.to_dict()
+        summary = cls._safe_iteration_receipt_summary(receipt)
+        redacted = cls._iteration_payload_contains_sensitive(raw)
+        return {
+            "proposal_id": cls._safe_iteration_text(
+                proposal_id, key="proposal_id", limit=100
+            ),
+            # Redacting fields would invalidate the evaluator's receipt hash.
+            # Omit the full object when unsafe and retain only a transparent,
+            # non-authorizing summary.  Such a receipt must be re-evaluated
+            # after restart before promotion can proceed.
+            "receipt": None if redacted else raw,
+            "receipt_hash": summary["receipt_hash"],
+            "summary": summary,
+            "binding": {
+                "revision_id": summary["candidate_revision_id"],
+                "fingerprint": summary["candidate_fingerprint"],
+            },
+            "redacted": redacted,
+        }
+
+    @classmethod
+    def _safe_iteration_proposal_dict(cls, proposal: ChangeProposal) -> dict[str, Any]:
+        """Redact host paths/capabilities and secret-shaped values at persistence."""
+
+        raw = proposal.to_dict()
+        payload = dict(raw)
+        for key, limit in (
+            ("title", 180),
+            ("scope", 180),
+            ("hypothesis", 1000),
+            ("created_at", 100),
+            ("status", 40),
+        ):
+            payload[key] = cls._safe_iteration_text(payload.get(key, ""), key=key, limit=limit)
+        for key in ("proposal_id", "need_id"):
+            value = cls._safe_iteration_text(payload.get(key, ""), key=key, limit=120)
+            payload[key] = value
+        for key in ("evidence", "expected_benefits", "risks"):
+            raw_items = payload.get(key, ())
+            if not isinstance(raw_items, (list, tuple)):
+                raw_items = (raw_items,)
+            payload[key] = [
+                cls._safe_iteration_text(item, key=key, limit=500)
+                for item in list(raw_items)[:32]
+            ]
+        for key in ("baseline_revision", "rollback_revision"):
+            payload[key] = cls._safe_iteration_text(
+                payload.get(key, ""), key=key, limit=180
+            )
+        # Candidate revisions are rebound explicitly to a fresh host path after
+        # restart.  Persisting even an opaque label here is unnecessary and can
+        # accidentally preserve a source path supplied by an adapter.
+        payload["candidate_revision"] = ""
+        payload["resource_budget"] = cls._safe_iteration_value(
+            payload.get("resource_budget", {}), key="resource_budget"
+        )
+        for key in (
+            "requires_external_approval",
+            "evaluation_required",
+            "authorized",
+            "is_authorized",
+            "can_apply",
+        ):
+            payload[key] = bool(payload.get(key, False))
         return payload
 
     @staticmethod
@@ -829,17 +1260,7 @@ class BrainStem:
         last_receipt = None
         if self._iteration_receipts:
             receipt = next(reversed(self._iteration_receipts.values()))
-            last_receipt = {
-                "receipt_id": receipt.receipt_id,
-                "receipt_hash": receipt.receipt_hash,
-                "candidate_revision_id": receipt.candidate_revision_id,
-                "candidate_fingerprint": receipt.candidate_fingerprint,
-                "mode": receipt.mode,
-                "accepted": receipt.accepted,
-                "outcome": receipt.outcome,
-                "isolated": receipt.isolated,
-                "result_verified": receipt.result_verified,
-            }
+            last_receipt = self._safe_iteration_receipt_summary(receipt)
         last_outcome = None
         if self._iteration_outcomes:
             last_outcome = self._safe_iteration_outcome_dict(
@@ -884,17 +1305,7 @@ class BrainStem:
             ]
         ]
         payload["receipts"] = [
-            {
-                "proposal_id": proposal_id,
-                "receipt": receipt.to_dict(),
-                "receipt_hash": receipt.receipt_hash,
-                # The receipt carries the evaluator-authoritative revision
-                # identity.  Do not persist a host-supplied source label/path.
-                "binding": {
-                    "revision_id": receipt.candidate_revision_id,
-                    "fingerprint": receipt.candidate_fingerprint,
-                },
-            }
+            self._safe_iteration_receipt_envelope(proposal_id, receipt)
             for proposal_id, receipt in list(self._iteration_receipts.items())[
                 -self._ITERATION_RECORD_LIMIT :
             ]
@@ -954,6 +1365,11 @@ class BrainStem:
                 proposal_id = str(item.get("proposal_id", ""))[:100]
                 if proposal_id not in self._iteration_proposals:
                     rejected += 1
+                    continue
+                if bool(item.get("redacted", False)):
+                    # The original receipt contained a path/secret-shaped
+                    # value and was intentionally not persisted.  Its summary
+                    # is observability only, never a promotion capability.
                     continue
                 try:
                     receipt_payload = item.get("receipt", {})
@@ -1025,6 +1441,7 @@ class BrainStem:
         """
 
         self._require_iteration_host(host)
+        self._assert_production_motivation_policy()
         need_obj = self._coerce_iteration_need(need)
         proposal = ChangeProposal.from_need(
             need_obj,
@@ -1074,6 +1491,7 @@ class BrainStem:
         """
 
         self._require_iteration_host(host)
+        self._assert_production_motivation_policy()
         registered = self._require_registered_iteration_proposal(proposal)
         if not registered.validate() == ():
             # This branch is defensive for records restored from old snapshots;
@@ -1147,6 +1565,7 @@ class BrainStem:
         """
 
         self._require_iteration_host(host)
+        self._assert_production_motivation_policy()
         registered = self._require_registered_iteration_proposal(proposal)
         # An active-tree write is a constitutional operation, not merely a
         # controller capability.  Keep the check in the BrainStem seam so a
@@ -1350,7 +1769,11 @@ class BrainStem:
         if not callable(append):
             append = getattr(store, "append_succession_anchor_set", None) if store is not None else None
         if not callable(append):
-            return True
+            # A production coordinator must never interpret a missing
+            # persistence projection as an acknowledged append.  The
+            # explicit legacy profile may retain the historical in-memory
+            # adapter behavior for offline tests.
+            return not self._succession_profile_is_production()
         return bool(append(payload))
 
     def _succession_record_sink(self, payload: dict[str, Any]) -> bool:
@@ -1362,8 +1785,14 @@ class BrainStem:
             else None
         )
         if not callable(append):
-            return True
+            return not self._succession_profile_is_production()
         return bool(append(payload))
+
+    def _succession_profile_is_production(self) -> bool:
+        """Return the normalized production/legacy policy for host checks."""
+
+        value = str(getattr(self, "succession_profile", "production") or "production")
+        return value.strip().lower() not in {"legacy", "test", "dev", "local", "compatibility"}
 
     def _get_succession_coordinator(self) -> SuccessionCoordinator:
         coordinator = self.succession_coordinator
@@ -1373,13 +1802,33 @@ class BrainStem:
                     "succession coordinator parent is not the current life kernel"
                 )
             return coordinator
+        if self._succession_profile_is_production() and self.state_store is not None:
+            required = (
+                "claim_life_control",
+                "renew_life_control",
+                "release_life_control",
+                "append_life_event",
+                "append_life_event_with_lease",
+                "append_life_event_handover",
+                "append_life_event_handover_seal",
+                "append_anchor_set",
+                "append_succession_record",
+            )
+            if any(not callable(getattr(self.state_store, name, None)) for name in required):
+                raise LifecycleError(
+                    "production succession requires the complete durable StateStore handover API"
+                )
         coordinator = SuccessionCoordinator(
             self.life_kernel,
             anchor_vault=self.anchor_vault,
             succession_ledger=self.succession_ledger,
             life_event_sink=self._life_event_sink if self.state_store is not None else None,
-            anchor_sink=self._succession_anchor_sink,
-            record_sink=self._succession_record_sink,
+            # Production succession requires durable projections.  The
+            # adapters below are intentionally not exposed when no store is
+            # attached; their historical no-op behavior remains available to
+            # explicit legacy/in-memory callers only.
+            anchor_sink=self._succession_anchor_sink if self.state_store is not None else None,
+            record_sink=self._succession_record_sink if self.state_store is not None else None,
             profile=self.succession_profile,
             activation_attestor=self.succession_activation_attestor,
         )
@@ -1433,10 +1882,11 @@ class BrainStem:
             await self._stop_runtime_for_succession()
             coordinator = self._get_succession_coordinator()
             parent_kernel = self.life_kernel
-            # The coordinator publishes a CREATED child genesis after it has
-            # sealed the parent.  Keep the parent's durable lease for all
-            # parent transitions, and open only the narrow genesis bypass in
-            # ``_life_event_sink`` until the coordinator returns.
+            # The coordinator publishes a CREATED child genesis while the
+            # parent remains SUCCESSION_PENDING, then seals the parent only
+            # after child/anchor/record persistence succeeds.  Keep the
+            # parent's durable lease for both phases and open only the narrow
+            # handover routes in ``_life_event_sink`` until it returns.
             self._life_handover_lineage = parent_kernel.lineage_id
             self._life_handover_parent_generation = parent_kernel.generation
             try:
@@ -1592,6 +2042,8 @@ class BrainStem:
                     "release_life_control",
                     "append_life_event_with_lease",
                     "append_life_event_handover",
+                    "append_life_event_handover_seal",
+                    "append_life_event_handover_finalize",
                 )
             )
         )
@@ -1631,12 +2083,15 @@ class BrainStem:
             )
 
     def _durable_life_handover_available(self) -> bool:
-        """Return whether the store also supports the child-genesis seam."""
+        """Return whether the store supports the complete staged handover."""
 
         return bool(
             self._durable_life_control_available()
             and self.state_store is not None
             and callable(getattr(self.state_store, "append_life_event_handover", None))
+            and callable(
+                getattr(self.state_store, "append_life_event_handover_seal", None)
+            )
         )
 
     def _claim_life_control(self, kernel: LifeKernel | None = None):
@@ -1795,12 +2250,80 @@ class BrainStem:
         # parent's durable proof is still held and the dedicated handover
         # adapter validates it while inserting the cross-generation event.
         if self._life_handover_lineage and isinstance(event, Mapping):
+            # The parent terminal edge is appended only after child genesis,
+            # anchors and the immutable succession record have landed.  Its
+            # predecessor is still the parent's pending hash, while the
+            # durable lease head has deliberately moved to the child hash;
+            # route it through the atomic seal seam and keep the local lease
+            # projection pinned to that child hash for the next claim.
+            try:
+                is_parent_seal = (
+                    str(event.get("lineage_id", "")) == self._life_handover_lineage
+                    and str(event.get("event_type", ""))
+                    == "succession_parent_sealed"
+                    and str(event.get("instance_id", ""))
+                    == self.life_kernel.instance_id
+                    and int(event.get("generation", -1))
+                    == int(
+                        self._life_handover_parent_generation
+                        if self._life_handover_parent_generation is not None
+                        else -1
+                    )
+                )
+            except (TypeError, ValueError, OverflowError):
+                is_parent_seal = False
+            if is_parent_seal:
+                lease = self._life_control_lease
+                seal_append = getattr(
+                    store, "append_life_event_handover_seal", None
+                )
+                if lease is not None and callable(seal_append) and self._durable_life_handover_available():
+                    metadata = event.get("metadata", {})
+                    if not isinstance(metadata, Mapping):
+                        metadata = {}
+                    try:
+                        accepted = bool(
+                            seal_append(
+                                event,
+                                lease,
+                                successor_instance_id=metadata.get(
+                                    "successor_instance_id"
+                                ),
+                                succession_record_id=metadata.get(
+                                    "succession_record_id"
+                                ),
+                                succession_record_hash=metadata.get(
+                                    "succession_record_hash"
+                                ),
+                            )
+                        )
+                    except Exception:
+                        accepted = False
+                    if not accepted:
+                        self._mark_life_control_lost(
+                            "durable succession seal rejected by lease"
+                        )
+                        return False
+                    # Do not replace ``last_event_hash`` with the parent's
+                    # terminal event hash: the StateStore intentionally keeps
+                    # the child genesis hash as the lineage handover head.
+                    return True
+                if self._has_any_life_lease_api(store):
+                    self._mark_life_control_lost(
+                        "durable succession seal API is not bound"
+                    )
+                    return False
+                try:
+                    return bool(append(event))
+                except Exception:
+                    return False
+
             try:
                 is_child_genesis = (
                     str(event.get("lineage_id", "")) == self._life_handover_lineage
                     and str(event.get("event_type", "")) == "created"
                     and int(event.get("sequence", 0) or 0) == 1
-                    and int(event.get("generation", -1) or -1)
+                    and int(event.get("generation", -1))
                     == int(
                         self._life_handover_parent_generation
                         if self._life_handover_parent_generation is not None
@@ -2206,8 +2729,15 @@ class BrainStem:
                 raw_runtime,
                 # The host's configured profile is authoritative; a mutable
                 # snapshot may not downgrade production to legacy on restart.
+                life_event_sink=self._life_event_sink if self.state_store is not None else None,
+                anchor_sink=self._succession_anchor_sink if self.state_store is not None else None,
+                record_sink=self._succession_record_sink if self.state_store is not None else None,
                 profile=self.succession_profile,
                 activation_attestor=self.succession_activation_attestor,
+                # The child ledger is attached below, after the durable child
+                # lease is reclaimed; replaying through the ordinary sink at
+                # this point would be an unleased write.
+                replay_life_events=False,
             )
         except Exception as exc:
             self._mark_life_restore_blocked(exc)
@@ -2313,8 +2843,8 @@ class BrainStem:
                 anchor_vault=vault,
                 succession_ledger=ledger,
                 life_event_sink=self._life_event_sink if store is not None else None,
-                anchor_sink=self._succession_anchor_sink,
-                record_sink=self._succession_record_sink,
+                anchor_sink=self._succession_anchor_sink if store is not None else None,
+                record_sink=self._succession_record_sink if store is not None else None,
                 profile=self.succession_profile,
                 activation_attestor=self.succession_activation_attestor,
             )
@@ -4756,11 +5286,23 @@ class BrainStem:
         raw_motivation = snapshot.get("motivation")
         if isinstance(raw_motivation, dict):
             try:
-                self.motivation = MotivationalPressure.from_snapshot(raw_motivation)
+                # Preserve the host-bound provenance policy and attestor.  A
+                # snapshot is data only; it cannot downgrade a production
+                # stem to caller-forgeable source labels or mint a verifier.
+                self.motivation = MotivationalPressure.from_snapshot(
+                    raw_motivation,
+                    source_attestor=self._motivation_source_attestor,
+                    source_verifier=self._motivation_source_verifier,
+                    require_source_attestation=self._motivation_require_source_attestation,
+                )
                 self.motivational_pressure = self.motivation
             except Exception as exc:
                 self._record_loop_error("motivation_restore", exc)
-                self.motivation = MotivationalPressure()
+                self.motivation = MotivationalPressure(
+                    source_attestor=self._motivation_source_attestor,
+                    source_verifier=self._motivation_source_verifier,
+                    require_source_attestation=self._motivation_require_source_attestation,
+                )
                 self.motivational_pressure = self.motivation
         self._sync_life_projection()
         self._sync_self_maintenance_projection()
@@ -6464,7 +7006,7 @@ Rules:
             # Keep the full safety/signal records outside the compact API
             # projections so restart can verify their independent history.
             snap["homeostasis"] = self.homeostasis.snapshot()
-            snap["motivation"] = self.motivation.snapshot()
+            snap["motivation"] = self.motivation.snapshot_for_persistence()
             # Persist only bounded, hash-addressed evidence metadata.  Host
             # capabilities and candidate source paths are intentionally absent;
             # a restart must receive a fresh explicit host binding.

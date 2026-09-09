@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import random
 import tempfile
 import unittest
 
@@ -57,6 +58,71 @@ def _anchors(kernel: LifeKernel) -> AnchorSet:
 
 
 class LongRunInvariantTests(unittest.TestCase):
+    def test_seeded_resource_fault_schedule_replays_safe_response(self):
+        """A reproducible pseudo-random fault matrix preserves its safe response."""
+
+        rng = random.Random(20260910)
+        dimensions = (
+            "compute_ms",
+            "memory_mb",
+            "storage_mb",
+            "network_calls",
+            "model_tokens",
+            "action_risk",
+            "attention_load",
+        )
+        for case in range(32):
+            fault_dimension = rng.choice(dimensions)
+            fault_tick = rng.randint(2, 9)
+            controller = HomeostasisController(
+                ResourceBudget(
+                    limits={name: 10.0 for name in dimensions},
+                    warning_ratio=0.70,
+                    critical_ratio=0.90,
+                    window_ticks=32,
+                )
+            )
+            for tick in range(1, fault_tick):
+                ordinary_dimension = rng.choice(dimensions)
+                decision = controller.observe(
+                    ResourceObservation(
+                        tick=tick,
+                        usage={ordinary_dimension: 0.05},
+                        source=f"seeded-case-{case}",
+                    )
+                )
+                self.assertNotEqual(decision.action.value, "quarantine")
+            decision = controller.observe(
+                ResourceObservation(
+                    tick=fault_tick,
+                    usage={fault_dimension: 11.0},
+                    source=f"seeded-fault-{case}",
+                )
+            )
+            self.assertIn(
+                decision.action.value,
+                {"SLEEP", "DEGRADE", "QUARANTINE"},
+            )
+            self.assertEqual(
+                controller.quarantine_latched,
+                fault_dimension == "action_risk",
+            )
+            restored = HomeostasisController.from_snapshot(
+                json.loads(json.dumps(controller.snapshot()))
+            )
+            self.assertEqual(
+                restored.quarantine_latched,
+                controller.quarantine_latched,
+            )
+            self.assertEqual(
+                restored.last_decision.action,
+                decision.action,
+            )
+            self.assertTrue(restored.ledger.verify_chain())
+            self.assertLessEqual(
+                len(restored.ledger.events), restored.ledger.max_events
+            )
+
     def test_motivation_remains_bounded_and_replayable(self):
         pressure = MotivationalPressure(
             threshold=0.95,
@@ -119,7 +185,10 @@ class LongRunInvariantTests(unittest.TestCase):
                     self.assertTrue(sandbox.verify())
                 self.assertEqual(directory_fingerprint(active), before)
             # A rejected authorization path must not create a rollback state.
-            controller = PromotionController(active)
+            # This soak assertion only exercises the local ledger replay path;
+            # production controllers must be wired with explicit external
+            # persistence and are covered by the dedicated configuration tests.
+            controller = PromotionController(active, profile="legacy")
             self.assertFalse(controller.rollback_available)
             self.assertTrue(controller.verify())
             for _ in range(12):
@@ -132,7 +201,7 @@ class LongRunInvariantTests(unittest.TestCase):
         parent = LifeKernel()
         parent.transition(LifecycleState.BOOTSTRAPPING, "soak boot")
         parent.transition(LifecycleState.ACTIVE, "soak ready")
-        coordinator = SuccessionCoordinator(parent)
+        coordinator = SuccessionCoordinator(parent, profile="legacy")
         outcome = coordinator.succeed(
             failure=FailureAssessment(
                 failure_class=FailureClass.HARD_INTEGRITY_FAILURE,
@@ -144,7 +213,7 @@ class LongRunInvariantTests(unittest.TestCase):
             snapshot = json.loads(json.dumps(coordinator.snapshot(), ensure_ascii=False))
             self.assertEqual(snapshot["active_instance_id"], outcome.successor.instance_id)
             self.assertTrue(coordinator.verify())
-        restored = SuccessionCoordinator.from_snapshot(snapshot)
+        restored = SuccessionCoordinator.from_snapshot(snapshot, profile="legacy")
         try:
             self.assertTrue(restored.verify())
             self.assertEqual(restored.successor.state, LifecycleState.CREATED)
