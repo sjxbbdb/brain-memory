@@ -8,6 +8,7 @@ promotion.
 from __future__ import annotations
 
 import json
+import inspect
 from pathlib import Path
 import subprocess
 import sys
@@ -36,6 +37,13 @@ from storage.database import MemoryStore, StateStore, init_db
 
 
 class BrainStemIterationTests(unittest.TestCase):
+    def test_cognitive_dispatch_ingests_emotion_once_per_tick(self):
+        """Dispatch output must not be applied again by the common emotion stage."""
+
+        tick_source = inspect.getsource(BrainStem._tick)
+        self.assertIn("self.cognitive_dispatch.dispatch(", tick_source)
+        self.assertEqual(tick_source.count("self.emotional_spectrum.ingest_llm_emotion("), 1)
+
     def _activate(self, stem: BrainStem) -> None:
         """Move a test kernel through the explicit constitutional wake edge."""
 

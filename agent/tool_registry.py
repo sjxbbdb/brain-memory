@@ -63,12 +63,16 @@ class ToolDef:
 
     def to_openai_schema(self) -> dict:
         """生成 OpenAI function calling 格式的 schema。"""
+        # Built-in tools provide the parameters JSON Schema directly.  Keep
+        # accepting the older ``{"parameters": ...}`` wrapper for callers
+        # that still use it.
+        parameters = self.schema.get("parameters", self.schema)
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.schema.get("parameters", {}),
+                "parameters": parameters,
             },
         }
 

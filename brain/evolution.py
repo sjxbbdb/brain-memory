@@ -1123,10 +1123,6 @@ _MANIFEST_NAME_RE = re.compile(
     r"^\.brain-memory-(?:backup|rollback-current)-[0-9a-f]{32}$"
 )
 _MANIFEST_STAGE_NAME_RE = re.compile(r"^\.brain-memory-stage-[A-Za-z0-9_-]{1,80}$")
-_MANIFEST_FAILED_NAME_RE = re.compile(
-    r"^\.brain-memory-failed-current-[0-9a-f]{32}$"
-)
-_MANIFEST_TEMP_NAME_RE = re.compile(r"^\.brain-memory-manifest-tmp-[A-Za-z0-9_-]{1,120}\.json$")
 
 
 def _root_identity_digest(root: Path) -> str:

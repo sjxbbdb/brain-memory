@@ -73,6 +73,28 @@ def _stop_process_tree(process: subprocess.Popen) -> None:
         process.wait(timeout=10)
 
 
+class ToolSchemaSmokeTests(unittest.TestCase):
+    def test_openai_schema_preserves_direct_and_wrapped_parameters(self):
+        async def tool_call(_args, _context):
+            return "ok"
+
+        direct = {"type": "object", "properties": {"query": {"type": "string"}}}
+        wrapped = {"parameters": direct}
+
+        self.assertEqual(
+            ToolDef("direct", "direct", direct, tool_call).to_openai_schema()[
+                "function"
+            ]["parameters"],
+            direct,
+        )
+        self.assertEqual(
+            ToolDef("wrapped", "wrapped", wrapped, tool_call).to_openai_schema()[
+                "function"
+            ]["parameters"],
+            direct,
+        )
+
+
 class V13ApiProcessSmokeTests(unittest.TestCase):
     def test_api_starts_on_isolated_database_and_exposes_read_only_metrics(self):
         with tempfile.TemporaryDirectory(prefix="brain-v13-api-smoke-") as temp_dir:

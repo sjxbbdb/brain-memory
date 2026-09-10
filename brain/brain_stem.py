@@ -5925,39 +5925,8 @@ class BrainStem:
                             )
                         )
 
-                        # ── V9: 规则引擎情绪已在 dispatch 中计算，跳过 LLM 情绪摄入 ──
-                        # 直接用规则引擎的 VAD 值（不做 LLM 情绪混合）
-                        llm_emotion = unified.get("emotion", {})
-                        if llm_emotion:
-                            v = float(llm_emotion.get("valence", 0.5))
-                            a = float(llm_emotion.get("arousal", 0.5))
-                            d = float(llm_emotion.get("dominance", 0.5))
-                            u = float(llm_emotion.get("urgency", 0.0))
-                            label = llm_emotion.get("label", "neutral")
-
-                            # V9: 规则引擎情绪权重低于 LLM 情绪但更高频更新
-                            self.emotional_spectrum.ingest_llm_emotion(v, a, d, label, u, activation=activation)
-                            # 同步杏仁核（使用与旧路径相同的混合逻辑）
-                            prev_v = self.amygdala.valence
-                            prev_a = self.amygdala.arousal
-                            prev_d = self.amygdala.dominance
-                            keep_ratio = 1.0 - LLM_EMOTION_BLEND_RATIO
-                            self.amygdala.valence = prev_v * keep_ratio + v * LLM_EMOTION_BLEND_RATIO
-                            self.amygdala.arousal = prev_a * keep_ratio + a * LLM_EMOTION_BLEND_RATIO
-                            self.amygdala.dominance = prev_d * keep_ratio + d * LLM_EMOTION_BLEND_RATIO
-                            self.amygdala.salience = a * 0.4 + u * 0.6
-
-                            amygdala_out["emotion_label"] = label
-                            amygdala_out["emotion_vector"] = {
-                                "valence": round(self.emotional_spectrum.valence, 3),
-                                "arousal": round(self.emotional_spectrum.arousal, 3),
-                                "dominance": round(self.emotional_spectrum.dominance, 3),
-                                "urgency": u,
-                                "salience": round(self.amygdala.salience, 3),
-                            }
-                            amygdala_out["salience"] = self.amygdala.salience
-                            self.state.emotion_vector.update(amygdala_out["emotion_vector"])
-                            self.state.current_emotion = self.emotional_spectrum.dominant_emotion
+                        # 情绪结果保留在统一 envelope 中，由下面的公共处理段
+                        # 摄入一次；这里不能再次写入同一份 dispatch 结果。
                     else:
                         # ── Legacy: 统一 LLM 调用（V5-V8 路径）──
                         from services.llm_prompts import UNIFIED_TICK_PROMPT

@@ -164,14 +164,7 @@ class LLMClient:
         import aiohttp
 
         # Deduplicate
-        unique = []
-        seen = set()
-        for t in texts:
-            key = t[:200]
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(t)
+        unique = list(dict.fromkeys(texts))
 
         # Check cache
         cached = {}
@@ -209,18 +202,8 @@ class LLMClient:
                 self._embedding_cache[text] = vec
                 cached[idx] = vec
 
-        # Reconstruct in original order
-        results = []
-        for t in texts:
-            key = t[:200]
-            for u in unique:
-                if u[:200] == key:
-                    results.append(self._embedding_cache.get(u) or [0.0])
-                    break
-            else:
-                results.append([0.0])
-
-        return results
+        # Exact text keys preserve order and make reconstruction linear.
+        return [self._embedding_cache.get(text) or [0.0] for text in texts]
 
     async def embed_single(self, text: str) -> list[float]:
         results = await self.embed([text])

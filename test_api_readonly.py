@@ -6,6 +6,7 @@ import asyncio
 import copy
 import types
 import unittest
+from unittest.mock import patch
 
 from brain.goal_system import Goal, GoalSystem
 from brain.task_execution import TaskExecutionLedger
@@ -250,6 +251,27 @@ class V13ReadOnlyApiTests(unittest.TestCase):
         self.assertEqual(self.scheduler.total_evicted, before_evictions)
         self.assertEqual(result["scheduler"]["queue_size"], 1)
         self.assertEqual(self.scheduler.sync_calls, 0)
+
+    def test_working_memory_reports_configured_capacity(self):
+        wm = types.SimpleNamespace(
+            get_state_snapshot=lambda: [],
+            get_context=lambda: "",
+        )
+        fake_brain = types.SimpleNamespace(
+            brain_stem=types.SimpleNamespace(
+                working_memory=wm,
+                state=types.SimpleNamespace(activation=object()),
+            )
+        )
+        previous_brain = api_main._brain
+        api_main._brain = fake_brain
+        try:
+            with patch.object(api_main, "WORKING_MEMORY_CAPACITY", 11):
+                result = self._call(api_main.get_working_memory_state())
+        finally:
+            api_main._brain = previous_brain
+
+        self.assertEqual(result["capacity"], 11)
 
 
 if __name__ == "__main__":

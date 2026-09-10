@@ -43,6 +43,7 @@ from config import (
     PORT,
     AGENT_BRIDGE_ENABLED,
     AGENT_BRIDGE_ALLOW_WRITE_TOOLS,
+    WORKING_MEMORY_CAPACITY,
 )
 from version import PRODUCT_VERSION, PRODUCT_VERSION_LABEL
 
@@ -868,7 +869,7 @@ async def get_working_memory_state():
     activation = brain.brain_stem.state.activation
     return {
         "items": wm.get_state_snapshot(),
-        "capacity": 7,
+        "capacity": WORKING_MEMORY_CAPACITY,
         "current_context": wm.get_context(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }

@@ -301,6 +301,21 @@ class StabilityBaselineTests(unittest.IsolatedAsyncioTestCase):
             result = await client.embed(["a", "a", "b"])
         self.assertEqual(result, [[1.0], [1.0], [2.0]])
 
+    async def test_llm_embed_does_not_merge_same_prefix(self):
+        """Inputs sharing the first 200 characters remain distinct."""
+        import services.llm_client as llm_module
+        from services.llm_client import LLMClient
+
+        first = "x" * 200 + "-first"
+        second = "x" * 200 + "-second"
+        client = LLMClient()
+        client._embedding_cache.update({first: [1.0], second: [2.0]})
+        with patch.object(llm_module, "OFFLINE_MODE", False), patch.object(
+            llm_module, "DASHSCOPE_KEY", "test-key"
+        ):
+            result = await client.embed([second, first, second])
+        self.assertEqual(result, [[2.0], [1.0], [2.0]])
+
     async def test_lifecycle_start_stop_is_serialized(self):
         stem = BrainStem()
         await asyncio.gather(stem.start(), stem.start())
