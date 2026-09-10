@@ -14,9 +14,8 @@ V6 升级: 元认知不仅监控自身，还校准 StateDiffusionEngine 的规�
 
 import logging
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 
 logger = logging.getLogger("brain-v6.metacognition")
 

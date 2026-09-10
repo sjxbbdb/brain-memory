@@ -549,7 +549,6 @@ async def get_identity_memories(limit: int = 20):
 async def get_memory_timeline(limit: int = 20):
     """Get recent memories as a timeline."""
     brain = get_brain()
-    from storage.database import MemoryStore
     ms = brain.memory_store
     recent = _shareable_memories(brain, ms.search("", limit=_bounded_limit(limit)))
     return {

@@ -34,10 +34,9 @@ from brain.default_mode import DefaultModeNetwork
 from brain.basal_ganglia import BasalGanglia
 from brain.cingulate import Cingulate
 from brain.dream import DreamEngine
-from brain.pipeline import gate_check, compute_emotion_weight, compute_strength, compress_clusters, run_consolidation, format_context_block
+from brain.pipeline import gate_check, run_consolidation
 from brain.working_memory import WorkingMemory
 from brain.brain_state import BrainState, SNAPSHOT_SCHEMA_VERSION
-from brain.self_model import SelfModel
 from brain.intent import Intent, IntentQueue, IntentType
 from brain.goal_system import GoalSystem, GoalStatus
 from brain.task_scheduler import LongTermTaskScheduler, TaskTier
@@ -48,7 +47,6 @@ from brain.time_sense import TimeSense
 from brain.drive_engine import DriveEngine, GoalGenerator, GoalScheduler, build_state_snapshot_for_drive_engine  # V7
 from brain.exploration import ExplorationQueue, ExplorationExecutor  # V8
 from brain.reflection_engine import ReflectionEngine  # V8
-from brain.core_purpose import core_purpose  # V8
 from brain.predictive_layer import PredictiveLayer  # V9
 from brain.cognitive_dispatch import CognitiveDispatch  # V9
 from brain.boredom import BoredomEngine  # V9
@@ -84,7 +82,6 @@ from brain.life_kernel import (
     LifeKernel,
     LifeIdentity,
     LedgerIntegrityError,
-    LedgerPersistenceError,
     LifecycleError,
     LifecycleEvent,
     LifecycleState,
@@ -132,11 +129,8 @@ from config import (
     CONSOLIDATION_INTERVAL_SEC,
     REFLECTION_INTERVAL_SEC,
     STATE_SNAPSHOT_INTERVAL_SEC,
-    SALIENCE_THRESHOLD,
     GATE_GOAL_RELEVANCE_DEFAULT,
     GATE_GOAL_RELEVANCE_WITH_GOAL,
-    GATE_GOAL_RELEVANCE_PASS,
-    GATE_NOVELTY_PASS,
     DEEP_REFLECTION_INTERVAL_TICKS,
     DEEP_REFLECTION_ENABLED,
     DREAM_ENABLED,

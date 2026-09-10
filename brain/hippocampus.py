@@ -11,7 +11,6 @@ import json
 import logging
 import math
 from datetime import datetime, timezone
-from typing import Any
 
 from services.llm_client import get_llm
 
@@ -258,7 +257,6 @@ class Hippocampus:
             return []
 
         # Search for each entity as a query
-        import re
         for entity in list(set(all_entities))[:3]:
             if not entity or len(entity) < 2:
                 continue

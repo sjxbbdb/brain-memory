@@ -8,9 +8,7 @@
 注意: 基底节不做决策，只做模式匹配。决策交给前额叶。
 """
 
-import json
 import logging
-from pathlib import Path
 
 logger = logging.getLogger("brain-v5.basal-ganglia")
 

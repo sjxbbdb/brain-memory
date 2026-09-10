@@ -288,6 +288,19 @@ class StabilityBaselineTests(unittest.IsolatedAsyncioTestCase):
         finally:
             client.cfg["key"] = original_key
 
+    async def test_llm_embed_reconstructs_cached_duplicates(self):
+        """Cached duplicate inputs keep their original order without I/O."""
+        import services.llm_client as llm_module
+        from services.llm_client import LLMClient
+
+        client = LLMClient()
+        client._embedding_cache.update({"a": [1.0], "b": [2.0]})
+        with patch.object(llm_module, "OFFLINE_MODE", False), patch.object(
+            llm_module, "DASHSCOPE_KEY", "test-key"
+        ):
+            result = await client.embed(["a", "a", "b"])
+        self.assertEqual(result, [[1.0], [1.0], [2.0]])
+
     async def test_lifecycle_start_stop_is_serialized(self):
         stem = BrainStem()
         await asyncio.gather(stem.start(), stem.start())

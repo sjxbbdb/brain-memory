@@ -15,7 +15,6 @@ V7 核心：驱动力不再是静态配置项，而是持续响应客观信号�
 
 import logging
 from datetime import datetime, timezone
-from typing import Any
 
 from brain.goal_system import Goal, GoalStatus
 

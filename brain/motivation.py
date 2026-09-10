@@ -746,8 +746,8 @@ def _marker_label(value: Any, *, default: str = "value") -> str:
 def _opaque_snapshot_text(value: Any, label: str, *, limit: int = 500) -> str:
     """Hash a free-form value before it crosses a durable snapshot boundary.
 
-    The older ``_safe_snapshot_text`` helper only redacts values that *look*
-    like paths or credentials.  Motivational context is user/tool supplied,
+    Older snapshot redaction only handled values that *look* like paths or
+    credentials.  Motivational context is user/tool supplied,
     though, so an ordinary sentence is sensitive too.  This helper preserves
     only a deterministic marker (and does not re-hash a marker restored from a
     previous snapshot), allowing bounded metrics and replay bookkeeping while
@@ -883,11 +883,6 @@ def _safe_snapshot_value(
         ]
     text = _text(value, 500)
     return _redaction_marker(text, _marker_label(key, default="value")) if _sensitive_text(text, key=key) else text
-
-
-def _safe_snapshot_text(value: Any, *, key: str = "", limit: int = 500) -> str:
-    text = _text(value, limit).strip()
-    return _redaction_marker(text, _marker_label(key, default="value")) if text and _sensitive_text(text, key=key) else text
 
 
 def _integrity_digest(payload: Mapping[str, Any]) -> str:

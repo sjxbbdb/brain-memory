@@ -210,17 +210,6 @@ class LLMClient:
                 cached[idx] = vec
 
         # Reconstruct in original order
-        result_map = {}
-        seen2 = set()
-        for t in texts:
-            key = t[:200]
-            if key not in seen2:
-                seen2.add(key)
-            for i, u in enumerate(unique):
-                if u[:200] == key:
-                    result_map.setdefault(i, self._embedding_cache.get(u) or cached.get(i))
-                    break
-
         results = []
         for t in texts:
             key = t[:200]

@@ -30,7 +30,7 @@ import json
 import math
 from threading import RLock
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Iterable, Mapping
 import uuid
 import re
 
@@ -113,16 +113,6 @@ def _bounded_int(value: Any, *, name: str, minimum: int = 0, maximum: int = 2**6
         raise SuccessionError(f"{name} must be an integer") from exc
     if result < minimum or result > maximum:
         raise SuccessionError(f"{name} outside allowed range")
-    return result
-
-
-def _finite_float(value: Any, *, name: str, default: float = 0.0) -> float:
-    try:
-        result = float(value)
-    except (TypeError, ValueError, OverflowError):
-        result = default
-    if not math.isfinite(result):
-        result = default
     return result
 
 

@@ -19,7 +19,6 @@ Salience 公式:
 
 import logging
 import math
-from typing import Any
 from config import WORKING_MEMORY_CAPACITY
 
 logger = logging.getLogger("brain-v6.working-memory")

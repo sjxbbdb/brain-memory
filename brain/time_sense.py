@@ -18,9 +18,8 @@ v5.0-v5.3 的大脑有时间戳但没有时间体验。
 
 import logging
 from collections import deque
-from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
-from typing import Any
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 logger = logging.getLogger("brain-v5.time-sense")
 

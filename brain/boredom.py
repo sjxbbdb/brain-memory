@@ -22,11 +22,9 @@
   - 低无聊 + 无输入 → 真正的放松睡眠
 """
 
-import math
 import logging
 import random
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Optional
 from collections import deque
 
@@ -347,8 +345,6 @@ class BoredomEngine:
         """从记忆库中随机获取一条低重要性记忆。"""
         try:
             # 优先选低 importance 的记忆（模拟走神时想起琐事）
-            import sqlite3
-
             conn = memory_store._get_conn()
             exclude_ids = list(self._last_random_memory_ids)
             exclude_clause = ""

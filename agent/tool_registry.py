@@ -8,7 +8,6 @@
 大脑不直接 import 此模块——只通过 agent_bridge 间接调用。
 """
 
-import asyncio
 import importlib
 import importlib.util
 import ast
@@ -17,10 +16,9 @@ import json
 import logging
 import sys
 import threading
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Callable, Dict, List
 
 logger = logging.getLogger("brain-v5.tool-registry")
 

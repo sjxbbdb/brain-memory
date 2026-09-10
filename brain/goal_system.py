@@ -20,9 +20,8 @@ v5.0 有驱动力但没有目标——好奇、想成长、要一致，但从不
 import logging
 import math
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 
 logger = logging.getLogger("brain-v5.goal-system")
 

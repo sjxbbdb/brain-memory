@@ -881,22 +881,6 @@ def _is_under(relative: str, protected: str) -> bool:
     return relative == protected or relative.startswith(protected + "/")
 
 
-def _copy_one(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if _is_link_like(source):
-        raise CandidateIsolationError(f"symlink copy is not allowed: {source}")
-    if source.is_dir():
-        destination.mkdir(parents=True, exist_ok=True)
-        for child in sorted(source.iterdir(), key=lambda item: item.name):
-            if _is_sensitive_name(child.name) or child.name.lower() in _SENSITIVE_DIRS:
-                continue
-            _copy_one(child, destination / child.name)
-        return
-    if not source.is_file():
-        raise CandidateIsolationError(f"unsupported source entry: {source}")
-    _copy_regular_file(source, destination)
-
-
 def _copy_regular_file(
     source: Path,
     destination: Path,

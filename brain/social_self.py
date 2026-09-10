@@ -21,7 +21,6 @@
   这是 Theory of Mind 的最小实现。
 """
 
-import math
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone

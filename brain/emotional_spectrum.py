@@ -6,11 +6,9 @@ V6 升级: ingest_llm_emotion() 直接写入 ActivationField，
 """
 
 import logging
-import math
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 
 logger = logging.getLogger("brain-v5.emotional-spectrum")
 

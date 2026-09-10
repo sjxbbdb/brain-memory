@@ -14,7 +14,6 @@ import json
 import logging
 import math
 from datetime import datetime, timezone
-from typing import Any
 
 logger = logging.getLogger("brain-v7.self-model")
 

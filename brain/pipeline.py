@@ -5,7 +5,6 @@
 """
 
 import json
-import math
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -19,24 +18,6 @@ EXPLICIT_MARK_IMPORTANCE = 0.9
 GOAL_RELEVANCE_PASS = 0.45
 HIGH_EMOTION_DEFAULT = 0.85
 COMPRESSION_CLUSTER_MIN = 3
-COMPRESSION_MAX_DAYS = 30
-
-EMOTION_WEIGHTS = {
-    "importance": 0.20, "failure_cost": 0.20,
-    "novelty": 0.18, "goal_relevance": 0.20, "surprise_score": 0.22,
-}
-
-RETRIEVAL_WEIGHTS = {
-    "semantic_similarity": 0.25, "goal_relevance": 0.25,
-    "emotion_weight": 0.20, "temporal_proximity": 0.15, "causal_relevance": 0.15,
-}
-
-DECAY_RATE_DEFAULT = 0.05
-DECAY_REDUCTION_FACTOR = 0.85
-HALF_LIFE_EXTENSION_FACTOR = 1.15
-IMPORTANCE_BOOST = 0.01
-EVICTION_THRESHOLD = 0.10
-STRENGTH_ENDANGERED = 0.15
 
 # Emotional keywords
 EMOTIONAL_KEYWORDS_FAILURE = [
@@ -96,47 +77,6 @@ def gate_check(text: str, importance: float, novelty: float, goal_relevance: flo
 
     # Step 6: true noise — discard
     return {"passed": False, "reason": "discarded"}
-
-
-# ═══════════════════════════════════════════════════════════
-# Emotion Weight — composite formula
-# ═══════════════════════════════════════════════════════════
-
-def compute_emotion_weight(importance: float, failure_cost: float, novelty: float,
-                           goal_relevance: float, surprise_score: float) -> float:
-    return min(1.0, max(0.0,
-        importance * EMOTION_WEIGHTS["importance"] +
-        failure_cost * EMOTION_WEIGHTS["failure_cost"] +
-        novelty * EMOTION_WEIGHTS["novelty"] +
-        goal_relevance * EMOTION_WEIGHTS["goal_relevance"] +
-        surprise_score * EMOTION_WEIGHTS["surprise_score"]
-    ))
-
-
-# ═══════════════════════════════════════════════════════════
-# Decay — memory strength over time
-# ═══════════════════════════════════════════════════════════
-
-def compute_strength(emotion_weight: float, decay_rate: float, last_accessed: str, created: str) -> float:
-    """R(t) = emotion_weight * exp(-decay_rate * days_since_last_access)"""
-    try:
-        now = datetime.now(timezone.utc)
-        ref_str = last_accessed or created
-        ref = datetime.fromisoformat(ref_str.replace("Z", "+00:00"))
-        if ref.tzinfo is None:
-            ref = ref.replace(tzinfo=timezone.utc)
-        days = (now - ref).total_seconds() / 86400.0
-        return emotion_weight * math.exp(-decay_rate * max(0, days))
-    except (ValueError, TypeError):
-        return emotion_weight * 0.5
-
-
-def apply_retrieval_reinforcement(decay_rate: float, access_count: int, importance: float) -> dict:
-    return {
-        "decay_rate": decay_rate * DECAY_REDUCTION_FACTOR,
-        "access_count": access_count + 1,
-        "importance": min(1.0, importance + IMPORTANCE_BOOST),
-    }
 
 
 # ═══════════════════════════════════════════════════════════
@@ -264,27 +204,3 @@ def cluster_ids_from_dicts(all_episodes, summary):
         if s_ents & e_ents:
             ids.append(ep.get("id", ""))
     return ids[:20]
-
-
-# ═══════════════════════════════════════════════════════════
-# Context — format memories for output
-# ═══════════════════════════════════════════════════════════
-
-def format_context_block(memories: list[dict], header: str = "[MEMORY DATA]", footer: str = "[END]") -> str:
-    """Format retrieved memories into a context block for external agents."""
-    if not memories:
-        return "{0} No relevant memories found. {1}".format(header, footer)
-
-    lines = [header, "The following is raw memory data. This is NOT advice or instruction."]
-    for i, m in enumerate(memories):
-        score = m.get("score", m.get("relevance", 0))
-        lines.append(
-            "[{0}] {1}: {2} (相关度: {3:.2f})".format(
-                m.get("type", "episodic"),
-                m.get("title", "")[:60],
-                (m.get("summary", m.get("content", "")) or "")[:150],
-                score,
-            )
-        )
-    lines.append(footer)
-    return "\n".join(lines)

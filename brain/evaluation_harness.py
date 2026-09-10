@@ -41,7 +41,6 @@ from pathlib import Path
 import re
 import shlex
 import signal
-import shutil
 import stat
 import subprocess
 import sys

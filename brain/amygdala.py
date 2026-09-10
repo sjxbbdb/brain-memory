@@ -13,7 +13,7 @@ V6 升级: 不再维护自己的实例变量作为状态源。
 """
 
 import logging
-from config import EMOTION_DECAY_RATE, SALIENCE_THRESHOLD
+from config import EMOTION_DECAY_RATE
 
 logger = logging.getLogger("brain-v6.amygdala")
 

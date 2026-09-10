@@ -7,7 +7,6 @@
 """
 
 import logging
-import random
 from datetime import datetime, timezone
 from services.llm_client import get_llm
 
@@ -55,7 +54,7 @@ class DreamEngine:
 
         try:
             # Get recent memories as dream material
-            import sqlite3, json as _json
+            import sqlite3
             conn = sqlite3.connect(memory_store.db_path)
             conn.row_factory = sqlite3.Row
             try:

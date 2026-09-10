@@ -13,7 +13,7 @@ from typing import Any
 
 from brain.self_model import SelfModel
 from brain.curiosity import CuriosityEngine
-from brain.session import SessionManager, SessionState
+from brain.session import SessionManager
 from brain.activation_field import ActivationField
 
 
