@@ -162,6 +162,58 @@ class MotivationReplayTests(unittest.TestCase):
             self.assertTrue(all(not thread.is_alive() for thread in threads))
             self.assertEqual(sorted(outcomes), [False, True])
 
+    def test_historical_signature_and_durable_hash_binding_survive_restart(self):
+        with tempfile.TemporaryDirectory(prefix="motivation-history-") as temp:
+            db_path = str(Path(temp) / "brain.sqlite")
+            init_db(db_path)
+            store = StateStore(db_path)
+            issuer = MotivationSourceAttestor(
+                self._SECRET,
+                issuer_id="test-host",
+                clock=lambda: 100.0,
+                replay_store=store,
+            )
+            event = self._event("durable-history")
+            proof = issuer.issue_for_event(event, source_id="sensor-a", now=100.0)
+            payload_hash = MotivationalPressure.event_payload_hash(event)
+            issuer.validate(
+                proof,
+                event_id=event.event_id,
+                payload_hash=payload_hash,
+                source_id="sensor-a",
+                source_kind="external",
+                now=100.0,
+            )
+
+            restarted = MotivationSourceAttestor(
+                self._SECRET,
+                issuer_id="test-host",
+                clock=lambda: 10_000.0,
+                replay_store=store,
+            )
+            self.assertTrue(
+                restarted.verify_historical(
+                    proof,
+                    event_id=event.event_id,
+                    payload_hash=payload_hash,
+                    source_id="sensor-a",
+                    source_kind="external",
+                )
+            )
+            self.assertTrue(
+                store.is_motivation_attestation_consumed(
+                    replay_key=proof.replay_key,
+                    attestation_hash=proof.attestation_hash,
+                )
+            )
+            self.assertFalse(
+                store.is_motivation_attestation_consumed(
+                    replay_key=proof.replay_key,
+                    attestation_hash="0" * 64,
+                )
+            )
+            store.close()
+
     def test_replay_table_is_append_only(self):
         with tempfile.TemporaryDirectory(prefix="motivation-guard-") as temp:
             db_path = str(Path(temp) / "brain.sqlite")
@@ -306,6 +358,11 @@ class MotivationReplayTests(unittest.TestCase):
                 ledger_path=root / "promotion.jsonl",
                 persistence_path=root / "brain.sqlite",
             )
+            with self.assertRaises(PermissionError):
+                BrainStem(
+                    evaluation_harness=harness,
+                    promotion_controller=controller,
+                )
             in_memory_only = MotivationSourceAttestor(
                 self._SECRET, clock=lambda: 100.0
             )

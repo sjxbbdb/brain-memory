@@ -308,7 +308,7 @@ class InheritanceContractsTests(unittest.TestCase):
         )
         sensitive_memory = _anchor(
             AnchorKind.MEMORY,
-            r"C:\Users\24763\Desktop\private-memory.txt",
+            r"C:\Users\example-user\Desktop\private-memory.txt",
             anchor_id="sensitive-memory",
         )
         plan = filter_inheritance(

@@ -2547,6 +2547,7 @@ class PromotionController:
         "test_api_readonly.py",
         "test_autonomy.py",
         "test_brain_stem_iteration.py",
+        "test_p7_controlled_host.py",
         "test_consciousness_chain.py",
         "test_learning_feedback.py",
         "test_source_adapter.py",

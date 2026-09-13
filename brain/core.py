@@ -22,6 +22,7 @@ import json
 import logging
 
 from brain.brain_stem import BrainStem
+from brain.public_projection import sanitize_public_projection
 from config import DB_PATH, INPUT_TIMEOUT_SEC
 from storage.database import init_db, StateStore, MemoryStore
 
@@ -219,13 +220,32 @@ class Brain:
         """Unregister a WebSocket client."""
         self._ws_clients.discard(client)
 
-    async def broadcast_state(self):
-        """Push current state to all WebSocket clients."""
+    async def broadcast_state(self, *, projector=None):
+        """Push current state through an optional public projection.
+
+        HTTP/WebSocket adapters provide their own fail-closed projector so
+        the domain object stays independent from transport policy.
+        """
         self._ensure_loop_primitives()
         self.brain_stem._ensure_loop_primitives()
         if not self._ws_clients:
             return
         state = await self.get_state()
+        if projector is not None:
+            try:
+                state = projector(state)
+            except Exception:
+                # A projection failure must not fall back to the raw state.
+                state = {}
+        # Always apply the canonical boundary, even when an adapter supplies
+        # a projector.  This prevents a caller from accidentally publishing
+        # private state by passing an identity function.
+        try:
+            state = sanitize_public_projection(state)
+        except Exception:
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
         payload = json.dumps({"type": "brain_state", "data": state}, ensure_ascii=False)
         dead = set()
         for client in self._ws_clients:

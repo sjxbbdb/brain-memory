@@ -24,6 +24,7 @@ from brain.evaluation_harness import (
     directory_fingerprint,
 )
 from brain.evolution import PromotionController, SandboxAttestationError, SandboxAttestor
+from brain.homeostasis import ControlledEnvironment
 from brain.life_kernel import LifeKernel, LifecycleError, LifecycleState
 from brain.motivation import (
     ChangeProposal,
@@ -127,6 +128,182 @@ class BrainStemIterationTests(unittest.TestCase):
         self.assertFalse(status["host_bound"])
         self.assertIsNone(stem.evaluation_harness)
         self.assertIsNone(stem.promotion_controller)
+
+    def test_continuity_readiness_is_bounded_and_needs_an_explicit_host(self):
+        """The public readiness seam must be read-only and capability-free."""
+
+        stem = BrainStem()
+        snapshot = stem.continuity_readiness_snapshot()
+
+        self.assertEqual(snapshot["schema_version"], 1)
+        self.assertEqual(snapshot["status"], "needs_host")
+        self.assertTrue(snapshot["read_only"])
+        self.assertFalse(snapshot["ready"])
+        self.assertEqual(snapshot["lifecycle"]["state"], "CREATED")
+        self.assertFalse(snapshot["lease"]["bound"])
+        self.assertFalse(snapshot["motivation"]["source_attestor_bound"])
+        self.assertFalse(snapshot["motivation"]["source_replay_durable"])
+        self.assertFalse(snapshot["evaluation_harness"]["bound"])
+        self.assertFalse(snapshot["promotion_controller"]["bound"])
+        self.assertFalse(snapshot["controlled_environment"]["bound"])
+        self.assertFalse(snapshot["controlled_host"]["bound"])
+        self.assertFalse(snapshot["controlled_host"]["ready"])
+        self.assertFalse(snapshot["succession"]["coordinator_bound"])
+        self.assertFalse(snapshot["checks"]["iteration_ready"])
+        self.assertFalse(snapshot["checks"]["succession_ready"])
+
+        serialized = json.dumps(snapshot, ensure_ascii=False)
+        for forbidden in (
+            "workspace_root",
+            "candidate_path",
+            "source_path",
+            "lease_token",
+            "api_key",
+            "secret",
+            '"ledger":',
+            '"events":',
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_continuity_readiness_reports_explicit_host_bindings_without_paths(self):
+        """A bound production host is observable without leaking its roots."""
+
+        with tempfile.TemporaryDirectory(prefix="brain-stem-continuity-") as temp:
+            root = Path(temp)
+            active = self._tree(root, "active", "trusted")
+            fixtures = root / "fixtures"
+            fixtures.mkdir()
+            (fixtures / "judge.py").write_text(
+                'print("{\\"status\\":\\"pass\\",\\"verified\\":true,\\"metrics\\":{\\"quality\\":2}}")\n',
+                encoding="utf-8",
+            )
+            harness = EvaluationHarness(
+                fixtures=fixtures,
+                command=[sys.executable, "{fixtures}/judge.py", "{candidate}"],
+                primary_dimension="quality",
+            )
+            controller = PromotionController(
+                active,
+                harness=harness,
+                sandbox_attestor=SandboxAttestor(
+                    secret=b"continuity-promotion-secret"
+                ),
+                ledger_path=root / "promotion.jsonl",
+                persistence_path=root / "brain.sqlite",
+            )
+            store = StateStore(str(root / "brain.sqlite"))
+            init_db(str(root / "brain.sqlite"))
+            source_attestor = MotivationSourceAttestor(
+                b"continuity-motivation-secret",
+                replay_store=store,
+            )
+            environment = ControlledEnvironment(
+                kind="evaluation",
+                root=active,
+                network_enabled=False,
+            )
+            stem = BrainStem(
+                state_store=store,
+                motivation_source_attestor=source_attestor,
+                controlled_environment=environment,
+                controlled_host_status={
+                    "ready": True,
+                    "executor": "docker",
+                    "protocol": "p7-docker-v1",
+                    "contract_digest": "a" * 64,
+                    "local_context_verified": True,
+                    "image_pinned": True,
+                    "image_available": True,
+                    "probe_verified": True,
+                    "cleanup_verified": True,
+                    "network_isolation_verified": True,
+                    "filesystem_isolation_verified": True,
+                    "privilege_isolation_verified": True,
+                    "resource_limits_configured": True,
+                },
+                evaluation_harness=harness,
+                promotion_controller=controller,
+            )
+            snapshot = stem.continuity_readiness_snapshot()
+            self.assertTrue(snapshot["motivation"]["source_attestor_bound"])
+            self.assertTrue(snapshot["motivation"]["source_replay_durable"])
+            self.assertTrue(snapshot["evaluation_harness"]["bound"])
+            self.assertTrue(snapshot["promotion_controller"]["bound"])
+            self.assertTrue(snapshot["promotion_controller"]["sandbox_attestor_bound"])
+            self.assertTrue(snapshot["controlled_environment"]["bound"])
+            self.assertEqual(snapshot["controlled_environment"]["kind"], "evaluation")
+            self.assertFalse(snapshot["controlled_environment"]["network_enabled"])
+            self.assertTrue(snapshot["controlled_host"]["bound"])
+            self.assertTrue(snapshot["controlled_host"]["ready"])
+            self.assertEqual(snapshot["controlled_host"]["executor"], "docker")
+            serialized = json.dumps(snapshot, ensure_ascii=False)
+            self.assertNotIn(str(root), serialized)
+            self.assertNotIn("source_path", serialized)
+
+            incomplete = {
+                "ready": True,
+                "executor": "docker",
+                "protocol": "p7-docker-v1",
+                "contract_digest": "a" * 64,
+                "local_context_verified": True,
+                "image_pinned": True,
+                "image_available": True,
+                "probe_verified": True,
+                "cleanup_verified": False,
+                "network_isolation_verified": True,
+                "filesystem_isolation_verified": True,
+                "privilege_isolation_verified": True,
+                "resource_limits_configured": True,
+            }
+            with self.assertRaisesRegex(ValueError, "verified external boundary"):
+                BrainStem(controlled_host_status=incomplete)
+
+    def test_succession_snapshot_restarts_without_false_control_owner_conflict(self):
+        """A restored no-successor coordinator must share the validated kernel object."""
+
+        import asyncio
+
+        from brain.succession_runtime import SuccessorActivationAttestor
+
+        with tempfile.TemporaryDirectory(prefix="brain-stem-succession-restart-") as temp:
+            db_path = Path(temp) / "state.sqlite"
+            init_db(str(db_path))
+            store = StateStore(str(db_path))
+            source_attestor = MotivationSourceAttestor(
+                b"succession-restart-motivation-secret",
+                replay_store=store,
+            )
+            activation_attestor = SuccessorActivationAttestor(
+                secret=b"succession-restart-activation-secret"
+            )
+
+            first = BrainStem(
+                state_store=store,
+                motivation_source_attestor=source_attestor,
+                succession_profile="production",
+                succession_activation_attestor=activation_attestor,
+            )
+            first._get_succession_coordinator()
+            asyncio.run(first.start())
+            asyncio.run(first.stop())
+
+            second_attestor = MotivationSourceAttestor(
+                b"succession-restart-motivation-secret",
+                replay_store=store,
+            )
+            second = BrainStem(
+                state_store=store,
+                motivation_source_attestor=second_attestor,
+                succession_profile="production",
+                succession_activation_attestor=activation_attestor,
+            )
+            asyncio.run(second.start())
+            self.assertEqual(second.life_kernel.state, LifecycleState.ACTIVE)
+            self.assertIsNotNone(second.succession_coordinator)
+            self.assertIs(second.succession_coordinator.parent, second.life_kernel)
+            asyncio.run(second.stop())
+            store.close()
+            store.close()
 
     def test_production_brain_stem_requires_host_bound_motivation_provenance(self):
         stem = BrainStem()
@@ -277,7 +454,16 @@ class BrainStemIterationTests(unittest.TestCase):
                 ledger_path=root / "promotion-prod.jsonl",
                 persistence_path=root / "brain-prod.sqlite",
             )
+            init_db(str(root / "brain-prod.sqlite"))
+            state_store = StateStore(str(root / "brain-prod.sqlite"))
+            self.addCleanup(state_store.close)
+            source_attestor = MotivationSourceAttestor(
+                b"brain-stem-production-motivation-secret",
+                replay_store=state_store,
+            )
             stem = BrainStem(
+                state_store=state_store,
+                motivation_source_attestor=source_attestor,
                 evaluation_harness=harness,
                 promotion_controller=controller,
             )
@@ -341,7 +527,16 @@ class BrainStemIterationTests(unittest.TestCase):
                 ledger_path=root / "promotion-gate-prod.jsonl",
                 persistence_path=root / "brain-gate-prod.sqlite",
             )
+            init_db(str(root / "brain-gate-prod.sqlite"))
+            state_store = StateStore(str(root / "brain-gate-prod.sqlite"))
+            self.addCleanup(state_store.close)
+            source_attestor = MotivationSourceAttestor(
+                b"brain-stem-gate-motivation-secret",
+                replay_store=state_store,
+            )
             stem = BrainStem(
+                state_store=state_store,
+                motivation_source_attestor=source_attestor,
                 evaluation_harness=harness,
                 promotion_controller=controller,
             )

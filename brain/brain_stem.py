@@ -75,6 +75,7 @@ from brain.evolution import (
     PromotionMode,
     PromotionOutcome,
     SandboxAttestation,
+    SandboxAttestor,
 )
 from brain.life_kernel import (
     AppendOnlyLedger,
@@ -223,6 +224,7 @@ class BrainStem:
         motivation_source_verifier=None,
         motivation_require_source_attestation: bool | None = None,
         controlled_environment=None,
+        controlled_host_status: Mapping[str, Any] | None = None,
         succession_coordinator=None,
         anchor_vault=None,
         succession_ledger=None,
@@ -402,6 +404,41 @@ class BrainStem:
             controlled_environment, ControlledEnvironment
         ):
             raise TypeError("controlled_environment must be a ControlledEnvironment")
+        if controlled_host_status is not None:
+            if not isinstance(controlled_host_status, Mapping):
+                raise TypeError("controlled_host_status must be a mapping")
+            executor = str(controlled_host_status.get("executor", "")).strip().lower()
+            protocol = str(controlled_host_status.get("protocol", "")).strip().lower()
+            contract_digest = str(
+                controlled_host_status.get("contract_digest", "")
+            ).strip().lower()
+            isolation_flags = (
+                "local_context_verified",
+                "image_pinned",
+                "image_available",
+                "probe_verified",
+                "cleanup_verified",
+                "network_isolation_verified",
+                "filesystem_isolation_verified",
+                "privilege_isolation_verified",
+                "resource_limits_configured",
+            )
+            if (
+                controlled_host_status.get("ready") is not True
+                or not re.fullmatch(r"[a-z0-9._-]{1,40}", executor)
+                or not re.fullmatch(r"[a-z0-9._-]{1,80}", protocol)
+                or not re.fullmatch(r"[0-9a-f]{64}", contract_digest)
+                or not all(controlled_host_status.get(name) is True for name in isolation_flags)
+            ):
+                raise ValueError("controlled_host_status is not a verified external boundary")
+            self._controlled_host_status = {
+                "executor": executor,
+                "protocol": protocol,
+                "contract_digest": contract_digest,
+                **{name: True for name in isolation_flags},
+            }
+        else:
+            self._controlled_host_status = None
         # ``HomeostasisController`` is intentionally allowed to be supplied
         # as an empty-but-configured object.  Do not use truthiness here:
         # future adapters may expose ``__len__`` and an empty ledger must not
@@ -839,17 +876,17 @@ class BrainStem:
         verifier = getattr(motivation, "source_verifier", None)
         if verifier is not None or (
             attestor is not None and not isinstance(attestor, MotivationSourceAttestor)
-        ):
+        ) or (production_controller and attestor is None):
             raise PermissionError(
                 "production iteration requires a MotivationSourceAttestor"
             )
-        if production_controller and attestor is not None and not bool(
+        if production_controller and not bool(
             getattr(attestor, "durable_replay_enabled", False)
         ):
             raise PermissionError(
                 "production iteration requires durable source-attestation replay protection"
             )
-        if production_controller and attestor is not None and (
+        if production_controller and (
             getattr(attestor, "replay_store", None)
             is not getattr(self, "state_store", None)
         ):
@@ -1239,6 +1276,419 @@ class BrainStem:
                 "sandbox_attestation_hash",
                 "attestation_verified",
             )
+        }
+
+    def continuity_readiness_snapshot(self) -> dict[str, Any]:
+        """Return bounded, read-only evidence for a controlled host.
+
+        This seam deliberately reports configuration and safety predicates,
+        never the capabilities that satisfy them.  In particular, lease
+        tokens, host roots, candidate paths, raw ledgers, and attestor secrets
+        stay in their owning process/object.  ``ready`` means that the
+        instance can enter the explicitly gated iteration pipeline; it never
+        means that a promotion has been authorised.
+        """
+
+        def _text(value: Any, default: str = "", limit: int = 120) -> str:
+            try:
+                result = str(value or default).replace("\x00", "").strip()
+            except Exception:
+                result = default
+            return result[:limit]
+
+        def _digest(value: Any) -> str:
+            result = _text(value, limit=128).lower()
+            return result if re.fullmatch(r"[0-9a-f]{64}", result) else ""
+
+        def _count(value: Any) -> int:
+            try:
+                return max(0, min(1_000_000, int(value)))
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
+        kernel = getattr(self, "life_kernel", None)
+        raw_state = getattr(kernel, "state", "UNKNOWN")
+        lifecycle_state = _text(getattr(raw_state, "value", raw_state), "UNKNOWN", 40).upper()
+        lifecycle_known = lifecycle_state in {item.value for item in LifecycleState}
+        lifecycle = {
+            "state": lifecycle_state if lifecycle_known else "UNKNOWN",
+            "generation": _count(getattr(kernel, "generation", 0)),
+            "lineage_id": _text(getattr(kernel, "lineage_id", ""), limit=128),
+            "instance_id": _text(getattr(kernel, "instance_id", ""), limit=128),
+            "parent_instance_id": _text(
+                getattr(kernel, "parent_instance_id", "") or "", limit=128
+            ) or None,
+            "last_sequence": _count(
+                getattr(getattr(kernel, "ledger", None), "last_sequence", 0)
+            ),
+            "last_hash": _digest(
+                getattr(getattr(kernel, "ledger", None), "last_hash", "")
+            ),
+            "accepts_input": bool(getattr(kernel, "accepts_input", False)),
+            "allows_self_modification": bool(
+                getattr(kernel, "allows_self_modification", False)
+            ),
+        }
+
+        homeostasis = getattr(self, "homeostasis", None)
+        quarantine_latched = bool(getattr(homeostasis, "quarantine_latched", False))
+        restore_blocked = bool(getattr(self, "_life_restore_blocked", False))
+        life_control_lost = bool(getattr(self, "_life_control_lost", False))
+
+        lease = getattr(self, "_life_control_lease", None)
+        lease_expired = False
+        if lease is not None:
+            try:
+                lease_expired = bool(lease.is_expired())
+            except Exception:
+                lease_expired = True
+        durable_lease_api = False
+        try:
+            durable_lease_api = bool(self._durable_life_control_available())
+        except Exception:
+            durable_lease_api = False
+        lease_mode = _text(getattr(self, "life_control_mode", "durable"), "durable", 20).lower()
+        lease_bound = lease is not None
+        lease_valid = lease_bound and not lease_expired and not life_control_lost
+        lease = {
+            "mode": lease_mode,
+            "durable_api_available": durable_lease_api,
+            "bound": lease_bound,
+            "valid": lease_valid,
+            "lost": life_control_lost,
+            "expired": lease_expired,
+            "fencing": _count(getattr(lease, "fencing", 0)) if lease_bound else None,
+            "head_hash": _digest(getattr(lease, "last_event_hash", ""))
+            if lease_bound
+            else "",
+        }
+
+        motivation = getattr(self, "motivation", None)
+        source_attestor = getattr(motivation, "source_attestor", None)
+        source_attestor_bound = isinstance(source_attestor, MotivationSourceAttestor)
+        source_replay_durable = bool(
+            source_attestor_bound
+            and getattr(source_attestor, "durable_replay_enabled", False)
+        )
+        replay_store_bound = bool(
+            source_attestor_bound
+            and getattr(source_attestor, "replay_store", None)
+            is getattr(self, "state_store", None)
+            and getattr(self, "state_store", None) is not None
+        )
+        motivation_required = bool(
+            getattr(motivation, "require_source_attestation", False)
+        )
+        motivation_ready = bool(
+            isinstance(motivation, MotivationalPressure)
+            and _text(getattr(self, "motivation_profile", "production"), "production", 20)
+            == "production"
+            and motivation_required
+            and source_attestor_bound
+            and source_replay_durable
+            and replay_store_bound
+        )
+        motivation_projection = {
+            "profile": _text(
+                getattr(self, "motivation_profile", "production"), "production", 20
+            ),
+            "source_attestation_required": motivation_required,
+            "source_attestor_bound": source_attestor_bound,
+            "source_replay_durable": source_replay_durable,
+            "replay_store_bound": replay_store_bound,
+            "total_received": _count(getattr(motivation, "total_received", 0)),
+            "total_accepted": _count(getattr(motivation, "total_accepted", 0)),
+            "total_rejected": _count(getattr(motivation, "total_rejected", 0)),
+            "total_needs_emitted": _count(
+                getattr(motivation, "total_needs_emitted", 0)
+            ),
+            "iteration_need_present": getattr(self, "_last_iteration_need", None)
+            is not None,
+            "ready": motivation_ready,
+        }
+
+        harness = getattr(self, "evaluation_harness", None)
+        harness_bound = isinstance(harness, EvaluationHarness)
+        evaluation_projection = {
+            "bound": harness_bound,
+            "ready": bool(
+                harness_bound
+                and _text(getattr(harness, "harness_version", ""), limit=80)
+                and _digest(getattr(harness, "fixture_hash", ""))
+                and _digest(getattr(harness, "evaluator_hash", ""))
+            ),
+            "harness_version": _text(
+                getattr(harness, "harness_version", ""), limit=80
+            )
+            if harness_bound
+            else "",
+            "fixture_hash": _digest(getattr(harness, "fixture_hash", ""))
+            if harness_bound
+            else "",
+            "evaluator_hash": _digest(getattr(harness, "evaluator_hash", ""))
+            if harness_bound
+            else "",
+        }
+
+        controller = getattr(self, "promotion_controller", None)
+        controller_bound = isinstance(controller, PromotionController)
+        controller_harness_bound = bool(
+            controller_bound and getattr(controller, "harness", None) is harness
+        )
+        sandbox_attestor_bound = bool(
+            controller_bound
+            and isinstance(getattr(controller, "sandbox_attestor", None), SandboxAttestor)
+        )
+        external_ledger_bound = bool(
+            controller_bound and getattr(getattr(controller, "ledger", None), "path", None)
+        )
+        external_persistence_bound = bool(
+            controller_bound and getattr(controller, "persistence_path", None) is not None
+        )
+        promotion_profile = _text(
+            getattr(controller, "profile", ""), "", 20
+        ).lower() if controller_bound else ""
+        promotion_ready = bool(
+            controller_bound
+            and promotion_profile == "production"
+            and controller_harness_bound
+            and sandbox_attestor_bound
+            and bool(getattr(controller, "require_sandbox_attestation", False))
+            and external_ledger_bound
+            and external_persistence_bound
+        )
+        promotion_projection = {
+            "bound": controller_bound,
+            "profile": promotion_profile or None,
+            "harness_bound": controller_harness_bound,
+            "sandbox_attestor_bound": sandbox_attestor_bound,
+            "sandbox_attestation_required": bool(
+                getattr(controller, "require_sandbox_attestation", False)
+            )
+            if controller_bound
+            else False,
+            "external_ledger_bound": external_ledger_bound,
+            "external_persistence_bound": external_persistence_bound,
+            "ready": promotion_ready,
+        }
+
+        environment = getattr(self, "controlled_environment", None)
+        environment_bound = isinstance(environment, ControlledEnvironment)
+        environment_kind = _text(
+            getattr(getattr(environment, "kind", None), "value", ""), "", 20
+        ).lower() if environment_bound else ""
+        audit_length = 0
+        audit_head = ""
+        if environment_bound:
+            try:
+                audit = tuple(environment.audit)
+                audit_length = _count(len(audit))
+                audit_head = _digest(getattr(audit[-1], "audit_hash", "")) if audit else ""
+            except Exception:
+                audit_length = 0
+        network_enabled = bool(getattr(environment, "network_enabled", False)) if environment_bound else False
+        environment_ready = bool(
+            environment_bound and environment_kind == EnvironmentKind.EVALUATION.value and not network_enabled
+        )
+        environment_projection = {
+            "bound": environment_bound,
+            "kind": environment_kind or None,
+            "network_enabled": network_enabled,
+            "audit_length": audit_length,
+            "audit_head": audit_head,
+            "ready": environment_ready,
+        }
+
+        host_status = getattr(self, "_controlled_host_status", None)
+        controlled_host_bound = isinstance(host_status, Mapping)
+        controlled_host_ready = bool(
+            controlled_host_bound
+            and all(
+                host_status.get(name) is True
+                for name in (
+                    "local_context_verified",
+                    "image_pinned",
+                    "image_available",
+                    "probe_verified",
+                    "cleanup_verified",
+                    "network_isolation_verified",
+                    "filesystem_isolation_verified",
+                    "privilege_isolation_verified",
+                    "resource_limits_configured",
+                )
+            )
+            and _digest(host_status.get("contract_digest", ""))
+        )
+        controlled_host_projection = {
+            "bound": controlled_host_bound,
+            "executor": _text(host_status.get("executor", ""), limit=40)
+            if controlled_host_bound
+            else None,
+            "protocol": _text(host_status.get("protocol", ""), limit=80)
+            if controlled_host_bound
+            else None,
+            "contract_digest": _digest(host_status.get("contract_digest", ""))
+            if controlled_host_bound
+            else "",
+            "local_context_verified": bool(
+                controlled_host_bound
+                and host_status.get("local_context_verified") is True
+            ),
+            "image_pinned": bool(
+                controlled_host_bound and host_status.get("image_pinned") is True
+            ),
+            "image_available": bool(
+                controlled_host_bound and host_status.get("image_available") is True
+            ),
+            "probe_verified": bool(
+                controlled_host_bound and host_status.get("probe_verified") is True
+            ),
+            "cleanup_verified": bool(
+                controlled_host_bound and host_status.get("cleanup_verified") is True
+            ),
+            "network_isolation_verified": bool(
+                controlled_host_bound
+                and host_status.get("network_isolation_verified") is True
+            ),
+            "filesystem_isolation_verified": bool(
+                controlled_host_bound
+                and host_status.get("filesystem_isolation_verified") is True
+            ),
+            "privilege_isolation_verified": bool(
+                controlled_host_bound
+                and host_status.get("privilege_isolation_verified") is True
+            ),
+            "resource_limits_configured": bool(
+                controlled_host_bound
+                and host_status.get("resource_limits_configured") is True
+            ),
+            "ready": controlled_host_ready,
+        }
+
+        coordinator = getattr(self, "succession_coordinator", None)
+        coordinator_bound = isinstance(coordinator, SuccessionCoordinator)
+        succession_profile = _text(
+            getattr(coordinator, "activation_profile", getattr(self, "succession_profile", "production")),
+            "production",
+            20,
+        ).lower()
+        activation_required = bool(
+            getattr(coordinator, "require_activation_attestation", False)
+        ) if coordinator_bound else False
+        activation_attestor_bound = bool(
+            coordinator_bound
+            and isinstance(
+                getattr(coordinator, "activation_attestor", None),
+                SuccessorActivationAttestor,
+            )
+        )
+        durable_sinks_bound = bool(
+            coordinator_bound
+            and all(
+                callable(getattr(coordinator, name, None))
+                for name in ("_life_event_sink", "_anchor_sink", "_record_sink")
+            )
+        )
+        successor = getattr(coordinator, "successor", None) if coordinator_bound else None
+        successor_pending = bool(
+            successor is not None
+            and getattr(successor, "state", None) is LifecycleState.CREATED
+        )
+        succession_ready = bool(
+            coordinator_bound
+            and succession_profile == "production"
+            and durable_sinks_bound
+            and (not activation_required or activation_attestor_bound)
+        )
+        succession_projection = {
+            "coordinator_bound": coordinator_bound,
+            "profile": succession_profile,
+            "activation_attestation_required": activation_required,
+            "activation_attestor_bound": activation_attestor_bound,
+            "durable_sinks_bound": durable_sinks_bound,
+            "successor_pending": successor_pending,
+            "ready": succession_ready,
+        }
+
+        lifecycle_ready = bool(
+            lifecycle_known
+            and lifecycle_state == LifecycleState.ACTIVE.value
+            and lifecycle["allows_self_modification"]
+            and not quarantine_latched
+            and not restore_blocked
+        )
+        lease_ready = bool(
+            lease_mode == "durable" and durable_lease_api and lease_valid
+        )
+        hard_blocked = bool(
+            restore_blocked
+            or life_control_lost
+            or lifecycle_state in {
+                LifecycleState.RETIRED.value,
+                LifecycleState.DEAD.value,
+            }
+            or not lifecycle_known
+        )
+        iteration_ready = bool(
+            lifecycle_ready
+            and lease_ready
+            and motivation_ready
+            and evaluation_projection["ready"]
+            and promotion_ready
+            and environment_ready
+            and controlled_host_ready
+            and succession_ready
+        )
+        reasons: list[str] = []
+        for flag, code in (
+            (not lifecycle_ready, "lifecycle_not_active"),
+            (not lease_ready, "durable_lease_not_ready"),
+            (not motivation_ready, "motivation_provenance_not_ready"),
+            (not evaluation_projection["ready"], "evaluation_harness_not_ready"),
+            (not promotion_ready, "promotion_controller_not_ready"),
+            (not environment_ready, "controlled_environment_not_ready"),
+            (not controlled_host_ready, "controlled_host_not_ready"),
+            (not succession_ready, "succession_not_ready"),
+        ):
+            if flag:
+                reasons.append(code)
+        if quarantine_latched or lifecycle_state == LifecycleState.QUARANTINED.value:
+            status = "quarantined"
+        elif hard_blocked:
+            status = "blocked"
+        elif iteration_ready:
+            status = "ready"
+        else:
+            status = "needs_host"
+
+        return {
+            "schema_version": 1,
+            "read_only": True,
+            "ready": iteration_ready,
+            "status": status,
+            "promotion_authorization_required": True,
+            "automatic_promotion": False,
+            "reasons": reasons[:16],
+            "lifecycle": lifecycle,
+            "lease": lease,
+            "motivation": motivation_projection,
+            "evaluation_harness": evaluation_projection,
+            "promotion_controller": promotion_projection,
+            "controlled_environment": environment_projection,
+            "controlled_host": controlled_host_projection,
+            "succession": succession_projection,
+            "checks": {
+                "lifecycle_ready": lifecycle_ready,
+                "lease_ready": lease_ready,
+                "motivation_ready": motivation_ready,
+                "evaluation_ready": evaluation_projection["ready"],
+                "promotion_ready": promotion_ready,
+                "controlled_environment_ready": environment_ready,
+                "controlled_host_ready": controlled_host_ready,
+                "iteration_ready": iteration_ready,
+                "succession_ready": succession_ready,
+            },
+            "iteration": self._iteration_snapshot(),
         }
 
     def _iteration_snapshot(self) -> dict[str, Any]:
@@ -2784,6 +3234,22 @@ class BrainStem:
         # The current life kernel has already been rebuilt from the durable
         # lifecycle table.  Keep it as the source of truth and only attach the
         # coordinator's child sink after the cross-check above.
+        if coordinator.successor is None and coordinator.parent is not current:
+            # ``SuccessionCoordinator.from_snapshot`` necessarily restores a
+            # distinct but hash-equivalent parent object.  The process-local
+            # control registry is identity-sensitive, so retain the validated
+            # coordinator object as the current kernel before the first lease
+            # claim; otherwise a clean restart would fail closed with a false
+            # "different control owner" error even though the durable chain
+            # is intact.
+            self.life_kernel = coordinator.parent
+            self._life_sink_attached = False
+            if self.state_store is not None:
+                try:
+                    self._attach_life_sink(self.life_kernel)
+                except (LifecycleError, ValueError, TypeError) as exc:
+                    self._mark_life_restore_blocked(exc)
+                    raise LifecycleError("parent life ledger attachment failed") from exc
         if coordinator.successor is not None:
             # ``from_snapshot`` necessarily creates a fresh LifeKernel
             # object.  The identity/hash cross-check above proves equivalence;

@@ -121,7 +121,7 @@ class SelfMaintenanceIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 stem.record_impulse(
                     "growth",
                     intensity=1.0,
-                    source=r"C:\Users\24763\Desktop\motivation-secret.txt",
+                    source=r"C:\Users\example-user\Desktop\motivation-secret.txt",
                     context="ordinary-private-context https://example.invalid/?access_token=never-store",
                     metadata={
                         "api_key": "motivation-secret-value",

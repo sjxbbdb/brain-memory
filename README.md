@@ -66,7 +66,7 @@ cp .env.example .env
 打开 `.env` 文件，填入你的 API Key：
 
 ```env
-# DeepSeek V3 — 启用 LLM 认知通道时填写（去 https://platform.deepseek.com 注册）
+# DeepSeek V4.1 Flash — 启用 LLM 认知通道时填写（API 模型名：deepseek-flash；去 https://platform.deepseek.com 注册）
 DEEPSEEK_API_KEY=sk-your-deepseek-key-here
 
 # DashScope Embedding — 启用向量检索时填写（去 https://dashscope.aliyun.com 注册）
@@ -76,7 +76,7 @@ DASHSCOPE_API_KEY=sk-your-dashscope-key-here
 GLM_API_KEY=
 ```
 
-> 💰 **费用说明**: DeepSeek V3 极便宜（约 ¥1/百万 token），DashScope embedding 有免费额度。日常使用每月几块钱。
+> 💰 **费用说明**: DeepSeek V4.1 Flash 按官方峰谷价格计费；价格会调整，请以 [DeepSeek 官方定价](https://api-docs.deepseek.com/quick_start/pricing/) 为准。DashScope embedding 有免费额度。
 
 没有模型/Embedding Key 也可以启动规则/记忆模式；系统会在本地快速降级，不会发起未认证的模型请求。信息来源适配器默认使用无需 Key 的 Wikipedia 官方 JSON API；也可以配置白名单 RSS/Atom 或 arXiv 官方 Atom 来源。
 
@@ -100,7 +100,7 @@ python -m venv .venv
 普通 `Brain` 兼容模式仍可使用 `brain_v4.db` 这一历史默认名，但候选晋升的活动树/候选树
 是可整树原子交换的专用运行时目录，不能包含 SQLite 数据库或 `-wal`/`-shm`/`-journal`
 文件。部署晋升管道时请把 `BRAIN_MEMORY_DB_PATH` 设为活动树之外的绝对路径（例如
-`D:\\brain-memory-state\\brain.sqlite`）；控制器会在初始化、暂存和恢复阶段拒绝树内的
+`<state-root>/brain.sqlite`）；控制器会在初始化、暂存和恢复阶段拒绝树内的
 可变数据库状态。这样代码树交换不会回滚或丢失生命账本、租约和记忆状态。
 
 ### 信息来源与核验
@@ -183,6 +183,12 @@ BRAIN_MEMORY_SOURCE_WIKIPEDIA_LANGS=zh,en
 任意文件内容中的秘密；评估器可能跳过敏感名称，但控制器会在晋升前再次拒绝，因此
 “评估通过”不等于“允许晋升”。重解析点、硬链接、原子重命名和文件锁是静态/最佳努力
 检查，不能替代 Windows ACL、容器隔离或冻结快照来对抗恶意并发宿主。
+
+### P7 连续性就绪度与受控宿主（实施中）
+
+P7 增加只读的 `/api/v4/continuity` 投影，用于查看当前 instance 和受控宿主是否具备进入候选迭代的前置条件。投影只返回有限的状态、布尔就绪项、计数和内容哈希；不会返回宿主能力对象、候选路径、原始账本、密钥或绝对路径。`ready` 只表示前置条件齐全，不代表已经授权晋升。
+
+达到动机阈值只会产生带来源证据的 `IterationNeed`。外置宿主可以据此登记提案、调用固定评估器并生成候选；活动树写入仍要求一次性沙箱证明和操作者明确授权。P7 首轮只允许连续性、可靠性、观测性、性能或冗余实现进入候选，继承系统只验证接线和安全阻断，不激活下一代。
 
 接入 `PromotionController` 时应显式绑定 `persistence_path`；若同时从 `BrainStem` 注入带有
 `db_path` 的 `StateStore`，脑干会在构造阶段自动完成同一校验，并拒绝尚未创建但位于活动树
@@ -379,6 +385,7 @@ V11 自主经历 📓（驱动→目标→行动→反馈→收束→持久化�
 | POST | `/api/v4/input` | 📥 提交输入 → 返回编码+情绪+焦点+独白+意图 |
 | GET | `/api/v4/state` | 🧠 完整脑状态快照（含所有 V9/V10 模块） |
 | GET | `/api/v4/health` | 💓 心跳 + 记忆统计 + execution/learning 摘要 |
+| GET | `/api/v4/continuity` | 🧭 P7 连续性就绪度与受控迭代前置条件（只读） |
 | GET | `/api/v4/self` | 🆔 自我模型 + 身份事实 + 行为倾向 + 驱动力 |
 | GET | `/api/v4/monologue` | 💭 当前内在独白 |
 | GET | `/api/v4/identity-memories` | 🏛️ 塑造身份的关键记忆 |
@@ -553,7 +560,7 @@ LivingWorld soak 的持续时长由 `BRAIN_MEMORY_P6_SOAK_SECONDS` 控制（限�
 
 ## 🔧 技术栈
 
-- 🤖 **LLM**: DeepSeek V3（默认）/ 兼容 OpenAI SDK 格式
+- 🤖 **LLM**: DeepSeek V4.1 Flash（默认模型名 `deepseek-flash`）/ 兼容 OpenAI Chat Completions 格式
 - 🔢 **Embedding**: DashScope text-embedding-v3
 - 🗄️ **数据库**: SQLite WAL 模式；普通兼容运行可用 `brain_v4.db`，晋升运行时必须使用
   活动树之外的绝对 `BRAIN_MEMORY_DB_PATH`

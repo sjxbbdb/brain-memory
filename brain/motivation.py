@@ -380,6 +380,45 @@ class MotivationSourceAttestor:
         except (TypeError, ValueError):
             return False
 
+    def verify_historical(
+        self,
+        value: MotivationSourceAttestation | Mapping[str, Any],
+        *,
+        event_id: str,
+        payload_hash: str,
+        source_id: str | None = None,
+        source_kind: str | None = None,
+    ) -> bool:
+        """Verify a persisted proof without replaying or renewing its authority.
+
+        Historical audit intentionally ignores wall-clock expiry: an expired
+        one-shot capability remains valid evidence that the original event was
+        signed and consumed, but it cannot be reused by :meth:`validate`.
+        """
+
+        try:
+            attestation = (
+                value
+                if isinstance(value, MotivationSourceAttestation)
+                else MotivationSourceAttestation.from_dict(value)
+            )
+            if attestation.issuer_id != self.issuer_id:
+                return False
+            if str(event_id) != attestation.event_id:
+                return False
+            if str(payload_hash).lower() != attestation.payload_hash:
+                return False
+            if source_id is not None and str(source_id) != attestation.source_id:
+                return False
+            if (
+                source_kind is not None
+                and str(source_kind).strip().lower() != attestation.source_kind
+            ):
+                return False
+            return attestation.verify_signature(self._secret)
+        except (TypeError, ValueError):
+            return False
+
     @property
     def consumed_ids(self) -> frozenset[str]:
         with self._lock:
@@ -522,8 +561,11 @@ def _epoch(value: Any, default: float | None = None) -> float:
         # Numeric strings are common in deterministic test/replay feeds.
         # Treat them as epoch seconds before attempting ISO parsing.
         if raw:
-            numeric = float(raw)
-            if math.isfinite(numeric):
+            try:
+                numeric = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                numeric = None
+            if numeric is not None and math.isfinite(numeric):
                 return numeric
         if raw.endswith("Z"):
             raw = raw[:-1] + "+00:00"

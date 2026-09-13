@@ -4,7 +4,7 @@
 
 ## 可复现命令
 
-在 `D:\brain-memory` 项目根目录执行：
+在项目根目录执行（具体路径由调用者决定）：
 
 ```text
 Remove-Item Env:DEEPSEEK_API_KEY,Env:DEEPSEEK_API_KEY_BACKUP,Env:DASHSCOPE_API_KEY,Env:GLM_API_KEY,Env:ZHIPU_API_KEY -ErrorAction SilentlyContinue

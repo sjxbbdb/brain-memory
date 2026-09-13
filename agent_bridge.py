@@ -1243,7 +1243,6 @@ class AgentBridge:
             "allow_write_tools": self.allow_write_tools,
             "write_policy": "per_action_one_shot",
             "pending_write_approvals": len(self._write_approvals),
-            "workspace_root": str(self.workspace_root),
         }
 
     async def process_user_message(self, text: str, source: str = "user") -> dict | None:

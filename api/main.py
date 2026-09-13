@@ -5,6 +5,7 @@ REST:
   POST /api/v4/input        — 外部输入
   GET  /api/v4/monologue    — 内在独白
   GET  /api/v4/health       — 健康检查
+  GET  /api/v4/continuity   — 连续性就绪度（只读）
   GET  /api/v11/tasks       — 分层长期任务队列
   GET  /api/v11/autonomy    — 自主经历状态与有限历史
   GET  /api/v13/tasks       — 只读执行计划列表
@@ -24,6 +25,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 # Ensure the brain-memory project root is on the path when launched as a module.
 _sys_path_root = Path(__file__).parent.parent
@@ -36,6 +38,9 @@ from pydantic import BaseModel, Field
 
 from brain.core import Brain
 from brain.core_purpose import core_purpose  # V8
+from brain.public_projection import (
+    sanitize_public_projection as _sanitize_continuity_projection,
+)
 from agent.tool_registry import discover_tools, registry
 from agent_bridge import AgentBridge
 from config import (
@@ -96,6 +101,47 @@ def _bounded_limit(value: int, default: int = 20, maximum: int = 100) -> int:
         return max(1, min(maximum, int(value)))
     except (TypeError, ValueError):
         return default
+
+
+def _sanitize_input_response(value: Any) -> dict[str, Any]:
+    """Keep the input contract's response key while redacting its contents."""
+
+    if not isinstance(value, dict):
+        return {}
+    clean: dict[str, Any] = {}
+    for key, raw in value.items():
+        # ``response`` is useful to API clients, but the generic projection
+        # drops that capability-bearing field entirely.  Sanitize its value
+        # as an anonymous payload so the key remains backward compatible.
+        if str(key).strip().lower().replace("-", "_") == "response":
+            projected = _sanitize_continuity_projection(raw, "")
+        else:
+            projected = _sanitize_continuity_projection(raw, str(key))
+        if projected is not None:
+            clean[str(key)[:80]] = projected
+    return clean
+
+
+def _public_projection(value: Any) -> Any:
+    """Apply the bounded, fail-closed projection to any JSON response."""
+
+    projected = _sanitize_continuity_projection(value)
+    return {} if projected is None else projected
+
+
+def _continuity_unavailable_projection() -> dict[str, Any]:
+    """Fail closed when an embedded legacy stem has no readiness seam."""
+
+    return {
+        "schema_version": 1,
+        "read_only": True,
+        "ready": False,
+        "status": "blocked",
+        "promotion_authorization_required": True,
+        "automatic_promotion": False,
+        "reasons": ["continuity_reader_unavailable"],
+        "checks": {"iteration_ready": False, "succession_ready": False},
+    }
 
 
 def _compact_task_scheduler(snapshot: Any) -> dict[str, Any]:
@@ -437,7 +483,7 @@ async def _broadcast_loop():
         await asyncio.sleep(3)
         brain = _brain
         if brain and brain.is_awake:
-            await brain.broadcast_state()
+            await brain.broadcast_state(projector=_sanitize_continuity_projection)
 
 
 # ── App ──
@@ -453,6 +499,37 @@ _cors_origins = [
     for origin in os.getenv("BRAIN_MEMORY_CORS_ORIGINS", "").split(",")
     if origin.strip()
 ]
+
+
+def _websocket_origin_allowed(ws: WebSocket) -> bool:
+    """Reject browser cross-origin WebSocket probes by default.
+
+    Native local clients commonly omit ``Origin``; those remain compatible.
+    A configured CORS origin is an explicit operator opt-in.  Otherwise only
+    the local dashboard origins for this process port are accepted.
+    """
+
+    origin = str(getattr(ws, "headers", {}).get("origin", "") or "").strip()
+    if not origin:
+        return True
+    configured = {str(item).rstrip("/") for item in _cors_origins if item != "*"}
+    if origin.rstrip("/") in configured:
+        return True
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"} or parsed.path not in {"", "/"}:
+        return False
+    host = (parsed.hostname or "").lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    return host in {"localhost", "127.0.0.1", "[::1]", "::1"} and port in {
+        None,
+        PORT,
+    }
 
 app.add_middleware(
     CORSMiddleware,
@@ -484,11 +561,22 @@ class InputRequest(BaseModel):
 
 @app.get("/api/v4/state")
 async def get_state():
-    """Get current brain state."""
+    """Get current brain state without publishing capability-bearing fields."""
     brain = get_brain()
     state = await brain.get_state()
+    if not isinstance(state, dict):
+        state = {}
+    else:
+        # Do not mutate an adapter-owned snapshot while adding the legacy
+        # sleep-state field for this response.
+        state = dict(state)
     state["sleep_state"] = brain.brain_stem.sleep_state
-    return state
+    # The legacy state snapshot is intentionally broad for the dashboard, but
+    # it is still an HTTP boundary.  Reuse the same bounded projection as the
+    # continuity/health routes so old adapters cannot publish paths, raw
+    # ledgers, candidate evidence, or credential-shaped diagnostics.
+    clean = _sanitize_continuity_projection(state)
+    return clean if isinstance(clean, dict) else {}
 
 
 @app.post("/api/v4/input")
@@ -507,18 +595,18 @@ async def post_input(req: InputRequest):
         action_id=req.action_id,
     )
     # 立即推送最新状态给所有 WebSocket 客户端
-    await brain.broadcast_state()
-    return result
+    await brain.broadcast_state(projector=_sanitize_continuity_projection)
+    return _sanitize_input_response(result)
 
 
 @app.get("/api/v4/monologue")
 async def get_monologue():
     """Get the brain's current inner monologue."""
     brain = get_brain()
-    return {
+    return _public_projection({
         "monologue": await brain.get_inner_monologue(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    })
 
 
 
@@ -528,7 +616,7 @@ async def get_identity_memories(limit: int = 20):
     """Get memories that shaped the brain's identity."""
     brain = get_brain()
     memories = _shareable_memories(brain, await brain.get_identity_memories(_bounded_limit(limit)))
-    return {
+    return _public_projection({
         "count": len(memories),
         "memories": [
             {
@@ -542,7 +630,7 @@ async def get_identity_memories(limit: int = 20):
             for m in memories
         ],
         "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    })
 
 
 
@@ -552,7 +640,7 @@ async def get_memory_timeline(limit: int = 20):
     brain = get_brain()
     ms = brain.memory_store
     recent = _shareable_memories(brain, ms.search("", limit=_bounded_limit(limit)))
-    return {
+    return _public_projection({
         "count": len(recent),
         "memories": [
             {
@@ -565,9 +653,9 @@ async def get_memory_timeline(limit: int = 20):
                 "is_identity_forming": m.get("is_identity_forming"),
                 "created": m.get("created"),
             }
-            for m in recent
+        for m in recent
         ],
-    }
+    })
 
 @app.get("/api/v4/memory/search")
 async def search_memories(q: str = "", limit: int = 20):
@@ -575,7 +663,7 @@ async def search_memories(q: str = "", limit: int = 20):
     brain = get_brain()
     ms = brain.memory_store
     results = _shareable_memories(brain, ms.search(q[:4000], limit=_bounded_limit(limit)))
-    return {
+    return _public_projection({
         "query": q,
         "count": len(results),
         "memories": [
@@ -594,14 +682,14 @@ async def search_memories(q: str = "", limit: int = 20):
             for m in results
         ],
         "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    })
 
 
 @app.get("/api/v4/sessions")
 async def get_sessions():
     """Get all active sessions and their states."""
     brain = get_brain()
-    return brain.brain_stem.state.session_manager.all_snapshots()
+    return _public_projection(brain.brain_stem.state.session_manager.all_snapshots())
 
 @app.get("/api/v4/self")
 async def get_self():
@@ -610,7 +698,7 @@ async def get_self():
     state = await brain.get_state()
     sm = state.get("self_model", {})
     curiosity_data = state.get("curiosity", {})
-    return {
+    return _public_projection({
         "identity": sm.get("identity_anchor", ""),
         "traits": sm.get("identity_traits", []),
         "version": sm.get("identity_version", 1),
@@ -632,7 +720,7 @@ async def get_self():
             "exploration_topics": curiosity_data.get("exploration_topics", [])[-5:],
         },
         "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    })
 
 @app.get("/api/v4/health")
 async def health():
@@ -647,7 +735,7 @@ async def health():
     task_snapshot = _read_only_task_scheduler_snapshot(
         task_scheduler, getattr(brain.brain_stem, "goal_system", None)
     )
-    return {
+    payload = {
         "status": (
             "awake" if brain.is_awake and loop_running
             else "degraded" if brain.is_awake
@@ -696,6 +784,38 @@ async def health():
             "running": False,
         },
     }
+    # Health is public observability just like /continuity.  Older state and
+    # bridge implementations may still carry diagnostics containing local
+    # paths, URLs, or credential-shaped text, so apply the same fail-closed
+    # projection before returning it.
+    clean = _sanitize_continuity_projection(payload)
+    return clean if isinstance(clean, dict) else {
+        "status": "degraded",
+        "version": PRODUCT_VERSION,
+        "product_version": PRODUCT_VERSION,
+        "version_label": PRODUCT_VERSION_LABEL,
+    }
+
+
+@app.get("/api/v4/continuity")
+async def get_continuity():
+    """Expose only the read-only controlled-iteration readiness projection."""
+
+    brain = get_brain()
+    stem = getattr(brain, "brain_stem", None)
+    reader = getattr(stem, "continuity_readiness_snapshot", None)
+    if not callable(reader):
+        return _continuity_unavailable_projection()
+    try:
+        snapshot = reader()
+    except Exception:
+        # A diagnostic endpoint must not turn a projection failure into a
+        # capability leak or an implicit recovery/write path.
+        return _continuity_unavailable_projection()
+    if not isinstance(snapshot, dict):
+        return _continuity_unavailable_projection()
+    clean = _sanitize_continuity_projection(snapshot)
+    return clean if isinstance(clean, dict) else _continuity_unavailable_projection()
 
 
 @app.get("/api/v4/goals")
@@ -707,7 +827,7 @@ async def get_goals():
     scheduler = getattr(brain.brain_stem, "task_scheduler", None)
     if scheduler is not None:
         snapshot["task_scheduler"] = _read_only_task_scheduler_snapshot(scheduler, gs)
-    return snapshot
+    return _public_projection(snapshot)
 
 
 @app.get("/api/v11/tasks")
@@ -716,8 +836,10 @@ async def get_long_term_tasks():
     brain = get_brain()
     scheduler = getattr(brain.brain_stem, "task_scheduler", None)
     if scheduler is None:
-        return {"enabled": False, "queue": []}
-    return _read_only_task_scheduler_snapshot(scheduler, brain.brain_stem.goal_system)
+        return _public_projection({"enabled": False, "queue": []})
+    return _public_projection(
+        _read_only_task_scheduler_snapshot(scheduler, brain.brain_stem.goal_system)
+    )
 
 
 @app.get("/api/v11/autonomy")
@@ -726,15 +848,15 @@ async def get_autonomy():
     brain = get_brain()
     manager = getattr(brain.brain_stem, "autonomy", None)
     if manager is None:
-        return {
+        return _public_projection({
             "enabled": False,
             "status": "disabled",
             "active": None,
             "history": [],
-        }
+        })
     snapshot = manager.snapshot()
     snapshot["enabled"] = True
-    return snapshot
+    return _public_projection(snapshot)
 
 
 @app.get("/api/v13/tasks")
@@ -747,16 +869,16 @@ async def get_v13_tasks():
         scheduler, brain.brain_stem.goal_system
     )
     if execution is None:
-        return {
+        return _public_projection({
             "enabled": False,
             "execution": _compact_task_execution_summary({}),
             "scheduler": _compact_task_scheduler(scheduler_snapshot),
-        }
-    return {
+        })
+    return _public_projection({
         "enabled": True,
         "execution": _safe_task_execution_summary(execution),
         "scheduler": _compact_task_scheduler(scheduler_snapshot),
-    }
+    })
 
 
 @app.get("/api/v13/tasks/{plan_id}")
@@ -773,11 +895,11 @@ async def get_v13_task(plan_id: str):
     scheduler_snapshot = _read_only_task_scheduler_snapshot(
         scheduler, brain.brain_stem.goal_system
     )
-    return {
+    return _public_projection({
         "enabled": True,
         "plan": detail,
         "scheduler": _compact_task_scheduler(scheduler_snapshot),
-    }
+    })
 
 
 @app.get("/api/v13/metrics")
@@ -791,7 +913,7 @@ async def get_v13_metrics():
         scheduler, brain.brain_stem.goal_system
     )
     execution_summary = _safe_task_execution_summary(execution)
-    return {
+    return _public_projection({
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "enabled": bool(execution is not None or learning is not None),
         "execution": {
@@ -805,7 +927,7 @@ async def get_v13_metrics():
             getattr(brain.brain_stem, "drive_engine", None)
         ),
         "scheduler": _compact_task_scheduler(scheduler_snapshot),
-    }
+    })
 
 
 @app.get("/api/v4/metacognition")
@@ -813,7 +935,7 @@ async def get_metacognition():
     """v5.2: Get the brain's metacognitive state — self-awareness metrics."""
     brain = get_brain()
     mc = brain.brain_stem.metacognition
-    return mc.snapshot()
+    return _public_projection(mc.snapshot())
 
 
 @app.get("/api/v4/emotion")
@@ -821,21 +943,21 @@ async def get_emotion():
     """v5.3: Get the brain's emotional spectrum — continuous blends, trajectory, expression."""
     brain = get_brain()
     es = brain.brain_stem.emotional_spectrum
-    return es.snapshot()
+    return _public_projection(es.snapshot())
 
 
 @app.get("/api/v4/skills")
 async def get_skills():
     """v5.4: Get learned procedural skills."""
     brain = get_brain()
-    return brain.brain_stem.procedural_memory.snapshot()
+    return _public_projection(brain.brain_stem.procedural_memory.snapshot())
 
 
 @app.get("/api/v4/timesense")
 async def get_timesense():
     """v5.4: Get time awareness — rhythm, temporal narrative, age."""
     brain = get_brain()
-    return brain.brain_stem.time_sense.snapshot()
+    return _public_projection(brain.brain_stem.time_sense.snapshot())
 
 
 # ── V6 State Field ──
@@ -845,7 +967,7 @@ async def get_state_field():
     """V6: Get the ActivationField state — all 14 dimensions + diffusion rules."""
     brain = get_brain()
     activation = brain.brain_stem.state.activation
-    return {
+    return _public_projection({
         "values": activation.to_dict(),
         "dominant_dimensions": [
             {"name": name, "value": round(val, 3),
@@ -859,7 +981,7 @@ async def get_state_field():
         "history_length": len(activation.history),
         "total_ticks": activation.total_ticks,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    })
 
 @app.get("/api/v6/working-memory-state")
 async def get_working_memory_state():
@@ -867,12 +989,12 @@ async def get_working_memory_state():
     brain = get_brain()
     wm = brain.brain_stem.working_memory
     activation = brain.brain_stem.state.activation
-    return {
+    return _public_projection({
         "items": wm.get_state_snapshot(),
         "capacity": WORKING_MEMORY_CAPACITY,
         "current_context": wm.get_context(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    })
 
 
 # ── V7 Drive Engine ──
@@ -887,13 +1009,13 @@ async def get_drives():
     for name in ["survival_drive","curiosity_drive","coherence_drive",
                  "growth_drive","exploration_drive","creation_drive","connection_drive"]:
         drives[name] = round(activation.get(name), 3)
-    return {
+    return _public_projection({
         "drives": drives,
         "dominant": max(drives, key=drives.get),
         "signals_emitted": de.total_signals_emitted,
         "goals_generated": de.total_goals_generated,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    })
 
 
 # ── V8 Exploration + Reflection ──
@@ -904,19 +1026,19 @@ async def get_exploration():
     brain = get_brain()
     eq = brain.brain_stem.exploration_queue
     ex = brain.brain_stem.exploration_executor
-    return {
+    return _public_projection({
         "queue": eq.snapshot(),
         "executor": ex.snapshot(),
         "core_purpose": str(core_purpose),
         "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    })
 
 @app.get("/api/v8/traits")
 async def get_traits():
     """V8: Get behavioral traits and their modulation effects."""
     brain = get_brain()
     sm = brain.brain_stem.state.self_model
-    return {
+    return _public_projection({
         "traits": dict(sm.behavioral_traits),
         "modulation_examples": {
             "call_tool": round(sm.modulate_intent("call_tool", 0.7), 3),
@@ -925,19 +1047,22 @@ async def get_traits():
         },
         "identity_version": sm.identity_version,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    })
 
 @app.get("/api/v8/reflection")
 async def get_reflection():
     """V8: Reflection engine stats."""
     brain = get_brain()
-    return brain.brain_stem.reflection_engine.snapshot()
+    return _public_projection(brain.brain_stem.reflection_engine.snapshot())
 
 
 # ── WebSocket ──
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    if not _websocket_origin_allowed(ws):
+        await ws.close(code=1008)
+        return
     await ws.accept()
     brain = get_brain()
     brain.register_ws(ws)
@@ -955,7 +1080,7 @@ async def websocket_endpoint(ws: WebSocket):
                 )
                 await ws.send_text(json.dumps({
                     "type": "input_response",
-                    "data": result,
+                    "data": _sanitize_input_response(result),
                 }, ensure_ascii=False))
 
             elif msg_type == "ping":

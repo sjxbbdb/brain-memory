@@ -764,6 +764,12 @@ class EvaluationReceipt:
     result_verified: bool
     error: str = ""
     receipt_hash: str = ""
+    # Small evaluator-owned metadata envelope.  It is intentionally optional
+    # for legacy callers, but lets an external executor bind its proof to the
+    # immutable receipt without smuggling paths or raw output into metrics.
+    # Keep this after ``receipt_hash`` so legacy positional construction keeps
+    # its original argument order.
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "harness_version", _bounded_text(self.harness_version, 80))
@@ -794,6 +800,7 @@ class EvaluationReceipt:
         object.__setattr__(self, "stderr_bytes", max(0, int(self.stderr_bytes)))
         object.__setattr__(self, "result_verified", bool(self.result_verified))
         object.__setattr__(self, "error", _bounded_text(self.error, 1000))
+        object.__setattr__(self, "metadata", _freeze(self.metadata))
         object.__setattr__(self, "receipt_hash", self._compute_hash())
 
     def _payload(self) -> dict[str, Any]:
@@ -827,6 +834,7 @@ class EvaluationReceipt:
             "stderr_bytes": self.stderr_bytes,
             "result_verified": self.result_verified,
             "error": self.error,
+            "metadata": _thaw(self.metadata),
         }
 
     def _compute_hash(self) -> str:
@@ -1205,6 +1213,7 @@ def _safe_environment(
     *,
     sandbox_temp: Path | None = None,
     harness_version: str = HARNESS_VERSION,
+    execution_request: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     """Build a minimal environment and remove credential-bearing variables."""
 
@@ -1237,6 +1246,22 @@ def _safe_environment(
             "no_proxy": "*",
         }
     )
+    if execution_request is not None:
+        if not isinstance(execution_request, Mapping):
+            raise HarnessConfigurationError("execution_request must be an object")
+        # This is a small, non-secret envelope for an external executor.  It
+        # is deliberately bounded before crossing the process boundary; the
+        # immutable EvaluationReceipt records whatever verified metadata the
+        # fixture judge returns.
+        try:
+            request_text = _canonical(execution_request)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise HarnessConfigurationError("execution_request is not JSON-safe") from exc
+        if len(request_text.encode("utf-8")) > 8 * 1024 or any(
+            ord(char) < 32 and char not in "\r\n\t" for char in request_text
+        ):
+            raise HarnessConfigurationError("execution_request exceeds its bounded contract")
+        env["P7_EXECUTION_REQUEST"] = request_text
     if sandbox_temp is not None:
         sandbox_temp.mkdir(parents=True, exist_ok=True)
         # Keep language/runtime temporary artifacts inside the disposable
@@ -1253,7 +1278,7 @@ def _run_bounded_process(
     env: Mapping[str, str],
     budget: ResourceBudget,
     watch_roots: Sequence[Path] = (),
-) -> tuple[int | None, bool, str, bytes, bytes, int, int]:
+) -> tuple[int | None, bool, str, bytes, bytes, int, int, bool]:
     """Run a child while keeping captured output memory bounded.
 
     ``Popen.communicate`` stores an unbounded stream in memory.  A candidate
@@ -1263,24 +1288,121 @@ def _run_bounded_process(
     """
 
     try:
-        process = subprocess.Popen(
-            list(argv),
-            cwd=str(cwd),
-            env=dict(env),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            start_new_session=True,
-        )
+        process_options: dict[str, Any] = {
+            "cwd": str(cwd),
+            "env": dict(env),
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "shell": False,
+            "close_fds": True,
+        }
+        if os.name == "nt":
+            # CREATE_SUSPENDED lets us assign the process to a kill-on-close
+            # Job Object before any candidate code can spawn descendants.
+            process_options["creationflags"] = int(
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            ) | 0x00000004
+        else:
+            process_options["start_new_session"] = True
+        process = subprocess.Popen(list(argv), **process_options)
     except (OSError, ValueError) as exc:
-        return None, False, f"candidate process failed: {type(exc).__name__}", b"", b"", 0, 0
+        return (
+            None,
+            False,
+            f"candidate process failed: {type(exc).__name__}",
+            b"",
+            b"",
+            0,
+            0,
+            False,
+        )
+
+    process_group = process.pid if os.name != "nt" else None
+    job: Any = None
+
+    def abort_setup(started_threads: Sequence[threading.Thread] = ()) -> None:
+        """Best-effort cleanup for setup failures; callers retain the primary error."""
+
+        nonlocal job
+        current_job = job
+        job = None
+        try:
+            _terminate_process_tree(
+                process, job=current_job, process_group=process_group
+            )
+        except BaseException:
+            pass
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            try:
+                _terminate_process_tree(process, process_group=process_group)
+            except BaseException:
+                pass
+            try:
+                process.wait(timeout=1.0)
+            except BaseException:
+                pass
+        except BaseException:
+            try:
+                _terminate_process_tree(process, process_group=process_group)
+            except BaseException:
+                pass
+        for stream in (process.stdout, process.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except BaseException:
+                pass
+        for thread in started_threads:
+            try:
+                thread.join(timeout=1.0)
+            except BaseException:
+                pass
+
+    try:
+        job = _create_kill_job(process)
+        if os.name == "nt" and not job:
+            abort_setup()
+            return (
+                None,
+                False,
+                "candidate process boundary unavailable",
+                b"",
+                b"",
+                0,
+                0,
+                False,
+            )
+        if not _resume_suspended_process(process):
+            abort_setup()
+            return (
+                None,
+                False,
+                "candidate process could not be resumed",
+                b"",
+                b"",
+                0,
+                0,
+                False,
+            )
+    except BaseException:
+        # Attaching/resuming is part of the isolation setup.  Never let a
+        # setup exception strand a live candidate outside the boundary.
+        abort_setup()
+        raise
 
     captures: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
     totals = {"stdout": 0, "stderr": 0}
     limits = {"stdout": budget.max_stdout_bytes, "stderr": budget.max_stderr_bytes}
 
+    drain_errors = {"stdout": False, "stderr": False}
+
     def drain(name: str, pipe: Any) -> None:
+        if pipe is None:
+            drain_errors[name] = True
+            return
         try:
             while True:
                 chunk = pipe.read(8192)
@@ -1290,22 +1412,74 @@ def _run_bounded_process(
                 remaining = limits[name] + 1 - len(captures[name])
                 if remaining > 0:
                     captures[name].extend(chunk[:remaining])
+        except Exception:
+            drain_errors[name] = True
+        except BaseException:
+            # A reader interrupted asynchronously cannot attest that the
+            # output boundary was completely consumed.
+            drain_errors[name] = True
         finally:
             try:
                 pipe.close()
-            except OSError:
-                pass
+            except BaseException:
+                drain_errors[name] = True
 
     threads = [
         threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
         threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
     ]
-    for thread in threads:
-        thread.start()
+    try:
+        for thread in threads:
+            thread.start()
+    except BaseException:
+        abort_setup(threads)
+        raise
     timed_out = False
     run_error = ""
     monitor_stop = threading.Event()
     resource_exceeded = threading.Event()
+    monitor_error = threading.Event()
+    termination_lock = threading.Lock()
+    termination_attempted = False
+    termination_result = True
+    job_holder = [job]
+
+    def close_boundary() -> bool:
+        """Close the process group/job exactly once and retain its result."""
+
+        nonlocal termination_attempted, termination_result
+        with termination_lock:
+            if termination_attempted:
+                return termination_result
+            termination_attempted = True
+            try:
+                termination_result = _terminate_process_tree(
+                    process,
+                    job=job_holder[0],
+                    process_group=process_group,
+                )
+            except BaseException:
+                termination_result = False
+            finally:
+                # A closed Job handle must never be reused by another thread.
+                job_holder[0] = None
+            return termination_result
+
+    def close_boundary_safely() -> bool:
+        """Keep cleanup progressing if the lock/termination path is interrupted."""
+
+        nonlocal termination_result
+        try:
+            return close_boundary()
+        except BaseException:
+            termination_result = False
+            # A lock/interruption before ``close_boundary`` reaches the kill
+            # primitive must not leave the candidate tree running.
+            try:
+                _terminate_process_tree(process, process_group=process_group)
+            except BaseException:
+                pass
+            return False
 
     def monitor_artifacts() -> None:
         """Stop a candidate while it grows an isolated tree past its limits.
@@ -1329,15 +1503,53 @@ def _run_bounded_process(
                     within = False
                 if not within:
                     resource_exceeded.set()
-                    _terminate_process_tree(process)
+                    close_boundary_safely()
                     return
+            # A monitor exception is itself an unverifiable resource state;
+            # do not let a daemon-thread traceback look like a clean run.
+
+    # Keep the monitor's own asynchronous failures observable to the caller.
+    original_monitor = monitor_artifacts
+
+    def guarded_monitor() -> None:
+        try:
+            original_monitor()
+        except BaseException:
+            monitor_error.set()
+            close_boundary_safely()
 
     monitor_thread = threading.Thread(
-        target=monitor_artifacts,
+        target=guarded_monitor,
         name="brain-memory-eval-budget",
         daemon=True,
     )
-    monitor_thread.start()
+    try:
+        monitor_thread.start()
+    except BaseException:
+        # Thread.start can fail after the candidate and pipe readers exist.
+        # Close every boundary before preserving the start exception.
+        try:
+            monitor_stop.set()
+        except BaseException:
+            pass
+        close_boundary_safely()
+        try:
+            process.wait(timeout=2.0)
+        except BaseException:
+            close_boundary_safely()
+        for stream in (process.stdout, process.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except BaseException:
+                pass
+        for thread in threads:
+            try:
+                thread.join(timeout=1.0)
+            except BaseException:
+                pass
+        raise
+    cleanup_error: BaseException | None = None
     try:
         deadline = time.monotonic() + budget.timeout_sec
         while True:
@@ -1345,7 +1557,7 @@ def _run_bounded_process(
             if remaining <= 0:
                 timed_out = True
                 run_error = f"candidate exceeded timeout {budget.timeout_sec:g}s"
-                _terminate_process_tree(process)
+                close_boundary_safely()
                 try:
                     process.wait(timeout=2.0)
                 except subprocess.TimeoutExpired:
@@ -1358,13 +1570,89 @@ def _run_bounded_process(
                 if resource_exceeded.is_set():
                     run_error = "candidate exceeded isolated artifact resource budget"
                     break
+    except BaseException:
+        # Never abandon a candidate tree when the supervising thread is
+        # interrupted.  The original exception is deliberately propagated.
+        close_boundary_safely()
+        raise
     finally:
-        monitor_stop.set()
-        monitor_thread.join(timeout=2.0)
+        try:
+            monitor_stop.set()
+        except BaseException as exc:
+            cleanup_error = cleanup_error or exc
+            monitor_error.set()
+        # Close the group/job even after a normal parent exit: a descendant
+        # may have redirected its output and otherwise outlive the parent.
+        close_boundary_safely()
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            run_error = run_error or "candidate process boundary did not close"
+            close_boundary_safely()
+        except BaseException as exc:
+            cleanup_error = cleanup_error or exc
+            run_error = run_error or "candidate process boundary did not close"
+            close_boundary_safely()
+        try:
+            monitor_thread.join(timeout=2.0)
+        except BaseException as exc:
+            cleanup_error = cleanup_error or exc
+            monitor_error.set()
+        for thread in threads:
+            try:
+                thread.join(timeout=2.0)
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+                drain_errors["stdout" if thread is threads[0] else "stderr"] = True
+            try:
+                thread_alive = thread.is_alive()
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+                thread_alive = True
+                drain_errors["stdout" if thread is threads[0] else "stderr"] = True
+            if thread_alive:
+                drain_errors["stdout" if thread is threads[0] else "stderr"] = True
+                for stream in (process.stdout, process.stderr):
+                    try:
+                        if stream is not None:
+                            stream.close()
+                    except BaseException:
+                        drain_errors["stdout" if thread is threads[0] else "stderr"] = True
+                        break
+                try:
+                    thread.join(timeout=1.0)
+                except BaseException as exc:
+                    cleanup_error = cleanup_error or exc
+                    drain_errors["stdout" if thread is threads[0] else "stderr"] = True
+    if cleanup_error is not None:
+        raise cleanup_error
+    try:
+        monitor_alive = monitor_thread.is_alive()
+    except BaseException:
+        monitor_alive = True
+        monitor_error.set()
+    thread_alive_states: list[bool] = []
     for thread in threads:
-        thread.join(timeout=2.0)
+        try:
+            thread_alive_states.append(thread.is_alive())
+        except BaseException:
+            thread_alive_states.append(True)
+            drain_errors["stdout" if thread is threads[0] else "stderr"] = True
     if resource_exceeded.is_set() and not run_error:
         run_error = "candidate exceeded isolated artifact resource budget"
+    if monitor_alive or monitor_error.is_set():
+        run_error = run_error or "candidate resource monitor boundary unverified"
+    if any(drain_errors.values()) or any(thread_alive_states):
+        run_error = run_error or "candidate output boundary unverified"
+    boundary_closed = bool(
+        termination_attempted
+        and termination_result
+        and process.returncode is not None
+        and not monitor_alive
+        and not monitor_error.is_set()
+        and not any(drain_errors.values())
+        and not any(thread_alive_states)
+    )
     return (
         process.returncode,
         timed_out,
@@ -1373,48 +1661,195 @@ def _run_bounded_process(
         bytes(captures["stderr"]),
         totals["stdout"],
         totals["stderr"],
+        boundary_closed,
     )
 
 
-def _terminate_process_tree(process: subprocess.Popen[Any]) -> None:
-    """Best-effort termination of a timed-out candidate and its descendants.
+def _create_kill_job(process: subprocess.Popen[Any]) -> Any:
+    """Attach a Windows kill-on-close Job Object to an evaluator child."""
 
-    ``Popen.kill`` only targets the immediate process.  A candidate can spawn
-    a child that keeps running (and keeps pipes open) after the parent exits,
-    so use the process group/job boundary where the platform exposes one and
-    retain a direct-kill fallback.  This is still not a replacement for an
-    external OS sandbox; it simply closes the common timeout leak.
-    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _BasicLimit(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [
+                (name, ctypes.c_ulonglong)
+                for name in (
+                    "ReadOperationCount",
+                    "WriteOperationCount",
+                    "OtherOperationCount",
+                    "ReadTransferCount",
+                    "WriteTransferCount",
+                    "OtherTransferCount",
+                )
+            ]
+
+        class _ExtendedLimit(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimit),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_job = kernel32.CreateJobObjectW
+        create_job.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        create_job.restype = wintypes.HANDLE
+        set_info = kernel32.SetInformationJobObject
+        set_info.argtypes = [
+            wintypes.HANDLE,
+            wintypes.INT,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        set_info.restype = wintypes.BOOL
+        assign = kernel32.AssignProcessToJobObject
+        assign.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        assign.restype = wintypes.BOOL
+        close = kernel32.CloseHandle
+        close.argtypes = [wintypes.HANDLE]
+        close.restype = wintypes.BOOL
+
+        handle = None
+        try:
+            handle = create_job(None, None)
+            if not handle:
+                return None
+            limits = _ExtendedLimit()
+            limits.BasicLimitInformation.LimitFlags = 0x00002000  # KILL_ON_JOB_CLOSE
+            if not set_info(
+                handle,
+                9,  # JobObjectExtendedLimitInformation
+                ctypes.byref(limits),
+                ctypes.sizeof(limits),
+            ) or not assign(handle, wintypes.HANDLE(process._handle)):
+                return None
+            job = (kernel32, handle)
+            handle = None
+            return job
+        finally:
+            if handle:
+                try:
+                    close(handle)
+                except (AttributeError, OSError, TypeError, ValueError):
+                    pass
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _close_kill_job(job: Any) -> bool:
+    if not job:
+        return True
+    try:
+        return bool(job[0].CloseHandle(job[1]))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
+def _resume_suspended_process(process: subprocess.Popen[Any]) -> bool:
+    """Resume a Windows child only after it entered its Job Object."""
+
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        resume = ntdll.NtResumeProcess
+        resume.argtypes = [wintypes.HANDLE]
+        resume.restype = ctypes.c_long
+        return int(resume(wintypes.HANDLE(process._handle))) == 0
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[Any], *, job: Any = None, process_group: int | None = None
+) -> bool:
+    """Close a child tree and report whether the boundary was proven closed."""
 
     pid = getattr(process, "pid", None)
     if not isinstance(pid, int) or pid <= 0:
-        return
-    if os.name == "nt":
-        # ``CREATE_NO_WINDOW`` avoids flashing a console for the evaluator's
-        # own cleanup command.  A missing taskkill binary or a race with a
-        # naturally exiting process falls through to ``process.kill``.
-        creation_flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return False
+    boundary_closed = True
+    if job:
+        # Job close is authoritative.  taskkill is cleanup-only fallback and
+        # therefore cannot turn a failed close into a positive attestation.
+        boundary_closed = _close_kill_job(job)
+        if not boundary_closed and os.name == "nt":
+            try:
+                system_root = os.environ.get("SystemRoot", r"C:\\Windows")
+                taskkill = Path(system_root) / "System32" / "taskkill.exe"
+                if taskkill.is_file() and not _is_link_like(taskkill):
+                    result = subprocess.run(
+                        [str(taskkill), "/PID", str(pid), "/T", "/F"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        shell=False,
+                        close_fds=True,
+                        timeout=3,
+                        check=False,
+                    )
+                    if result.returncode != 0:
+                        boundary_closed = False
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                boundary_closed = False
+    elif os.name == "nt":
+        # Without a Job Object the descendant boundary is not attestable.
+        boundary_closed = False
         try:
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=2.0,
-                creationflags=creation_flags,
-            )
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            pass
+            system_root = os.environ.get("SystemRoot", r"C:\\Windows")
+            taskkill = Path(system_root) / "System32" / "taskkill.exe"
+            if taskkill.is_file() and not _is_link_like(taskkill):
+                result = subprocess.run(
+                    [str(taskkill), "/PID", str(pid), "/T", "/F"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    shell=False,
+                    close_fds=True,
+                    timeout=3,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    boundary_closed = False
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            boundary_closed = False
     else:
         try:
-            os.killpg(pid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
+            os.killpg(process_group or pid, signal.SIGKILL)
+        except ProcessLookupError:
             pass
+        except (AttributeError, OSError):
+            boundary_closed = False
     try:
         process.kill()
-    except OSError:
+    except ProcessLookupError:
         pass
+    except (AttributeError, OSError, ValueError):
+        boundary_closed = False
+    return boundary_closed
 
 
 def _expand_command(command: Sequence[str] | str | None, candidate: Path, fixtures: Path) -> list[str]:
@@ -1750,6 +2185,7 @@ class EvaluationHarness:
         stderr_bytes: int,
         result_verified: bool,
         error: str = "",
+        metadata: Mapping[str, Any] | None = None,
     ) -> EvaluationReceipt:
         return EvaluationReceipt(
             receipt_id=f"receipt-{uuid.uuid4().hex}",
@@ -1780,6 +2216,7 @@ class EvaluationHarness:
             stderr_bytes=stderr_bytes,
             result_verified=result_verified,
             error=error,
+            metadata=metadata or {},
         )
 
     def evaluate(
@@ -1791,6 +2228,7 @@ class EvaluationHarness:
         command: Sequence[str] | str | None = None,
         judge_command: Sequence[str] | str | None = None,
         primary_dimension: str | None = None,
+        execution_request: Mapping[str, Any] | None = None,
     ) -> EvaluationReceipt:
         """Run one candidate and return an immutable acceptance receipt.
 
@@ -1848,6 +2286,7 @@ class EvaluationHarness:
         result_verified = False
         error = ""
         startup_ok = False
+        boundary_closed = False
         fixture_ok = False
         fixture_source_ok = False
         candidate_source_ok = False
@@ -1918,6 +2357,7 @@ class EvaluationHarness:
                     self._budget,
                     sandbox_temp=root / "tmp",
                     harness_version=self._harness_version,
+                    execution_request=execution_request,
                 )
                 (
                     exit_code,
@@ -1927,6 +2367,7 @@ class EvaluationHarness:
                     stderr,
                     stdout_bytes,
                     stderr_bytes,
+                    boundary_closed,
                 ) = _run_bounded_process(
                     argv,
                     cwd=isolated_candidate,
@@ -1934,7 +2375,12 @@ class EvaluationHarness:
                     budget=self._budget,
                     watch_roots=(isolated_candidate, root / "tmp"),
                 )
-                startup_ok = bool(not timed_out and not run_error and exit_code == 0)
+                startup_ok = bool(
+                    not timed_out
+                    and not run_error
+                    and exit_code == 0
+                    and boundary_closed
+                )
                 parsed_result, parse_error = _parse_candidate_result(stdout)
                 if parsed_result is None:
                     error = run_error or parse_error
@@ -2039,7 +2485,7 @@ class EvaluationHarness:
         if duration_sec > self._budget.timeout_sec:
             resources_ok = False
 
-        gates.append(GateResult(HardGate.STARTUP.value, startup_ok, "process exited successfully" if startup_ok else (error or "startup failed"), {"exit_code": exit_code, "timed_out": timed_out}))
+        gates.append(GateResult(HardGate.STARTUP.value, startup_ok, "process exited successfully" if startup_ok else (error or "startup failed"), {"exit_code": exit_code, "timed_out": timed_out, "boundary_closed": boundary_closed}))
         integrity_ok = fixture_ok and fixture_source_ok and candidate_source_ok and evaluator_ok and baseline_observed_ok
         gates.append(GateResult(HardGate.INTEGRITY.value, integrity_ok, "fixture, baseline, candidate source, and evaluator hashes unchanged" if integrity_ok else "fixture/baseline/candidate/evaluator mutation or drift detected", {"fixture_copy_unchanged": fixture_ok, "fixture_source_unchanged": fixture_source_ok, "candidate_source_unchanged": candidate_source_ok, "baseline_fingerprint_matches": baseline_observed_ok, "evaluator_unchanged": evaluator_ok}))
         gates.append(GateResult(HardGate.RESOURCE_BUDGET.value, resources_ok, "within declared resource budget" if resources_ok else "resource budget exceeded", {"duration_sec": round(duration_sec, 6), "stdout_bytes": stdout_bytes, "stderr_bytes": stderr_bytes}))
@@ -2114,6 +2560,12 @@ class EvaluationHarness:
             stderr_bytes=stderr_bytes,
             result_verified=result_verified,
             error=error,
+            metadata=(
+                parsed_result.get("metadata", {})
+                if isinstance(parsed_result, Mapping)
+                and isinstance(parsed_result.get("metadata", {}), Mapping)
+                else {}
+            ),
         )
 
     # Common vocabulary aliases make the seam convenient for orchestrators.

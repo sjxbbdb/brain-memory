@@ -1,7 +1,7 @@
 """LLM Client — Unified multi-provider LLM + Embedding backend for Brain Memory.
 
 Providers:
-  - DeepSeek V3: primary LLM (cheap, fast, good Chinese)
+  - DeepSeek V4.1 Flash: primary LLM (fast, multimodal-capable API channel)
   - GLM-4: fallback LLM
   - DashScope Qwen: LLM fallback + text-embedding-v3
 
@@ -51,8 +51,12 @@ def _env_flag(name: str, default: bool = False) -> bool:
 OFFLINE_MODE = _env_flag("BRAIN_MEMORY_OFFLINE", False)
 
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL = "deepseek-chat"  # V3
+# DeepSeek's current canonical API model is ``deepseek-v4-flash``.  The base URL
+# intentionally follows the canonical endpoint without the optional ``/v1``
+# compatibility suffix; the Chat Completions path is appended below.  Keep the model name in
+# one place so host-bound callers can verify they are using the current channel.
+DEEPSEEK_BASE = "https://api.deepseek.com"
+DEEPSEEK_MODEL = "deepseek-v4-flash"  # DeepSeek V4 Flash
 
 GLM_KEY = os.environ.get("GLM_API_KEY", os.environ.get("ZHIPU_API_KEY", ""))
 GLM_BASE = "https://open.bigmodel.cn/api/paas/v4"
@@ -80,7 +84,16 @@ class LLMClient:
 
     async def chat_json(self, system: str, user: str, temperature: float = 0.1, max_tokens: int = 1024) -> dict[str, Any]:
         """Call LLM and parse JSON response."""
-        result = await self._call_llm(self.cfg, system, user, temperature, max_tokens)
+        if "json" not in (str(system) + "\n" + str(user)).lower():
+            system = str(system) + "\nReturn one valid JSON object only."
+        result = await self._call_llm(
+            self.cfg,
+            system,
+            user,
+            temperature,
+            max_tokens,
+            json_mode=True,
+        )
         return self._parse_json(result, self.cfg["provider"])
 
     async def chat_text(self, system: str, user: str, temperature: float = 0.3, max_tokens: int = 2048) -> str:
@@ -89,7 +102,7 @@ class LLMClient:
 
     async def _call_llm(
         self, cfg: dict, system: str, user: str,
-        temperature: float, max_tokens: int,
+        temperature: float, max_tokens: int, *, json_mode: bool = False,
     ) -> str:
         if OFFLINE_MODE or not cfg.get("key"):
             reason = "offline mode" if OFFLINE_MODE else "API key is not configured"
@@ -115,9 +128,14 @@ class LLMClient:
             "max_tokens": max_tokens,
         }
 
-        # DeepSeek + DashScope support response_format json_object
-        if cfg["provider"] in ("deepseek", "dashscope"):
+        # Structured callers opt into JSON mode explicitly.  DeepSeek V4.1
+        # Flash defaults to thinking mode, which can consume the output budget
+        # before a JSON body is emitted; disable it for bounded machine-readable
+        # responses while leaving normal text calls on the provider default.
+        if json_mode and cfg["provider"] in ("deepseek", "dashscope"):
             body["response_format"] = {"type": "json_object"}
+        if json_mode and cfg["provider"] == "deepseek":
+            body["thinking"] = {"type": "disabled"}
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -135,6 +153,8 @@ class LLMClient:
 
     def _parse_json(self, text: str, provider: str) -> dict:
         """Extract JSON from LLM response (handles markdown fences)."""
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"{provider}: empty JSON response")
         text = text.strip()
         # Remove markdown code fences
         if text.startswith("```"):

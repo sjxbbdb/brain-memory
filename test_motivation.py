@@ -3,6 +3,7 @@
 import json
 import threading
 import unittest
+from datetime import datetime, timezone
 
 from brain.motivation import (
     ChangeProposal,
@@ -14,6 +15,18 @@ from brain.motivation import (
 
 
 class MotivationTests(unittest.TestCase):
+    def test_iteration_need_iso_timestamp_round_trips_without_clock_drift(self):
+        stamp = datetime(2026, 9, 11, 1, 2, 3, 456789, tzinfo=timezone.utc).isoformat()
+        need = IterationNeed(
+            motive="growth",
+            pressure=0.8,
+            need_id="need-stable",
+            created_at=stamp,
+        )
+        restored = IterationNeed.from_dict(need.to_dict())
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.created_at, stamp)
+
     def test_impulse_is_bounded_frozen_and_round_trips(self):
         event = ImpulseEvent.create(
             kind="CURIOUSITY",
@@ -660,7 +673,7 @@ class MotivationTests(unittest.TestCase):
             ImpulseEvent.create(
                 "growth",
                 1.0,
-                r"C:\Users\24763\Desktop\private-token.txt",
+                r"C:\Users\example-user\Desktop\private-token.txt",
                 context="ordinary-private-context https://example.invalid/?access_token=do-not-store",
                 metadata={"api_key": "super-secret", "safe": "ordinary-private-value"},
                 event_id="sensitive-1",

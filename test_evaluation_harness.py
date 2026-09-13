@@ -8,6 +8,8 @@ from pathlib import Path
 import sys
 import tempfile
 import textwrap
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -98,6 +100,67 @@ class EvaluationHarnessTests(unittest.TestCase):
                 receipt.from_dict(tampered)
             with self.assertRaises((TypeError, AttributeError)):
                 receipt.candidate_metrics["quality"] = 9  # type: ignore[index]
+
+    def test_executor_metadata_is_hash_bound_and_round_trips(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            baseline = self._baseline(root)
+            candidate = self._candidate(
+                root,
+                '{"status":"pass","verified":true,"metrics":{"quality":0.75,"safety":1.0},"metadata":{"protocol":"p7-docker-v1","proof_digest":"' + "a" * 64 + '"}}',
+            )
+            fixtures = self._judge(root, '{"status":"pass","verified":true,"metrics":{"quality":0.75,"safety":1.0},"metadata":{"protocol":"p7-docker-v1","proof_digest":"' + "a" * 64 + '"}}')
+            receipt = EvaluationHarness(
+                fixtures=fixtures,
+                command=self._command(),
+                primary_dimension="quality",
+            ).evaluate(candidate, baseline)
+            self.assertEqual(receipt.metadata["protocol"], "p7-docker-v1")
+            restored = receipt.from_dict(json.loads(receipt.to_json()))
+            self.assertEqual(restored.metadata, receipt.metadata)
+            tampered = receipt.to_dict()
+            tampered["metadata"]["proof_digest"] = "b" * 64
+            with self.assertRaises(CandidateResultError):
+                receipt.from_dict(tampered)
+
+    def test_execution_request_crosses_only_the_bounded_judge_environment(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            baseline = self._baseline(root)
+            candidate = self._candidate(root, "unused")
+            fixtures = root / "judge-fixtures"
+            fixtures.mkdir()
+            (fixtures / "judge.py").write_text(
+                "import json, os\n"
+                "request = json.loads(os.environ['P7_EXECUTION_REQUEST'])\n"
+                "print(json.dumps({'status':'pass','verified':True,"
+                "'metrics':{'quality':0.75,'safety':1.0},'metadata':request}, "
+                "sort_keys=True))\n",
+                encoding="utf-8",
+            )
+            request = {
+                "schema_version": 1,
+                "protocol": "p7-docker-v1",
+                "nonce": "a" * 32,
+            }
+            receipt = EvaluationHarness(
+                fixtures=fixtures,
+                command=self._command(),
+                primary_dimension="quality",
+            ).evaluate(candidate, baseline, execution_request=request)
+            self.assertTrue(receipt.accepted, receipt.to_dict())
+            self.assertEqual(dict(receipt.metadata), request)
+
+            with self.assertRaises(HarnessConfigurationError):
+                EvaluationHarness(
+                    fixtures=fixtures,
+                    command=self._command(),
+                    primary_dimension="quality",
+                ).evaluate(
+                    candidate,
+                    baseline,
+                    execution_request={"payload": "x" * (9 * 1024)},
+                )
 
     def test_receipt_schema_is_versioned(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -347,6 +410,102 @@ class EvaluationHarnessTests(unittest.TestCase):
             self.assertFalse(receipt.accepted)
             self.assertTrue(receipt.timed_out)
             self.assertFalse(next(g for g in receipt.gates if g.name == "resource_budget").passed)
+
+    def test_process_boundary_closes_descendants_after_normal_parent_exit(self):
+        """A child that outlives its parent cannot mutate an external marker."""
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            marker = root / "descendant-marker.txt"
+            child_code = (
+                "import time; time.sleep(0.4); "
+                f"from pathlib import Path; Path({str(marker)!r}).write_text('leaked')"
+            )
+            baseline = self._baseline(root)
+            candidate = self._candidate(
+                root,
+                '{"status":"pass","verified":true,"metrics":{"quality":0.75,"safety":1.0}}',
+                extra=(
+                    "import subprocess, sys\n"
+                    f"subprocess.Popen([sys.executable, '-c', {child_code!r}])"
+                ),
+            )
+            fixtures = self._judge(
+                root,
+                '{"status":"pass","verified":true,"metrics":{"quality":0.75,"safety":1.0}}',
+            )
+            receipt = EvaluationHarness(
+                fixtures=fixtures,
+                command=self._command(),
+                primary_dimension="quality",
+            ).evaluate(candidate, baseline)
+            self.assertTrue(receipt.accepted, receipt.to_dict())
+            startup = next(gate for gate in receipt.gates if gate.name == "startup")
+            self.assertTrue(startup.evidence["boundary_closed"])
+            time.sleep(0.8)
+            self.assertFalse(marker.exists())
+
+    def test_monitor_start_interrupt_cleans_candidate_boundary_before_reraising(self):
+        """A failed monitor thread start must not leak the candidate process."""
+
+        import brain.evaluation_harness as harness_module
+
+        class _Stream:
+            def __init__(self):
+                self.closed = False
+
+            def read(self, _size):
+                return b""
+
+            def close(self):
+                self.closed = True
+
+        class _Process:
+            pid = 12345
+
+            def __init__(self):
+                self.stdout = _Stream()
+                self.stderr = _Stream()
+                self.returncode = -9
+                self.wait_calls = 0
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                return self.returncode
+
+            def poll(self):
+                return self.returncode
+
+        process = _Process()
+        original_start = threading.Thread.start
+
+        def start(thread):
+            if thread.name == "brain-memory-eval-budget":
+                raise KeyboardInterrupt("monitor start")
+            return original_start(thread)
+
+        with mock.patch.object(
+            harness_module.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            harness_module, "_create_kill_job", return_value=object()
+        ), mock.patch.object(
+            harness_module, "_resume_suspended_process", return_value=True
+        ), mock.patch.object(
+            harness_module, "_terminate_process_tree", return_value=True
+        ) as terminate, mock.patch.object(
+            harness_module, "_close_kill_job", return_value=True
+        ), mock.patch.object(threading.Thread, "start", new=start):
+            with self.assertRaises(KeyboardInterrupt):
+                harness_module._run_bounded_process(
+                    ["fixture-command"],
+                    cwd=Path.cwd(),
+                    env={},
+                    budget=ResourceBudget(timeout_sec=1),
+                )
+        self.assertGreaterEqual(process.wait_calls, 1)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+        terminate.assert_called()
 
     def test_candidate_artifact_limits_are_enforced_before_copy(self):
         """A hostile source cannot consume disk before the post-run gate."""

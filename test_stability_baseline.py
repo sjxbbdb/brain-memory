@@ -8,10 +8,12 @@ on a fresh checkout before optional API/LLM dependencies are installed:
 
 import asyncio
 import json
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from agent.tool_registry import discover_tools, registry, ToolDef, ToolRegistry
 from agent.tools.builtin_tools import _file_read
@@ -287,6 +289,89 @@ class StabilityBaselineTests(unittest.IsolatedAsyncioTestCase):
                 )
         finally:
             client.cfg["key"] = original_key
+
+    async def test_llm_json_calls_request_explicit_structured_mode(self):
+        from services.llm_client import LLMClient
+
+        client = LLMClient()
+        call = AsyncMock(return_value='{"ok": true}')
+        with patch.object(client, "_call_llm", call):
+            result = await client.chat_json("structured output", "probe")
+        self.assertTrue(result["ok"])
+        args, kwargs = call.call_args
+        self.assertIn("json", args[1].lower())
+        self.assertTrue(kwargs["json_mode"])
+
+    async def test_deepseek_flash_http_contract_is_exact_and_bounded(self):
+        import services.llm_client as llm_module
+        from services.llm_client import LLMClient
+
+        captured = {}
+
+        class Response:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def json(self):
+                return {
+                    "choices": [{"message": {"content": '{"ok": true}'}}],
+                    "usage": {"total_tokens": 3},
+                }
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def post(self, url, *, json, headers, timeout):
+                captured.update(
+                    {"url": url, "body": json, "headers": headers, "timeout": timeout}
+                )
+                return Response()
+
+        fake_aiohttp = types.SimpleNamespace(
+            ClientSession=Session,
+            ClientTimeout=lambda *, total: {"total": total},
+        )
+        client = LLMClient()
+        config = {
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+            "base": "https://api.deepseek.com",
+            "key": "test-only-key",
+        }
+        with patch.object(llm_module, "OFFLINE_MODE", False), patch.dict(
+            sys.modules, {"aiohttp": fake_aiohttp}
+        ):
+            content = await client._call_llm(
+                config,
+                "return json",
+                "probe",
+                0.1,
+                128,
+                json_mode=True,
+            )
+
+        self.assertEqual(content, '{"ok": true}')
+        self.assertEqual(captured["url"], "https://api.deepseek.com/chat/completions")
+        self.assertEqual(captured["body"]["model"], "deepseek-v4-flash")
+        self.assertEqual(captured["body"]["response_format"], {"type": "json_object"})
+        self.assertEqual(captured["body"]["thinking"], {"type": "disabled"})
+        self.assertEqual(captured["timeout"], {"total": 30})
+
+    async def test_llm_json_parser_rejects_nullable_or_empty_content(self):
+        from services.llm_client import LLMClient
+
+        client = LLMClient()
+        with self.assertRaisesRegex(ValueError, "empty JSON response"):
+            client._parse_json(None, "deepseek")
 
     async def test_llm_embed_reconstructs_cached_duplicates(self):
         """Cached duplicate inputs keep their original order without I/O."""

@@ -985,24 +985,37 @@ class StateStore:
                 if conn is not None:
                     conn.close()
 
-    def is_motivation_attestation_consumed(self, *, replay_key: str) -> bool:
-        """Read whether an opaque proof key is already consumed.
+    def is_motivation_attestation_consumed(
+        self, *, replay_key: str, attestation_hash: str | None = None
+    ) -> bool:
+        """Read whether an opaque proof key and optional proof hash were consumed.
 
         An operational error is not equivalent to "not consumed" and is
         therefore raised for the caller to handle fail-closed.
         """
 
         key = _motivation_replay_hash(replay_key, name="replay_key")
+        expected_hash = (
+            _motivation_replay_hash(attestation_hash, name="attestation_hash")
+            if attestation_hash is not None
+            else None
+        )
         with self._motivation_replay_lock:
             conn = None
             try:
                 conn = self._motivation_replay_connection()
                 row = conn.execute(
-                    "SELECT 1 FROM motivation_attestation_replay "
+                    "SELECT attestation_hash FROM motivation_attestation_replay "
                     "WHERE replay_key = ? LIMIT 1",
                     (key,),
                 ).fetchone()
-                return row is not None
+                if row is None:
+                    return False
+                if expected_hash is None:
+                    return True
+                return secrets.compare_digest(
+                    str(row["attestation_hash"]), expected_hash
+                )
             except sqlite3.Error as exc:
                 logger.error("motivation replay ledger lookup failed")
                 raise RuntimeError(
