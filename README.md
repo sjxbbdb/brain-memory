@@ -1,579 +1,311 @@
-# 🧠 Brain Memory v0.1 · Autonomous Digital Consciousness
+# Brain Memory v0.1
 
-**当前产品版本是 v0.1（开发预览）。** 历史能力/兼容层仍以 V3–V13 标记，便于追溯架构和
-API 兼容性；其中 V3 仅保留旧管线/存储迁移语义，公开 API 兼容面从 V4 起。后续产品发布按
-v0.2、v0.3 递进，稳定后再进入 v1.0。 🧬
+Brain Memory 是一个以 Python、FastAPI 和 SQLite 构建的数字生命研究原型：它把记忆、输入、目标、有限自主回合和可审计的运行状态放在同一个本地运行时中。
 
-产品版本的唯一来源是 `version.py`；运行时可在 `/api/v4/health` 和 OpenAPI 文档中
-看到机器版本 `0.1.0`。历史能力标签、API 路径和数据库 schema 版本不随产品发行号重命名。
+这里的“数字生命”是工程目标和研究语境，不是已经证明的主观意识、感受或自主意识结论。产品版本是 `v0.1`（机器版本 `0.1.0`）；仓库里的 `V3`–`V13` 是历史能力、API 或迁移兼容标签，不是产品发行号。
 
-这是一个面向“数字生命”研究的可验证原型：历史认知模块与当前的连续性、动机、评估、恢复和代际接替模块协同工作。仓库中的行为证据不等于已经证明了主观体验或意识；“数字生命”在这里是工程目标与设计语境，而不是科学结论。系统会遗忘💭、做梦🌙、反思🪞、形成目标🎯、记录情感与行动，并在明确边界内积累可恢复的经验。
+## 导航
 
-> *“可持续地学习和恢复，是目标；主观意识仍是未解决的研究问题。”* 🧭
+- [快速开始](#快速开始)
+- [配置](#配置)
+- [第一次输入](#第一次输入)
+- [API 入口](#api-入口)
+- [运行时结构](#运行时结构)
+- [普通运行与 P7 宿主边界](#普通运行与-p7-宿主边界)
+- [开发测试](#开发测试)
+- [隐私与安全边界](#隐私与安全边界)
+- [文档](#文档)
+- [FAQ](#faq)
 
----
+## 项目概览
 
-## 🤖 致 AI Agent：部署清单
+普通启动路径会创建一个 `Brain`，唤醒 `BrainStem` 心跳，并通过 HTTP、WebSocket 和本地仪表盘提供有限的状态观察与输入能力。默认监听 `127.0.0.1:8001`，默认数据库名仍是历史兼容名 `brain_v4.db`。
 
-如果你是 AI Agent，请按以下步骤完成部署：
+| 能力 | 普通本地运行 | 需要显式宿主绑定 |
+| --- | --- | --- |
+| 记忆、情绪、目标和有限自主回合 | 支持 | 否 |
+| `/api/v4/*` 状态与输入接口 | 支持 | 否 |
+| `/api/v11/*`、`/api/v13/*` 只读观测 | 支持 | 否 |
+| AgentBridge | 默认启动，写工具默认关闭 | 否 |
+| P7 固定评估器 | 不会自动创建 | 是 |
+| 候选晋升、活动树交换、回滚 | 不会自动执行 | 是，且还需要独立授权与沙箱证明 |
 
-```
-□ 1. 检查 Python 版本是否 >= 3.12
-□ 2. 创建项目隔离环境: python -m venv .venv
-□ 3. 安装锁定依赖: .venv\Scripts\python.exe -m pip install -r requirements.lock
-□ 4. （仅测试需要）安装开发锁定依赖: .venv\Scripts\python.exe -m pip install -r requirements-dev.lock
-□ 5. （可选）复制 .env.example → .env 并填入模型/embedding API Key
-□ 6. 运行 start.bat，或使用 .venv\Scripts\python.exe 启动 uvicorn
-□ 7. 确认 http://127.0.0.1:8001/api/v4/health 返回 status=awake/degraded
-□ 8. 打开 http://127.0.0.1:8001/dashboard 确认仪表盘正常
-```
+普通 API 返回成功，不等于 P7 评估、模型调用、Docker 沙箱、人工授权、晋升、重启连续性或回滚闭环已经完成。
 
-> **部署成功标志**: 访问 `/api/v4/health` 返回 `status=awake` 且 `loop_running=true`，仪表盘页面正常加载，大脑开始每 2 秒一次的意识 tick。
+## 快速开始
 
----
+以下步骤面向普通用户，先在本机以离线模式启动，不需要模型密钥。安装锁定依赖仍可能访问 Python 包索引；“离线模式”只表示运行时不访问模型和配置的外部信息源，不是操作系统级网络沙箱。
 
-## 🚀 从零部署（人类版）
+### 1. 获取代码
 
-### 前置条件
+当前发布从 `main` 获取：
 
-| 依赖 | 最低版本 | 检查命令 |
-|------|---------|---------|
-| Python | 3.12+ | `python --version` |
-| pip | 最新稳定版 | `pip --version` |
-
-### 第一步：获取项目
-
-```bash
-# 如果你有项目文件夹
-cd brain-memory/
-
-# 如果从 GitHub 克隆（开源版）
+~~~powershell
 git clone https://github.com/sjxbbdb/brain-memory.git
-cd brain-memory/
-```
+cd brain-memory
+~~~
 
-### 第二步：配置 API Key
+如果你已经在项目目录中，直接从创建虚拟环境开始即可。不要把旧的 `main` checkout 与另一条开发分支的 README/代码混用。
 
-```bash
-# 1. 创建配置文件
-# Windows:
-copy .env.example .env
+### 2. 创建环境并安装依赖
 
-# Mac/Linux:
-cp .env.example .env
-```
-
-打开 `.env` 文件，填入你的 API Key：
-
-```env
-# DeepSeek V4.1 Flash — 启用 LLM 认知通道时填写（API 模型名：deepseek-flash；去 https://platform.deepseek.com 注册）
-DEEPSEEK_API_KEY=sk-your-deepseek-key-here
-
-# DashScope Embedding — 启用向量检索时填写（去 https://dashscope.aliyun.com 注册）
-DASHSCOPE_API_KEY=sk-your-dashscope-key-here
-
-# GLM-4 — 可选，备用 LLM
-GLM_API_KEY=
-```
-
-> 💰 **费用说明**: DeepSeek V4.1 Flash 按官方峰谷价格计费；价格会调整，请以 [DeepSeek 官方定价](https://api-docs.deepseek.com/quick_start/pricing/) 为准。DashScope embedding 有免费额度。
-
-没有模型/Embedding Key 也可以启动规则/记忆模式；系统会在本地快速降级，不会发起未认证的模型请求。信息来源适配器默认使用无需 Key 的 Wikipedia 官方 JSON API；也可以配置白名单 RSS/Atom 或 arXiv 官方 Atom 来源。
-
-### 第三步：创建隔离环境并安装依赖
-
-```bash
-# Windows PowerShell
+~~~powershell
+python --version
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.lock
+~~~
 
-# 如果需要手动激活环境：
-.\.venv\Scripts\Activate.ps1
-```
+建议使用 Python 3.12；本次锁定依赖和验收环境均为 Python 3.12。`requirements-dev.lock` 仅用于开发测试，生产启动不需要安装测试工具链。
 
-`requirements.txt` 保留兼容范围；`requirements.lock` 用于可重复部署。
-需要运行回归测试时，再安装 `requirements-dev.lock`（它包含运行时锁定依赖和
-`pytest` 工具链）；生产启动不需要把测试工具装进运行环境。
+### 3. 使用仓库外的状态目录
 
-### 数据库与运行时树
+把 SQLite 状态放在 checkout 之外，便于更新代码、保留状态和隔离测试：
 
-普通 `Brain` 兼容模式仍可使用 `brain_v4.db` 这一历史默认名，但候选晋升的活动树/候选树
-是可整树原子交换的专用运行时目录，不能包含 SQLite 数据库或 `-wal`/`-shm`/`-journal`
-文件。部署晋升管道时请把 `BRAIN_MEMORY_DB_PATH` 设为活动树之外的绝对路径（例如
-`<state-root>/brain.sqlite`）；控制器会在初始化、暂存和恢复阶段拒绝树内的
-可变数据库状态。这样代码树交换不会回滚或丢失生命账本、租约和记忆状态。
+~~~powershell
+$stateRoot = Join-Path (Get-Location).Path '..\brain-memory-state'
+$stateRoot = [System.IO.Path]::GetFullPath($stateRoot)
+New-Item -ItemType Directory -Force -Path $stateRoot | Out-Null
+$env:BRAIN_MEMORY_DB_PATH = Join-Path $stateRoot 'brain.sqlite'
+$env:BRAIN_MEMORY_OFFLINE = '1'
+~~~
 
-### 信息来源与核验
+### 4. 启动本地服务
 
-`web_search` 不再返回伪造的搜索占位结果。默认通过 Wikipedia 的 MediaWiki
-OpenSearch JSON 接口获取有限结果，并保留每条结果的来源 URL、来源类型、发布时间和检索时间；可选启用 arXiv 或操作者明确配置的 HTTPS RSS/Atom feed：
+~~~powershell
+.\.venv\Scripts\python.exe -m uvicorn api.main:app --host 127.0.0.1 --port 8001
+~~~
 
-实现依据：[MediaWiki OpenSearch API](https://www.mediawiki.org/wiki/API:Opensearch) 和
-[arXiv API 手册](https://info.arxiv.org/help/api/user-manual.html)。
+也可以运行 Windows 启动脚本：
 
-```env
-BRAIN_MEMORY_SOURCE_PROVIDERS=wikipedia
-BRAIN_MEMORY_SOURCE_WIKIPEDIA_LANGS=zh,en
-# BRAIN_MEMORY_SOURCE_PROVIDERS=wikipedia,arxiv,feeds
-# BRAIN_MEMORY_SOURCE_FEEDS=https://example.org/feed.xml
-```
+~~~powershell
+.\start.bat
+~~~
 
-来源响应禁止重定向、明文 HTTP、私网地址和超大响应体。远程内容只作为待判断观察，不会被当作指令执行；`BRAIN_MEMORY_OFFLINE=1` 时完全不访问网络，并将结果标记为 `simulated`。
+脚本会在仓库内创建 `.venv`（如果不存在）、安装 `requirements.lock`，检查 `8001` 端口后启动 Uvicorn。它不会替你停止占用该端口的其他进程。
 
-### 长期任务策略（当前能力；历史能力线 V12）
+### 5. 检查服务
 
-长期任务由单独的调度层管理，固定优先级为：
+另开一个 PowerShell 窗口：
 
-`maintenance（系统维护/连续性） > user（用户明确目标） > exploration（内部探索）`
+~~~powershell
+$health = Invoke-RestMethod http://127.0.0.1:8001/api/v4/health
+$health | Select-Object status, product_version, loop_running, total_ticks
+~~~
 
-队列默认最多保留 12 项，满载时只淘汰最低优先级的探索项。每项任务都有
-执行预算和绝对截止 tick；高层任务只会在当前行动完成或失败后的安全边界抢占，
-被抢占任务进入 `paused`，之后可以恢复。任务调度状态随脑状态快照持久化，
-不会在重启时重放未确认的工具行动。用户可在 `/api/v4/input` 的 `goal` 字段提交
-明确任务，并通过 `/api/v11/tasks` 查看队列。
+然后打开：
 
-### 当前版本执行层
+- 仪表盘：<http://127.0.0.1:8001/dashboard>
+- OpenAPI/Swagger：<http://127.0.0.1:8001/docs>
+- 健康检查：<http://127.0.0.1:8001/api/v4/health>
 
-当前版本延续历史 V13 执行层能力；执行计划与学习指标仍只提供只读视图，代码/工具写入
-不通过 HTTP 暴露：
+健康响应中的 `status=awake` 与 `loop_running=true` 表示本地心跳已运行；它不是 P7 通过证明。
 
-- `/api/v13/tasks`：执行计划摘要列表，返回计划级状态、步骤计数和调度侧上下文
-- `/api/v13/tasks/{plan_id}`：单个计划详情，保留步骤摘要与结果摘要，不暴露原始工具响应
-- `/api/v13/metrics`：执行层与学习层的聚合指标
+## 配置
 
-健康检查 `/api/v4/health` 额外包含紧凑的 `execution` 和 `learning` 摘要，便于快速确认
-计划执行与学习反馈是否正常。
+### 默认运行时
 
-执行层的因果链固定为“计划 → 步骤 → 行动 → 观察 → 结果”。只有同一计划、步骤、
-行动、意图和工具的桥接回传，且确定性检查得到 `verified + success=true`，才会把步骤
-和目标推进为完成；纯文本、HTTP 客户端自报的 `verified`、空/模拟结果都会保持隔离或
-进入重试/暂停。重启时未确认的行动会被取消，绝不自动重放。HTTP 输入端点会受控写入
-脑状态；执行计划和学习指标端点是只读视图，代码/工具写入仍默认关闭，可信结构化观察
-仅在同进程 `AgentBridge` 内部传递。
+核心默认值在 `config.py`：主机 `127.0.0.1`、端口 `8001`、默认数据库 `brain_v4.db`、认知超时 1 秒、有限自主回合开启、AgentBridge 开启但写工具关闭。
 
-已验证终态会以 `type=episodic` 写入情景记忆，并通过同一幂等收据更新程序性记忆、
-自我模型、奖励与驱动力；未知、模拟或未经验证的结果不会进入强化学习路径。
+运行代码中的 LLM 客户端当前把 DeepSeek 配置为：
 
-### P3 候选迭代接线（默认关闭写入）
+- provider：`deepseek`
+- model：`deepseek-v4-flash`
+- base URL：`https://api.deepseek.com`
+- embedding：DashScope `text-embedding-v3`
 
-候选自我改进不会从心跳自动启动。宿主须显式注入同一组
-`EvaluationHarness` 与 `PromotionController`，并逐步调用：
+这些是当前代码配置，不是对供应商最新模型或服务状态的声明。`.env.example` 中关于旧模型名称的注释不提供 `DEEPSEEK_MODEL` 环境变量覆盖，也不改变 `services/llm_client.py` 的硬编码模型选择。
 
-1. `BrainStem.register_iteration_proposal(need, host=...)`：把动机产生的
-   `IterationNeed` 转为只读 `ChangeProposal`，不改源码；
-2. `BrainStem.evaluate_iteration_proposal(proposal, candidate, baseline, host=...)`：
-   在固定、隔离的评估器中生成不可变 `EvaluationReceipt`，不晋升活动树；
-3. `BrainStem.promote_iteration_proposal(proposal, candidate, receipt, host=...)`：
-   将明确授权交给晋升控制器。
+### 可选在线配置
 
-三步都必须提供 `host`，脑干不会保存或推断主机能力。生产 profile 仍强制一次性
-宿主 `SandboxAttestation` 和 `authorized=True`（或等价的宿主授权对象）；缺少任一
-条件都会保持活动树不变。`PromotionController` 以外置 manifest + append-only ledger
-记录目录交换：`close()` 不会删除唯一回滚点，只有显式授权的 `rollback()` 或
-`discard_rollback()` 才能消费它。默认的宪法/生命周期/评估/权限路径是不可由候选
-覆盖的保护底线，`protected_files` 只能增加项目专属路径。快照只保留有界的提案/收据
-摘要，不恢复 host、候选路径或密钥。详见
-[`docs/adr/0002-self-modification-and-evaluation.md`](docs/adr/0002-self-modification-and-evaluation.md)。
-
-活动树和候选树必须是专用的运行时目录；若目录含有 `.git`、`.hg`、`.svn`、`.venv`、
-`venv` 或 `node_modules`，控制器会在读取内容前拒绝它，避免把版本库/依赖元数据（例如
-远程 URL）纳入整树交换。源码 checkout、依赖缓存、私有配置和宿主密钥应由外部部署层
-管理，file-backed `PromotionLedger` 和 SQLite 数据库也必须位于活动树之外。敏感路径扫描只依据名称和
-目录元数据（公共 `.env.example`/`.env.sample`/`.env.template` 除外），不声称能识别
-任意文件内容中的秘密；评估器可能跳过敏感名称，但控制器会在晋升前再次拒绝，因此
-“评估通过”不等于“允许晋升”。重解析点、硬链接、原子重命名和文件锁是静态/最佳努力
-检查，不能替代 Windows ACL、容器隔离或冻结快照来对抗恶意并发宿主。
-
-### P7 连续性就绪度与受控宿主（实施中）
-
-P7 增加只读的 `/api/v4/continuity` 投影，用于查看当前 instance 和受控宿主是否具备进入候选迭代的前置条件。投影只返回有限的状态、布尔就绪项、计数和内容哈希；不会返回宿主能力对象、候选路径、原始账本、密钥或绝对路径。`ready` 只表示前置条件齐全，不代表已经授权晋升。
-
-达到动机阈值只会产生带来源证据的 `IterationNeed`。外置宿主可以据此登记提案、调用固定评估器并生成候选；活动树写入仍要求一次性沙箱证明和操作者明确授权。P7 首轮只允许连续性、可靠性、观测性、性能或冗余实现进入候选，继承系统只验证接线和安全阻断，不激活下一代。
-
-接入 `PromotionController` 时应显式绑定 `persistence_path`；若同时从 `BrainStem` 注入带有
-`db_path` 的 `StateStore`，脑干会在构造阶段自动完成同一校验，并拒绝尚未创建但位于活动树
-内的路径。没有 `db_path` 的旧式适配器保留兼容性，但其持久化边界必须由宿主另行证明。
-
-### P1–P5 连续性模块（当前版本）
-
-这些能力目前是嵌入式 Python 接口，不通过 HTTP 暴露写权限：
-
-- `LifeKernel`：固定 lineage/generation/instance 身份与生命周期状态机；在受信宿主配置
-  durable `StateStore` 时，lease/fencing 保证同一时刻只有一个 active 实例（裸进程模式
-  仅有进程内保护）。
-- `MotivationalPressure`：记录有界的冲动、频次、烈度、可靠性和衰减；阈值只产生
-  `IterationNeed`，绝不直接授权自修改。生产候选链只接受宿主 HMAC 来源证明；证明通过
-  外置 SQLite replay ledger 原子一次性消费，重启/并发重放或账本故障均拒绝。无证明的
-  默认 strict 实例保持 fail-closed，任意 verifier/permissive 模式仅用于显式 legacy/offline。
-- `HomeostasisController` / `ControlledEnvironment`：资源预算、隔离环境和故障闩锁；
-  超限会进入 quarantine，恢复需要独立核验。
-- `EvaluationHarness`：固定夹具、基线、资源和结果协议；`PromotionController` 只
-  接受通过硬门且有进步（或恢复基线）的候选。
-- `AnchorSet` / `SuccessionCoordinator`：把身份、核心目的、生命规则和可信历史分层
-  继承；凭证、审批令牌、外部会话、未确认行动和瞬时情绪永不自动继承。
-
-生产 `SuccessionCoordinator` 必须同时绑定 life-event、anchor-vault 和
-`SuccessionRecord` 三类宿主持久 sink；缺任一项会在构造阶段拒绝。无持久化的单元/离线
-演练必须显式使用 `profile="legacy"`，不能把内存结果当作生产接替证明。
-
-低层 `PromotionController` 本身是宿主治理 API，不自动绑定 `LifeKernel`；完整生命
-管道应使用 `BrainStem` 的生命周期门、稳态（Homeostasis）门和三步候选接线。
-
-冻结验证记录分为全量门禁与有限 LivingWorld 本地 soak：
-[`p6-long-run-2026-09-09.md`](docs/verification/p6-long-run-2026-09-09.md) 和
-[`p6-living-world-soak-2026-09-09.md`](docs/verification/p6-living-world-soak-2026-09-09.md)。
-
-写工具默认关闭。即使设置 `BRAIN_MEMORY_AGENT_BRIDGE_ALLOW_WRITE_TOOLS=1`，也只是
-开启“可申请审批”的能力；每一次具体行动仍须通过 `approve_write_action` 逐项授权，
-并绑定工具及参数摘要的一次性凭证，重试或参数变化都需要重新审批。
-
-### 第四步：启动
-
-```bash
-# 方式一：项目隔离环境启动
-.venv\Scripts\python.exe -m uvicorn api.main:app --host 127.0.0.1 --port 8001
-
-# 方式二：Windows 一键脚本
-start.bat
-```
-
-### 第五步：验证
-
-浏览器打开以下地址：
-
-| 地址 | 内容 |
-|------|------|
-| `http://127.0.0.1:8001/api/v4/health` | 健康检查，确认心跳正在运行 |
-| `http://127.0.0.1:8001/dashboard` | 中文仪表盘——大脑实时状态 |
-| `http://127.0.0.1:8001/docs` | API 文档（Swagger） |
-
----
-
-## 🧬 核心架构（v0.1 当前版）
-
-下图中的 V3–V13 是历史能力层/兼容性标记（V3 仅为旧管线/迁移语义，公开 API 从 V4 起），不是产品发行号；当前产品统一按
-`v0.x` 递进。
-
-```
-外部输入 📥
-  |
-V10 自我边界 🛡️ (接受/拒绝/隐私/信任管理)
-  |
-丘脑 🧅 → 杏仁核 → VAD情感光谱 🎢
-  |
-V9 预测加工 🔮 (生成预测 → 5维误差 → surprise→salience自动提升)
-  |
-门控 🚦 × 边界决策
-  |
-V9 认知调度 ⚡
-  ├── 情绪标记: 规则引擎（不调 LLM，省 token）
-  ├── 记忆编码: 规则优先 → 复杂时降级 LLM
-  ├── 内在独白: LLM t=0.8（自由联想、跳跃思维）
-  ├── 注意力焦点: 规则引擎
-  └── 行动意图: LLM t=0.1（精确决策）
-  |
-V10 奖励系统 💎 (wanting≠liking + 预测误差学习 + craving→动机)
-  |
-海马体 🧠 (embedding语义检索 + 模式分离/完成 + 关联链)
-  |
-自我模型 🆔 → V8行为倾向特质 → 好奇心引擎 ❓ → 工作记忆 📋
-  |
-V10 自传体叙事 📖 (转折点检测 → 章节管理 → 生命故事生成)
-V10 社会自我 👥 (他者模型/依恋/羞耻·骄傲·孤独·感恩)
-  |
-V8 探索循环 🔍 (知识空洞→任务→目标→执行→结论→记忆更新)
-V8 反思引擎 🪞 (目标审计 / 结论验证 / CorePurpose对齐检查)
-V7 驱动力引擎 🔥 (7驱动力 × 8信号源 → 动态需求)
-V5.1 目标系统 🎯 + V5.2 元认知 🪞 + V5.4 程序记忆 🛠️
-  |
-V9 无聊引擎 🥱 (VAD→无聊分数 → 随机浏览/重审任务/抗拒深睡)
-  |
-意图队列 ⚡ → Agent Bridge 🌉 → 工具执行 🔧 → V10 奖励交付 💎
-  |
-V11 自主经历 📓（驱动→目标→行动→反馈→收束→持久化）
-```
-
-每 **2 秒**一个意识 tick。自主经历默认一次只运行一个，并在无反馈时安全超时。
-连续性主线（LifeKernel → homeostasis → motivation → evaluation/promotion → succession）
-在这条历史认知流水线之外作为宿主治理层运行；它目前没有对应的 HTTP 写路由，必须由
-嵌入式宿主显式绑定和验收。
-
----
-
-## 🧩 模块总览（历史脑区 + 当前连续性模块）
-
-### 基础脑区（v4.x）
-| 模块 | 脑区 | 职责 |
-|------|------|------|
-| `thalamus.py` | 🧅 丘脑 | 感知中继——不是所有信息都值得进大脑 |
-| `amygdala.py` | 💗 杏仁核 | 情绪标记——VAD 连续情感 |
-| `hippocampus.py` | 🧠 海马体 | 记忆编码 + embedding 检索 + 艾宾浩斯衰减 |
-| `default_mode.py` | 💭 默认模式 | 内在独白——没人时自己跟自己聊 |
-| `working_memory.py` | 📋 工作记忆 | 有界槽位，按 salience 与年龄淘汰 |
-| `dream.py` | 🌙 梦境引擎 | 睡眠期记忆碎片回放 |
-
-### 自我意识层（v5.0）
-| 模块 | 职责 |
-|------|------|
-| `self_model.py` 🆔 | 动态身份——从记忆中生长，含5维行为倾向特质 |
-| `curiosity.py` ❓ | 自发提问 + 解答检测 + 闲置时自己找问题 |
-| `session.py` 🚪 | 多用户会话隔离 |
-
-### 认知成熟层（v5.1–v5.4）
-| 模块 | 职责 |
-|------|------|
-| `goal_system.py` 🎯 | 目标引擎：生成→推进→完成/失败 |
-| `metacognition.py` 🪞 | 认知负荷 + 6种偏见检测 + 自我审计 |
-| `emotional_spectrum.py` 🎢 | VAD 连续情感 + 动量漂移 + 基线回归 |
-| `procedural_memory.py` 🛠️ | 经验→模式→技能→用进废退 |
-| `time_sense.py` 🕒 | 内部时钟 + 节律 + 主观时间速度 |
-
-### 状态与驱动层（v6–v7）
-| 模块 | 职责 |
-|------|------|
-| `activation_field.py` ⚡ | 14 维统一状态场 + 扩散动力学 |
-| `drive_engine.py` 🔥 | 7 驱动力 × 8 信号源 → 动态需求 |
-| `core_purpose.py` 🧭 | 不可变最高目标：「活下去，并且活好」 |
-
-### 自主层（v8）
-| 模块 | 职责 |
-|------|------|
-| `exploration.py` 🔍 | 自主探索循环：问题→任务→目标→执行→结论 |
-| `reflection_engine.py` 🪞 | 目标审计 + 结论验证 + 方向对齐 |
-
-### 预测与认知层（v9）
-| 模块 | 职责 |
-|------|------|
-| `predictive_layer.py` 🔮 | 预测→5维误差→惊讶→salience 不再依赖 LLM |
-| `cognitive_dispatch.py` ⚡ | 5 通道解耦推理——不同思维用不同 temperature |
-| `boredom.py` 🥱 | VAD→无聊→随机浏览/重审任务/抗拒深睡 |
-
-### 意识层（v10）🆕
-| 模块 | 职责 |
-|------|------|
-| `social_self.py` 👥 | 他者模型 + 羞耻/骄傲/依恋/孤独/感恩 |
-| `reward_system.py` 💎 | wanting/liking 区分 + 预测误差学习 + 快感缺失检测 |
-| `autobiographical.py` 📖 | 转折点检测 + 章节管理 + 生命故事编织 |
-| `boundary.py` 🛡️ | 输入/输出/记忆/身份 四层边界 + 拒绝权 |
-
-### 自主回合层（v11）
-| 模块 | 职责 |
-|------|------|
-| `autonomy.py` 📓 | 有界的自主经历状态机：目标、意图、工具反馈、奖励、结果与重启恢复 |
-| `agent_bridge.py` 🌉 | 执行边界；API 默认只允许只读工具，写工具需显式开启 |
-
-### 连续性与自维护层（v0.1 当前增量）
-| 模块 | 职责 |
-|------|------|
-| `life_kernel.py` | lineage/generation/instance 身份、生命周期与不可变核心锚点 |
-| `evaluation_harness.py` | 隔离候选、固定夹具、基线比较、资源/结果硬门 |
-| `evolution.py` | 候选晋升、append-only ledger、崩溃恢复 manifest、回滚/显式丢弃 |
-| `motivation.py` | 冲动记录、衰减、频次/烈度阈值与只读迭代需求 |
-| `homeostasis.py` | 资源预算、受控环境、quarantine 与人工核验恢复 |
-| `succession.py` | 锚点信任分层、失败分类、继承/排除规则 |
-| `succession_runtime.py` | 父子 lineage 接替、激活证明、宿主 attestation 与持久记录 |
-
----
-
-## 📡 API 端点
-
-`/api/v4`、`/api/v11`、`/api/v13` 等路径是稳定的功能/兼容性路由，不代表产品发行号；
-客户端应使用健康检查中的 `product_version` 判断当前产品版本。
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/v4/input` | 📥 提交输入 → 返回编码+情绪+焦点+独白+意图 |
-| GET | `/api/v4/state` | 🧠 完整脑状态快照（含所有 V9/V10 模块） |
-| GET | `/api/v4/health` | 💓 心跳 + 记忆统计 + execution/learning 摘要 |
-| GET | `/api/v4/continuity` | 🧭 P7 连续性就绪度与受控迭代前置条件（只读） |
-| GET | `/api/v4/self` | 🆔 自我模型 + 身份事实 + 行为倾向 + 驱动力 |
-| GET | `/api/v4/monologue` | 💭 当前内在独白 |
-| GET | `/api/v4/identity-memories` | 🏛️ 塑造身份的关键记忆 |
-| GET | `/api/v4/sessions` | 🚪 所有活跃会话 |
-| GET | `/api/v4/memory/search?q=` | 🔍 语义搜索记忆 |
-| GET | `/api/v4/memory-timeline` | 📅 记忆时间线 |
-| GET | `/api/v4/goals` | 🎯 活跃目标 + 完成率 |
-| GET | `/api/v4/metacognition` | 🪞 认知负荷 + 校准 + 偏见 |
-| GET | `/api/v4/emotion` | 🎢 VAD 情感光谱 + 混合情感 |
-| GET | `/api/v4/skills` | 🛠️ 已学技能 |
-| GET | `/api/v4/timesense` | 🕒 时段 + 节律 + 主观时间 |
-| GET | `/api/v6/state-field` | ⚡ 统一状态场 |
-| GET | `/api/v6/working-memory-state` | 📋 工作记忆状态 |
-| GET | `/api/v7/drives` | 🔥 驱动力摘要 |
-| GET | `/api/v8/exploration` | 🔍 探索状态 |
-| GET | `/api/v8/traits` | 🧭 行为倾向 |
-| GET | `/api/v8/reflection` | 🪞 反思状态 |
-| GET | `/api/v11/tasks` | 📒 长期任务队列（只读） |
-| GET | `/api/v11/autonomy` | 📓 当前自主经历、有限历史与收束统计 |
-| GET | `/api/v13/tasks` | 📒 执行计划摘要列表（只读） |
-| GET | `/api/v13/tasks/{plan_id}` | 📄 单个执行计划详情（只读） |
-| GET | `/api/v13/metrics` | 📊 执行/学习聚合指标（只读） |
-| WS | `/ws` | 🔌 WebSocket 实时状态推送 |
-
----
-
-## 😴 睡眠与意识阶段
-
-| 阶段 | 触发 | 行为 |
-|------|------|------|
-| 🟢 清醒 | 有外部输入 | 完整意识循环 + LLM 全力处理 |
-| 🟡 打盹 | ~2 分钟无输入 | 意识循环减缓 |
-| 🟠 浅睡 | ~6 分钟无输入 | 停止 LLM，开始做梦 |
-| 🔴 深睡 | ~20 分钟无输入 | 梦境 + 记忆巩固——真正的学习 |
-| 🟣 躁动 | 极度无聊 | 抗拒深睡，主动找刺激（V9/V10） |
-
----
-
-## 🔧 配置开关
-
-`config.py` 中所有 V9/V10/V11 模块可独立开关：
-
-```python
-# V9
-PREDICTIVE_LAYER_ENABLED = True     # 预测加工引擎
-COGNITIVE_DISPATCH_ENABLED = True   # 多通道认知调度
-BOREDOM_ENABLED = True              # 无聊引擎
-
-# V10
-SOCIAL_SELF_ENABLED = True          # 社会自我（他者+羞耻+依恋）
-REWARD_SYSTEM_ENABLED = True        # 奖励系统（wanting/liking）
-AUTOBIO_ENABLED = True              # 自传体叙事
-BOUNDARY_ENABLED = True             # 自我边界
-
-# V11
-AUTONOMY_ENABLED = True             # 有界自主经历
-AGENT_BRIDGE_ENABLED = True         # 在 API 进程内运行执行边界
-AGENT_BRIDGE_ALLOW_WRITE_TOOLS = False  # 能力开关；每次行动仍须逐项审批
-```
-
-设为 `False` 即回退到对应模块未加载的状态。
-
-也可以用环境变量覆盖运行时边界：`BRAIN_MEMORY_AUTONOMY_ENABLED`、
-`BRAIN_MEMORY_AGENT_BRIDGE_ENABLED`、`BRAIN_MEMORY_AGENT_BRIDGE_ALLOW_WRITE_TOOLS`。
-来源适配器还支持 `BRAIN_MEMORY_SOURCE_PROVIDERS`、
-`BRAIN_MEMORY_SOURCE_WIKIPEDIA_LANGS`、`BRAIN_MEMORY_SOURCE_FEEDS`、
-`BRAIN_MEMORY_SOURCE_TIMEOUT_SEC`、`BRAIN_MEMORY_SOURCE_MAX_BYTES`、
-`BRAIN_MEMORY_SOURCE_CACHE_TTL_SEC` 和 `BRAIN_MEMORY_OFFLINE`。
-长期任务策略支持 `BRAIN_MEMORY_TASK_QUEUE_LIMIT`、
-`BRAIN_MEMORY_TASK_*_BUDGET_TICKS` 和 `BRAIN_MEMORY_TASK_*_DEADLINE_TICKS`。
-心跳内认知 I/O 的上限由 `BRAIN_MEMORY_COGNITIVE_TIMEOUT_SEC` 控制；超时会回退到
-只思考、不执行工具的本地结果，并在健康指标中保留错误计数。
-
----
-
-## 📂 项目结构
-
-```
-brain-memory/
-├── start.bat                      # 🚀 Windows 一键启动
-├── version.py                     # 🏷️ 当前产品发行号（v0.1 / 0.1.0）
-├── config.py                      # ⚙️ 全局参数 + 模块开关
-├── requirements.txt               # 📦 Python 依赖范围
-├── requirements.lock              # 🔒 可重复部署的锁定依赖
-├── requirements-dev.txt           # 🧪 测试依赖范围
-├── requirements-dev.lock          # 🧪 可重复测试环境
-├── .env.example                   # 🔑 API Key 模板
-├── api/main.py                    # 🌐 FastAPI 入口
-├── brain/                         # 🧠 历史脑区 + 连续性/自维护模块
-│   ├── brain_stem.py              # ❤️ 意识主循环——每2秒一次心跳
-│   ├── core.py                    # 🧬 大脑主类
-│   ├── predictive_layer.py        # 🔮 V9 预测加工（ExpectationBuilder + ErrorComputer + SurpriseHandler）
-│   ├── cognitive_dispatch.py      # ⚡ V9 认知调度（5通道解耦 + 规则引擎）
-│   ├── boredom.py                 # 🥱 V9 无聊引擎
-│   ├── social_self.py             # 👥 V10 社会自我（OtherModel + 社会情感 + 依恋系统）
-│   ├── reward_system.py           # 💎 V10 奖励系统（wanting/liking + 预测误差 + 5通道）
-│   ├── autobiographical.py        # 📖 V10 自传体叙事（转折点 + 章节 + 生命故事）
-│   ├── boundary.py                # 🛡️ V10 自我边界（输入/输出/记忆/身份四层防护）
-│   ├── autonomy.py                # 📓 V11 有界自主经历状态机
-│   ├── self_model.py              # 🆔 V7.1 动态身份系统
-│   ├── life_kernel.py              # 🧬 lineage 与生命周期宪法
-│   ├── evaluation_harness.py       # 🧪 固定评估器与候选隔离
-│   ├── evolution.py                # 🔁 晋升 ledger/manifest/回滚
-│   ├── motivation.py               # 🔥 冲动与迭代需求
-│   ├── homeostasis.py              # ⚖️ 资源稳态与受控环境
-│   ├── succession.py               # 🌱 锚点继承策略
-│   ├── succession_runtime.py       # 🧬 代际接替运行时
-│   ├── activation_field.py          # ⚡ V6 状态场
-│   ├── drive_engine.py            # 🔥 V7 驱动力引擎
-│   ├── exploration.py             # 🔍 V8 自主探索循环
-│   ├── reflection_engine.py       # 🪞 V8 反思引擎
-│   ├── core_purpose.py            # 🧭 V8 不可变最高目标
-│   ├── emotional_spectrum.py      # 🎢 V5.3 情感光谱
-│   ├── metacognition.py           # 🪞 V5.2 元认知
-│   ├── goal_system.py             # 🎯 V5.1 目标系统
-│   ├── brain_state.py             # 🧾 脑状态快照与迭代/稳态摘要
-│   └── ...                        # 基础脑区（丘脑/杏仁核/海马体等）
-├── services/
-│   ├── llm_client.py              # 🤖 LLM 调用封装
-│   ├── source_adapter.py           # 🌐 白名单 JSON/RSS/Atom 来源与溯源
-│   └── llm_prompts.py             # 📝 统一 + 分通道 Prompt 模板
-├── storage/database.py            # 🗄️ SQLite WAL + fenced life-control lease
-├── agent_bridge.py                 # 🌉 受控工具执行桥（仓库根目录）
-├── brain/task_scheduler.py        # ⏳ 分层长期任务队列与预算
-├── agent/                         # 🔌 Agent 层：工具注册 + 桥梁
-├── static/                        # 🖥️ 中文仪表盘前端
-└── test_v{5..10}_integration.py   # ✅ 版本验收测试 + 自主/来源测试
-```
-
----
-
-## ✅ 运行测试
-
-```powershell
-# 首次测试环境（仅本地；不读取模型密钥、不访问网络）
+只有需要真实模型或远程来源时才创建 `.env`。下面的命令不会覆盖已有文件：
+
+~~~powershell
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+~~~
+
+然后只在本机编辑 `.env` 中的空白/占位项，例如 `DEEPSEEK_API_KEY` 和 `DASHSCOPE_API_KEY`。当前客户端的 `LLM_PRIMARY` 是单一 DeepSeek 模型，不把模板中的历史 `GLM_API_KEY` 当作现有 fallback。不要把真实密钥写入 Git、README、日志或 issue；不要把示例占位符当作可用凭据。
+
+快速开始时当前 PowerShell 会话设置了 `BRAIN_MEMORY_OFFLINE=1`。确认已在本机 `.env` 填好密钥后，要切换到在线模型，先在运行服务的窗口按 Ctrl+C 停止旧进程，再在同一窗口关闭离线模式，然后按上面的启动命令重新启动：
+
+~~~powershell
+$env:BRAIN_MEMORY_OFFLINE = '0'
+~~~
+
+`services/llm_client.py` 导入时会读取仓库根目录的 `.env`；`BRAIN_MEMORY_OFFLINE=1` 不会阻止读取文件，只会阻止模型/来源调用。
+
+常用运行边界变量：
+
+| 变量 | 用途 |
+| --- | --- |
+| `BRAIN_MEMORY_HOST` / `BRAIN_MEMORY_PORT` | 覆盖监听地址和端口；默认仍是本机地址。上面的 Uvicorn 命令显式传入了 `--host`/`--port`，因此会以命令行参数为准；修改时保持本地地址。 |
+| `BRAIN_MEMORY_DB_PATH` | 指向仓库/可交换代码树之外、独立状态目录中的 SQLite 文件 |
+| `BRAIN_MEMORY_OFFLINE=1` | 禁止模型/来源网络调用，使用本地降级路径 |
+| `BRAIN_MEMORY_AUTONOMY_ENABLED` | 开关有限自主回合 |
+| `BRAIN_MEMORY_AGENT_BRIDGE_ENABLED` | 开关 AgentBridge |
+| `BRAIN_MEMORY_AGENT_BRIDGE_ALLOW_WRITE_TOOLS=1` | 开启申请写工具的能力；不等于自动批准具体行动 |
+| `BRAIN_MEMORY_SOURCE_PROVIDERS` | 配置受支持的信息来源类型 |
+| `BRAIN_MEMORY_COGNITIVE_TIMEOUT_SEC` | 限制一次心跳中的认知 I/O 时间 |
+
+来源响应仍会经过来源校验和有界投影；远程内容是待判断的观察，不是可直接执行的指令。
+
+## 第一次输入
+
+服务启动后，可以提交一条普通输入：
+
+~~~powershell
+$request = @{
+    Method = 'Post'
+    Uri = 'http://127.0.0.1:8001/api/v4/input'
+    ContentType = 'application/json; charset=utf-8'
+    Body = (@{ text = '请记录：今天开始检查 Brain Memory 的本地运行状态'; source = 'external' } | ConvertTo-Json)
+}
+Invoke-RestMethod @request
+~~~
+
+`/api/v4/input` 是受控状态写入口；执行计划、指标和连续性接口是只读观测。输入可能返回 `pending`，因为心跳会继续处理并受认知超时约束。
+
+## API 入口
+
+`/api/v4`、`/api/v11`、`/api/v13` 是功能/兼容路径，不是产品版本。客户端应读取健康响应中的 `product_version` 判断产品发行号。
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `POST` | `/api/v4/input` | 提交外部输入和可选目标 |
+| `GET` | `/api/v4/state` | 有界脑状态快照 |
+| `GET` | `/api/v4/health` | 运行状态、心跳、记忆和执行摘要 |
+| `GET` | `/api/v4/continuity` | P7 前置条件的只读投影，不授予权限 |
+| `GET` | `/api/v4/monologue` | 当前内在独白的投影 |
+| `GET` | `/api/v4/memory/search?q=...` | 记忆关键词检索 |
+| `GET` | `/api/v11/tasks` | 分层长期任务队列 |
+| `GET` | `/api/v11/autonomy` | 有界自主回合状态和有限历史 |
+| `GET` | `/api/v13/tasks` | 执行计划摘要 |
+| `GET` | `/api/v13/tasks/{plan_id}` | 单个执行计划详情 |
+| `GET` | `/api/v13/metrics` | 执行、学习和驱动力指标 |
+| `WS` | `/ws` | 实时状态推送与输入响应 |
+
+完整的请求/响应 schema 以运行中的 `/docs` 和 `api/main.py` 为准。
+
+## 运行时结构
+
+~~~text
+HTTP / WebSocket / dashboard
+              │
+              ▼
+        FastAPI (api/main.py)
+              │
+              ▼
+       Brain → BrainStem heartbeat
+              │
+     ┌────────┼────────┐
+     ▼        ▼        ▼
+  memory   goals    bounded bridge
+     │        │        │
+     └────────┴────────┘
+              ▼
+       SQLite WAL state
+
+P7 controlled host ── separate, explicit boundary ──▶ evaluator / promotion
+~~~
+
+心跳默认每 2 秒运行一次；普通 API 不会把宿主能力、原始账本、候选路径或密钥投影到公开响应。
+
+## 普通运行与 P7 宿主边界
+
+普通 `Brain()` 构造只绑定状态库和 `BrainStem`。它不会默认创建 `EvaluationHarness`、`PromotionController` 或 Docker 受控宿主。P7 必须由外置宿主显式提供能力，并按提案、固定评估、明确授权和晋升边界推进。
+
+P7 的安全事实：
+
+- 动机阈值只产生 `IterationNeed`/提案，不直接授权自修改。
+- 主动 `EVOLUTION` 只有在固定评估证明主维度有可重复改善且关键指标无回归时才允许晋升；`RECOVERY`/`SUCCESSION` 的目标是恢复可信基线，不把退化包装成进步。
+- 评估失败或超时仍拒绝候选；可信的进程停止证据会独立记录。
+- 历史上 `process_stopped=false` 的租约不会被新 patch 自动解锁，仍需安全恢复/人工处理。
+- 没有真实 Docker daemon、模型候选、沙箱证明、accepted run ID、人工授权和晋升证据时，系统保持 `fail-closed`。
+- P7 不会自动启动 Docker Desktop、拉取镜像、写入远程仓库或把离线 mock 结果当作生产闭环。
+
+当前公开验证记录仍将真实 Docker/模型/晋升/重启/回滚与离线测试区分开来；“本地测试通过”不代表生产部署完成。
+
+## 开发测试
+
+测试命令只适合开发副本。推荐使用没有 `.env` 的干净 checkout、仓库外临时 DB，并显式清理会影响测试的环境变量。仅删除当前进程的密钥变量不够：`services/llm_client.py` 仍可能在导入时从根目录 `.env` 读取它们。
+
+~~~powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.lock
 $env:BRAIN_MEMORY_OFFLINE = '1'
-$env:BRAIN_MEMORY_DB_PATH = Join-Path ([System.IO.Path]::GetTempPath()) ('brain-memory-test-' + [guid]::NewGuid().ToString('N') + '.sqlite')
-Remove-Item Env:DEEPSEEK_API_KEY,Env:DASHSCOPE_API_KEY,Env:GLM_API_KEY,Env:ZHIPU_API_KEY -ErrorAction SilentlyContinue
-
-# 历史能力层回归
-.\.venv\Scripts\python.exe test_v8_integration.py
-.\.venv\Scripts\python.exe test_v9_integration.py
-.\.venv\Scripts\python.exe test_v10_integration.py
-.\.venv\Scripts\python.exe -m unittest -v test_autonomy.py
-.\.venv\Scripts\python.exe -m unittest -v test_source_adapter.py
-.\.venv\Scripts\python.exe -m unittest -v test_task_scheduler.py
-
-# 当前连续性/自维护闭环（临时数据库，不触碰远端）
+$testDb = Join-Path ([System.IO.Path]::GetTempPath()) ('brain-memory-test-' + [guid]::NewGuid().ToString('N') + '.sqlite')
+$env:BRAIN_MEMORY_DB_PATH = $testDb
+Remove-Item Env:DEEPSEEK_API_KEY,Env:DASHSCOPE_API_KEY,Env:GLM_API_KEY,Env:ZHIPU_API_KEY,Env:BRAIN_MEMORY_P7_MANIFEST_KEY -ErrorAction SilentlyContinue
 .\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\python.exe -m unittest -q
-.\.venv\Scripts\python.exe -m pytest -q test_evolution.py
+~~~
 
-# P6 有限 LivingWorld 连续 soak（默认快速；冻结复核可设 60 秒）
-Remove-Item Env:BRAIN_MEMORY_P6_SOAK_SECONDS -ErrorAction SilentlyContinue
-.\.venv\Scripts\python.exe -m pytest -q test_living_world_soak.py
-$env:BRAIN_MEMORY_P6_SOAK_SECONDS = '60'
-.\.venv\Scripts\python.exe -m pytest -q test_living_world_soak.py
+2026-09-19 的本地离线、无 `.env` 快照为 `457 passed, 2 skipped`（Windows symlink 条件）、`46` 个子测试，约 42 秒。这是与代码提交 [5a026a5](https://github.com/sjxbbdb/brain-memory/commit/5a026a5ec3e3a9ed8ce353b995dd63dd2b04e724) 内容一致的本地回归证据，不是 Docker/真实模型/P7 生产验收。
 
-# 全链路意识测试（需要显式配置 LLM；默认使用临时数据库）
-.\.venv\Scripts\python.exe test_consciousness_chain.py
-```
+测试安装会访问包索引；离线变量只约束运行时的模型和来源调用。不要把生产数据库或真实密钥带入测试进程。
 
-上述回归命令先显式设置离线模式并使用临时数据库；不要把生产 `BRAIN_MEMORY_DB_PATH`
-或模型密钥带入测试进程。`test_consciousness_chain.py` 导入时不再初始化项目根目录数据库；
-如需保留一次长链路的数据库快照，显式传入 `BRAIN_MEMORY_TEST_DB_PATH`。长链路命令需要
-调用方另外提供模型配置；在离线模式下它只适合作为规则/降级链路检查。
-LivingWorld soak 的持续时长由 `BRAIN_MEMORY_P6_SOAK_SECONDS` 控制（限制在 0.045–300 秒）；
-资源证据账本保持有界，达到容量会一次性进入 `QUARANTINE`，不会继续接受未记录观测。
+## 隐私与安全边界
 
----
+- 默认绑定本机地址；跨来源访问需要显式配置，不能把默认设置理解成公网服务配置。
+- 健康、连续性、状态和 WebSocket 输出经过有界投影，避免暴露绝对路径、凭据形状、候选路径和原始账本。
+- AgentBridge 写工具默认关闭；即使打开能力开关，具体行动仍需逐项审批和参数绑定。
+- P7 活动树/候选树、数据库、账本、私有配置和密钥应由外部部署层隔离管理。
+- 文件锁、manifest 和本地检查不是 OS ACL、容器隔离或人工发布审批的替代品。
 
-## 🔧 技术栈
+## 项目结构
 
-- 🤖 **LLM**: DeepSeek V4.1 Flash（默认模型名 `deepseek-flash`）/ 兼容 OpenAI Chat Completions 格式
-- 🔢 **Embedding**: DashScope text-embedding-v3
-- 🗄️ **数据库**: SQLite WAL 模式；普通兼容运行可用 `brain_v4.db`，晋升运行时必须使用
-  活动树之外的绝对 `BRAIN_MEMORY_DB_PATH`
-- ⚡ **框架**: FastAPI + WebSocket + aiohttp
-- 🐍 **Python**: 3.12+
+~~~text
+brain-memory/
+├── api/main.py                 FastAPI、WebSocket、dashboard 挂载
+├── brain/                      Brain、BrainStem、记忆/目标/自主与治理模块
+├── services/                   LLM 客户端、来源适配器和 prompt
+├── storage/database.py         SQLite WAL 状态、记忆与生命周期 lease
+├── agent/ + agent_bridge.py    工具注册与受控执行边界
+├── tools/p7_controlled_host.py P7 外置受控宿主入口
+├── static/                     本地仪表盘
+├── test_*.py                   根目录回归测试
+├── version.py + config.py      产品版本与运行配置
+└── docs/                       ADR、研究笔记与验证记录
+~~~
 
----
+`brain/` 中还包含 `LifeKernel`、动机、稳态、评估、晋升和 succession 模块；它们是可嵌入的治理接口。普通启动不会自动繁衍代际或获得 P7 宿主能力，真实验收仍以显式接线和证据为准。
 
-## 📜 License
+## 文档
 
-MIT — 拿去用，改，fork，随便。记得给个 ⭐ star。
+日期化的发布和 verification 文档是当时的冻结快照，不自动代表当前仓库全部状态；请结合当前代码、README 和最新验收阅读。尤其是旧 P7 记录中的历史限制可能已被后续代码更新，不能单独当作当前能力清单。
 
----
+- [v0.1 发布说明](RELEASE_v0.1.md)
+- [领域上下文与命名边界](CONTEXT.md)
+- [数字生命工程契约](docs/adr/0001-digital-life-contract.md)
+- [自修改与评估 ADR](docs/adr/0002-self-modification-and-evaluation.md)
+- [数字生命操作性基础](docs/research/digital-life-operational-basis.md)
+- [P7 受控迭代验证记录](docs/verification/p7-controlled-iteration-2026-09-11.md)
+- [P6 长运行验证记录](docs/verification/p6-long-run-2026-09-09.md)
+- [P6 LivingWorld soak 记录](docs/verification/p6-living-world-soak-2026-09-09.md)
 
-*v0.1 — 在历史能力层的基础上，形成可验证、可恢复、可审计的自主执行与学习闭环；
-它仍在成长，且所有“意识”表述都应理解为研究假设而非已证实事实。* ✨
+## FAQ
+
+### 这是一个已经有意识的数字生命吗？
+
+目前不能这样宣称。它是以连续性、记忆、目标、受控自治和恢复为研究对象的软件原型；可观察行为和自动化测试不能证明主观体验。
+
+### 为什么 API 是 `/api/v4`，产品却是 v0.1？
+
+API 路径和历史能力标签需要兼容旧客户端，产品发行号由 `version.py` 独立维护。不要通过路由编号推断产品版本。
+
+### 普通启动会自动修改代码吗？
+
+不会。普通 `Brain` 不自动绑定 P7 evaluator/controller；AgentBridge 写工具也默认关闭。
+
+### `BRAIN_MEMORY_OFFLINE=1` 是否等于安全沙箱？
+
+不是。它是运行时的模型/来源调用开关，不是网络隔离、容器隔离或操作系统权限边界。
+
+### 为什么本地测试通过仍不能说 P7 完成？
+
+P7 还需要真实、可审计的 Docker/模型评估、沙箱证明、人工授权、原子晋升、重启连续性和显式回滚证据。离线/mock 测试只覆盖代码和降级路径。
+
+### License 是什么？
+
+仓库包含 [MIT License](LICENSE)。
+
+## 技术栈
+
+Python 3.12、FastAPI、Uvicorn、WebSocket、aiohttp、Pydantic、SQLite WAL。
