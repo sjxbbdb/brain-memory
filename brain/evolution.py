@@ -2516,6 +2516,7 @@ class PromotionController:
         "docs/verification",
         "fixtures",
         "tests",
+        "test_memory_store.py",
         # Test/dependency discovery controls are evaluator-owned even when a
         # project does not currently contain them.  Protecting an absent path
         # prevents a candidate from introducing its own collection policy or

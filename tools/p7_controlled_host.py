@@ -6548,9 +6548,58 @@ if __name__ == '__main__':
     ) -> Any:
         """Evaluate only while the formal Docker nonce has a durable lease."""
 
-        nonce = _safe_text(execution_request.get("nonce"), 128).lower()
+        # Canonicalize once before arming or calling the evaluator.  The
+        # round-trip creates a deep, immutable-in-practice JSON snapshot so a
+        # caller cannot change the request after the nonce lease is armed.
+        try:
+            request_text = _canonical(dict(execution_request))
+            request_snapshot = json.loads(request_text)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("evaluation request is not canonical JSON") from exc
+        if not isinstance(request_snapshot, dict):
+            raise RuntimeError("evaluation request is not an object")
+        request_digest = _digest(_canonical(request_snapshot))
+
+        harness = getattr(runtime, "harness", None)
+        expected_candidate_fingerprint = _safe_text(
+            getattr(candidate, "fingerprint", None), 128
+        ).lower()
+        expected_baseline_fingerprint = _safe_text(
+            getattr(baseline, "fingerprint", None), 128
+        ).lower()
+        expected_harness_version = _safe_text(
+            getattr(harness, "harness_version", None), 80
+        )
+        expected_fixture_hash = _safe_text(
+            getattr(harness, "fixture_hash", None), 128
+        ).lower()
+        expected_evaluator_hash = _safe_text(
+            getattr(harness, "evaluator_hash", None), 128
+        ).lower()
+        expected_binding = {
+            "candidate_fingerprint": expected_candidate_fingerprint,
+            "baseline_fingerprint": expected_baseline_fingerprint,
+            "fixture_hash": expected_fixture_hash,
+            "evaluator_hash": expected_evaluator_hash,
+        }
+        if (
+            not expected_harness_version
+            or any(
+                not re.fullmatch(r"[0-9a-f]{64}", value)
+                for value in expected_binding.values()
+            )
+        ):
+            raise RuntimeError("evaluation lease binding is incomplete")
+        request_binding = {
+            key: _safe_text(request_snapshot.get(key), 128).lower()
+            for key in expected_binding
+        }
+        if request_binding != expected_binding:
+            raise RuntimeError("evaluation request binding changed")
+
+        nonce = _safe_text(request_snapshot.get("nonce"), 128).lower()
         expected_endpoint = _safe_text(
-            execution_request.get("endpoint_digest"), 128
+            request_snapshot.get("endpoint_digest"), 128
         ).lower()
         if (
             not re.fullmatch(r"[0-9a-f]{32,128}", nonce)
@@ -6574,13 +6623,19 @@ if __name__ == '__main__':
             run_id=runtime.layout.run_id,
         )
         completed = False
+        process_stopped = False
+        primary_error: BaseException | None = None
         try:
+            # Give the stem its own deep copy.  Verification below always
+            # uses the untouched startup snapshot, even if a faulty seam
+            # mutates the mapping it receives.
+            stem_request = json.loads(request_text)
             receipt = runtime.stem.evaluate_iteration_proposal(
                 proposal,
                 candidate,
                 baseline,
                 host=HostBinding(False),
-                execution_request=execution_request,
+                execution_request=stem_request,
             )
             # The external lease is a security boundary, so do not trust a
             # duck-typed/mocked result from the stem.  The concrete immutable
@@ -6595,53 +6650,108 @@ if __name__ == '__main__':
                 raise RuntimeError("evaluation receipt verification failed")
             if receipt.isolated is not True:
                 raise RuntimeError("evaluation receipt is not isolated")
-            metadata = dict(getattr(receipt, "metadata", {}) or {})
-            startup_boundary = any(
-                getattr(gate, "name", "") == "startup"
-                and isinstance(getattr(gate, "evidence", None), Mapping)
-                and gate.evidence.get("boundary_closed") is True
-                and getattr(gate, "passed", False)
-                for gate in (getattr(receipt, "gates", ()) or ())
+            metadata = dict(receipt.metadata or {})
+            startup_gates = [
+                gate
+                for gate in (receipt.gates or ())
+                if getattr(gate, "name", "") == "startup"
+            ]
+            startup_evidence = (
+                startup_gates[0].evidence
+                if len(startup_gates) == 1
+                and isinstance(getattr(startup_gates[0], "evidence", None), Mapping)
+                else {}
+            )
+            raw_exit_code = startup_evidence.get("exit_code")
+            raw_timed_out = startup_evidence.get("timed_out")
+            startup_gate_passed = bool(
+                len(startup_gates) == 1 and getattr(startup_gates[0], "passed", False)
+            )
+            receipt_binding = {
+                "candidate_fingerprint": receipt.candidate_fingerprint.lower(),
+                "baseline_fingerprint": (receipt.baseline_fingerprint or "").lower(),
+                "fixture_hash": receipt.fixture_hash.lower(),
+                "evaluator_hash": receipt.evaluator_hash.lower(),
+                "harness_version": receipt.harness_version,
+            }
+            expected_receipt_binding = dict(expected_binding)
+            expected_receipt_binding["harness_version"] = expected_harness_version
+            process_stopped = bool(
+                len(startup_gates) == 1
+                and startup_evidence.get("boundary_closed") is True
+                and type(raw_exit_code) is int
+                and type(receipt.exit_code) is int
+                and raw_exit_code == receipt.exit_code
+                and type(raw_timed_out) is bool
+                and raw_timed_out is receipt.timed_out
+                and _safe_text(
+                    startup_evidence.get("execution_request_digest"), 128
+                ).lower()
+                == request_digest
+                and receipt_binding == expected_receipt_binding
             )
             # Preserve an explicit evaluator/wrapper failure.  Failed wrapper
             # JSON is intentionally not an execution proof and commonly has
             # no metadata; validate the proof only for an otherwise successful
             # receipt so the original bounded error is not misreported as a
             # protocol drift.
-            receipt_error = _safe_text(getattr(receipt, "error", ""), 240)
+            receipt_error = _safe_text(receipt.error, 240)
             if (
-                getattr(receipt, "exit_code", None) != 0
-                or bool(getattr(receipt, "timed_out", False))
-                or getattr(receipt, "result_verified", False) is not True
+                receipt.exit_code != 0
+                or receipt.timed_out is not False
+                or receipt.result_verified is not True
                 or receipt_error
-                or not startup_boundary
+                or not startup_gate_passed
+                or not process_stopped
             ):
                 raise RuntimeError(
                     "evaluation failed: "
                     + _diagnostic_summary(
                         "exit_code=%s timed_out=%s result_verified=%s startup_boundary=%s error=%s"
                         % (
-                            getattr(receipt, "exit_code", None),
-                            bool(getattr(receipt, "timed_out", False)),
-                            getattr(receipt, "result_verified", False),
-                            startup_boundary,
+                            receipt.exit_code,
+                            receipt.timed_out,
+                            receipt.result_verified,
+                            process_stopped,
                             receipt_error,
                         )
                     )
                 )
-            self._validate_execution_metadata(metadata, execution_request)
-            # The trusted wrapper emits its bound cleanup proof only at the end
-            # of a normally reaped outer process.  A timeout or absent exit code
-            # is not enough to mark the creator stopped.
-            if not lease_store.mark_cleanup_pending(
+            self._validate_execution_metadata(metadata, request_snapshot)
+            # A successful lease seal still requires the trusted wrapper proof;
+            # timeout receipts remain rejected above even when the host can
+            # independently prove that the bounded process boundary closed.
+            marked = lease_store.mark_cleanup_pending(
                 lease, process_stopped=True
-            ) or not lease_store.complete(lease):
+            )
+            if marked is not True or not lease_store.complete(lease):
                 raise RuntimeError("evaluation cleanup lease is unverified")
             completed = True
             return receipt
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
             if not completed:
-                lease_store.mark_cleanup_pending(lease, process_stopped=False)
+                try:
+                    marked = lease_store.mark_cleanup_pending(
+                        lease, process_stopped=process_stopped
+                    )
+                    if marked is not True:
+                        raise RuntimeError("evaluation cleanup lease is unverified")
+                except BaseException as cleanup_error:
+                    if primary_error is not None:
+                        try:
+                            primary_error.add_note(
+                                "cleanup registration failed: "
+                                + _diagnostic_summary(str(cleanup_error))
+                            )
+                        except BaseException:
+                            pass
+                    else:
+                        raise RuntimeError(
+                            "evaluation cleanup lease registration failed"
+                        ) from cleanup_error
 
     @staticmethod
     def _receipt_core(receipt: Any) -> dict[str, Any]:

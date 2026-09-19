@@ -3367,9 +3367,23 @@ class MemoryStore:
             1 if memory.get("llm_encoded") else 0,
             1 if memory.get("is_identity_forming") else 0,
         )
-        sql = """INSERT OR REPLACE INTO memories (id, type, title, content, entities, emotion_tags,
+        sql = """INSERT INTO memories (id, type, title, content, entities, emotion_tags,
             importance, embedding, summary, source, emotion_label, emotion_vector, created, llm_encoded, is_identity_forming)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                type = excluded.type,
+                title = excluded.title,
+                content = excluded.content,
+                entities = excluded.entities,
+                emotion_tags = excluded.emotion_tags,
+                importance = excluded.importance,
+                embedding = excluded.embedding,
+                summary = excluded.summary,
+                source = excluded.source,
+                emotion_label = excluded.emotion_label,
+                emotion_vector = excluded.emotion_vector,
+                llm_encoded = excluded.llm_encoded,
+                is_identity_forming = excluded.is_identity_forming"""
         try:
             self.conn.execute(sql, vals)
             self.conn.commit()

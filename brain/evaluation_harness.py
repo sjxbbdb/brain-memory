@@ -2298,6 +2298,7 @@ class EvaluationHarness:
         sandbox_boundary_ok = False
         parsed_result: dict[str, Any] | None = None
         baseline_unchanged = True
+        execution_request_digest: str | None = None
 
         try:
             if trusted_baseline is not None:
@@ -2359,6 +2360,14 @@ class EvaluationHarness:
                     harness_version=self._harness_version,
                     execution_request=execution_request,
                 )
+                # Hash the exact bounded serialization that crosses the
+                # process boundary.  This is computed before starting the
+                # child and never sourced from candidate output or mutable
+                # caller state after execution.
+                if execution_request is not None:
+                    execution_request_digest = hashlib.sha256(
+                        env["P7_EXECUTION_REQUEST"].encode("utf-8")
+                    ).hexdigest()
                 (
                     exit_code,
                     timed_out,
@@ -2485,7 +2494,14 @@ class EvaluationHarness:
         if duration_sec > self._budget.timeout_sec:
             resources_ok = False
 
-        gates.append(GateResult(HardGate.STARTUP.value, startup_ok, "process exited successfully" if startup_ok else (error or "startup failed"), {"exit_code": exit_code, "timed_out": timed_out, "boundary_closed": boundary_closed}))
+        startup_evidence = {
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "boundary_closed": boundary_closed,
+        }
+        if execution_request_digest is not None:
+            startup_evidence["execution_request_digest"] = execution_request_digest
+        gates.append(GateResult(HardGate.STARTUP.value, startup_ok, "process exited successfully" if startup_ok else (error or "startup failed"), startup_evidence))
         integrity_ok = fixture_ok and fixture_source_ok and candidate_source_ok and evaluator_ok and baseline_observed_ok
         gates.append(GateResult(HardGate.INTEGRITY.value, integrity_ok, "fixture, baseline, candidate source, and evaluator hashes unchanged" if integrity_ok else "fixture/baseline/candidate/evaluator mutation or drift detected", {"fixture_copy_unchanged": fixture_ok, "fixture_source_unchanged": fixture_source_ok, "candidate_source_unchanged": candidate_source_ok, "baseline_fingerprint_matches": baseline_observed_ok, "evaluator_unchanged": evaluator_ok}))
         gates.append(GateResult(HardGate.RESOURCE_BUDGET.value, resources_ok, "within declared resource budget" if resources_ok else "resource budget exceeded", {"duration_sec": round(duration_sec, 6), "stdout_bytes": stdout_bytes, "stderr_bytes": stderr_bytes}))

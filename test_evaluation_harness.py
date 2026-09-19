@@ -162,6 +162,78 @@ class EvaluationHarnessTests(unittest.TestCase):
                     execution_request={"payload": "x" * (9 * 1024)},
                 )
 
+    def test_startup_gate_records_the_bounded_execution_request_digest(self):
+        """The host must bind stop evidence to the exact request text sent to the child."""
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            baseline = self._baseline(root)
+            candidate = self._candidate(root, "unused")
+            fixtures = root / "judge-fixtures"
+            fixtures.mkdir()
+            (fixtures / "judge.py").write_text(
+                "import json, os\n"
+                "print(json.dumps({'status':'pass','verified':True,"
+                "'metrics':{'quality':0.75,'safety':1.0},"
+                "'metadata':{'execution_request_digest':'" + "0" * 64 + "'}}))\n",
+                encoding="utf-8",
+            )
+            request = {"schema_version": 1, "protocol": "p7-docker-v1", "nonce": "a" * 32}
+            harness = EvaluationHarness(
+                fixtures=fixtures,
+                command=self._command(),
+                primary_dimension="quality",
+            )
+            import brain.evaluation_harness as harness_module
+            original_run = harness_module._run_bounded_process
+
+            def mutate_request_after_environment(*args, **kwargs):
+                self.assertIn("P7_EXECUTION_REQUEST", kwargs["env"])
+                request["nonce"] = "z" * 32
+                return original_run(*args, **kwargs)
+
+            with mock.patch.object(
+                harness_module,
+                "_run_bounded_process",
+                side_effect=mutate_request_after_environment,
+            ):
+                receipt = harness.evaluate(
+                    candidate, baseline, execution_request=request
+                )
+            startup = next(gate for gate in receipt.gates if gate.name == "startup")
+            request["nonce"] = "a" * 32
+            expected = hashlib.sha256(
+                json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            self.assertEqual(startup.evidence["execution_request_digest"], expected)
+            self.assertEqual(receipt.metadata["execution_request_digest"], "0" * 64)
+
+    def test_failed_fixture_process_still_attests_a_closed_bound_request_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            baseline = self._baseline(root)
+            candidate = self._candidate(root, "unused")
+            fixtures = root / "judge-fixtures"
+            fixtures.mkdir()
+            (fixtures / "judge.py").write_text(
+                "import sys\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            request = {"schema_version": 1, "protocol": "p7-docker-v1", "nonce": "b" * 32}
+            receipt = EvaluationHarness(
+                fixtures=fixtures,
+                command=self._command(),
+                primary_dimension="quality",
+            ).evaluate(candidate, baseline, execution_request=request)
+            startup = next(gate for gate in receipt.gates if gate.name == "startup")
+            self.assertFalse(receipt.accepted)
+            self.assertEqual(startup.evidence["exit_code"], 1)
+            self.assertIs(startup.evidence["boundary_closed"], True)
+            self.assertIs(startup.evidence["timed_out"], False)
+            self.assertIn("execution_request_digest", startup.evidence)
+
     def test_receipt_schema_is_versioned(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

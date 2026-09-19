@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import inspect
 import os
+from dataclasses import replace
 from pathlib import Path
 import py_compile
 import subprocess
@@ -18,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -118,19 +120,40 @@ class P7ControlledHostContractTests(unittest.TestCase):
         )
 
     @staticmethod
-    def _host_evaluation_receipt(*, isolated: bool = True):
+    def _host_evaluation_receipt(
+        *, isolated: bool = True, execution_request=None, exit_code: int | None = 0,
+        timed_out: bool = False, startup_timed_out=None,
+        boundary_closed: bool = True, startup_passed: bool = True,
+        result_verified: bool = True, error: str = "", metadata=None,
+        candidate_fingerprint: str = "c" * 64,
+        baseline_fingerprint: str = "b" * 64,
+        fixture_hash: str = "f" * 64,
+        evaluator_hash: str = "e" * 64,
+    ):
         from brain.evaluation_harness import EvaluationReceipt, GateResult
+
+        startup_evidence = {
+            "boundary_closed": boundary_closed,
+            "exit_code": exit_code,
+            "timed_out": timed_out if startup_timed_out is None else startup_timed_out,
+        }
+        if execution_request is not None:
+            from tools.p7_controlled_host import _digest, _canonical
+
+            startup_evidence["execution_request_digest"] = _digest(
+                _canonical(execution_request)
+            )
 
         return EvaluationReceipt(
             receipt_id="receipt-formal-test",
             harness_version="test",
-            fixture_hash="f" * 64,
-            evaluator_hash="e" * 64,
+            fixture_hash=fixture_hash,
+            evaluator_hash=evaluator_hash,
             mode="evolution",
             candidate_revision_id="candidate",
-            candidate_fingerprint="c" * 64,
+            candidate_fingerprint=candidate_fingerprint,
             baseline_revision_id="baseline",
-            baseline_fingerprint="b" * 64,
+            baseline_fingerprint=baseline_fingerprint,
             baseline_metrics={"quality": 1.0},
             candidate_metrics={"quality": 2.0},
             primary_dimension="quality",
@@ -138,8 +161,8 @@ class P7ControlledHostContractTests(unittest.TestCase):
             gates=(
                 GateResult(
                     name="startup",
-                    passed=True,
-                    evidence={"boundary_closed": True},
+                    passed=startup_passed,
+                    evidence=startup_evidence,
                 ),
             ),
             accepted=True,
@@ -150,16 +173,67 @@ class P7ControlledHostContractTests(unittest.TestCase):
             started_at="2026-09-12T00:00:00+00:00",
             finished_at="2026-09-12T00:00:01+00:00",
             duration_sec=1.0,
-            exit_code=0,
-            timed_out=False,
+            exit_code=exit_code,
+            timed_out=timed_out,
             stdout_bytes=0,
             stderr_bytes=0,
-            result_verified=True,
-            metadata={
+            result_verified=result_verified,
+            error=error,
+            metadata=metadata if metadata is not None else {
                 "inspect_verified": True,
                 "cleanup_verified": True,
             },
         )
+
+    @staticmethod
+    def _formal_request(host_module, endpoint: str, *, nonce: str) -> dict:
+        return {
+            "nonce": nonce,
+            "endpoint_digest": host_module._digest(endpoint),
+            "candidate_target_sha256": "a" * 64,
+            "executor_config_sha256": "b" * 64,
+            "wrapper_sha256": "c" * 64,
+            "judge_sha256": "d" * 64,
+            "candidate_fingerprint": "c" * 64,
+            "baseline_fingerprint": "b" * 64,
+            "fixture_hash": "f" * 64,
+            "evaluator_hash": "e" * 64,
+            "sandbox_contract_digest": "1" * 64,
+            "container_config_digest": "2" * 64,
+            "image_id_digest": "3" * 64,
+            "resource_budget": {},
+        }
+
+    @staticmethod
+    def _formal_harness():
+        return SimpleNamespace(
+            harness_version="test",
+            fixture_hash="f" * 64,
+            evaluator_hash="e" * 64,
+        )
+
+    @staticmethod
+    def _formal_execution_metadata(host_module, request: dict) -> dict:
+        metadata = {
+            "schema_version": host_module.HOST_SCHEMA_VERSION,
+            "protocol": host_module._SANDBOX_PROTOCOL,
+            "nonce": request["nonce"],
+            "request_digest": host_module._digest(host_module._canonical(request)),
+            "input_integrity_verified": True,
+            "candidate_target_sha256_before": request["candidate_target_sha256"],
+            "candidate_target_sha256_after": request["candidate_target_sha256"],
+            "judge_sha256_before": request["judge_sha256"],
+            "judge_sha256_after": request["judge_sha256"],
+            "inspect_verified": True,
+            "cleanup_verified": True,
+        }
+        for key in (
+            "wrapper_sha256", "judge_sha256", "executor_config_sha256",
+            "container_config_digest", "image_id_digest", "endpoint_digest",
+            "sandbox_contract_digest",
+        ):
+            metadata[key] = request[key]
+        return metadata
 
     def test_generated_judge_bounds_child_output(self):
         source = (
@@ -2226,19 +2300,25 @@ class P7ControlledHostContractTests(unittest.TestCase):
 
         endpoint = "npipe://local"
         nonce = "a" * 32
-        endpoint_digest = host_module._digest(endpoint)
         events = []
-        receipt = self._host_evaluation_receipt()
+        request = self._formal_request(host_module, endpoint, nonce=nonce)
+        request["nested"] = {"proof": {"value": 7}}
+        receipt = self._host_evaluation_receipt(
+            execution_request=request,
+            metadata=self._formal_execution_metadata(host_module, request),
+        )
         stem = mock.Mock()
 
         def evaluate(*args, **kwargs):
             events.append("evaluate")
+            kwargs["execution_request"]["nested"]["proof"]["value"] = 99
             return receipt
 
         stem.evaluate_iteration_proposal.side_effect = evaluate
         runtime = mock.Mock()
         runtime.layout.fixtures = Path("fixture-root")
         runtime.layout.run_id = "run-1"
+        runtime.harness = self._formal_harness()
         runtime.stem = stem
         lease = object()
         lease_store = mock.Mock()
@@ -2263,22 +2343,18 @@ class P7ControlledHostContractTests(unittest.TestCase):
             run_root=Path.cwd(),
             manifest_key="k" * 32,
         )
-        request = {
-            "nonce": nonce,
-            "endpoint_digest": endpoint_digest,
-        }
         with mock.patch.object(
             host_module,
             "_executor_config_from_fixtures",
             return_value=("python@sha256:" + "b" * 64, "default", sys.executable),
         ), mock.patch.object(
             host_module, "_local_docker_context_endpoint", return_value=endpoint
-        ), mock.patch.object(host, "_validate_execution_metadata"):
+        ):
             result = host._evaluate_iteration_with_lease(
                 runtime,
                 object(),
-                object(),
-                object(),
+                mock.Mock(fingerprint="c" * 64),
+                mock.Mock(fingerprint="b" * 64),
                 execution_request=request,
                 lease_store=lease_store,
             )
@@ -2287,6 +2363,7 @@ class P7ControlledHostContractTests(unittest.TestCase):
         self.assertEqual([item if isinstance(item, str) else item[0] for item in events], ["arm", "evaluate", "mark", "complete"])
         self.assertEqual(events[0][1]["nonce"], nonce)
         self.assertIs(events[2][1]["process_stopped"], True)
+        self.assertEqual(request["nested"]["proof"]["value"], 7)
         lease_store.complete.assert_called_once_with(lease)
 
     def test_formal_iteration_evaluation_failure_leaves_a_nonstopped_lease(self):
@@ -2296,17 +2373,18 @@ class P7ControlledHostContractTests(unittest.TestCase):
         nonce = "b" * 32
         lease_store = mock.Mock()
         lease_store.arm.return_value = object()
-        lease_store.mark_cleanup_pending.return_value = True
+        lease_store.mark_cleanup_pending.side_effect = RuntimeError("cleanup db down")
         runtime = mock.Mock()
         runtime.layout.fixtures = Path("fixture-root")
         runtime.layout.run_id = "run-2"
+        runtime.harness = self._formal_harness()
         runtime.stem.evaluate_iteration_proposal.side_effect = RuntimeError("child failed")
         host = host_module.P7ControlledHost(
             repo_root=Path.cwd(),
             run_root=Path.cwd(),
             manifest_key="k" * 32,
         )
-        request = {"nonce": nonce, "endpoint_digest": host_module._digest(endpoint)}
+        request = self._formal_request(host_module, endpoint, nonce=nonce)
         with mock.patch.object(
             host_module,
             "_executor_config_from_fixtures",
@@ -2314,22 +2392,217 @@ class P7ControlledHostContractTests(unittest.TestCase):
         ), mock.patch.object(
             host_module, "_local_docker_context_endpoint", return_value=endpoint
         ), mock.patch.object(host, "_validate_execution_metadata"):
-            with self.assertRaisesRegex(RuntimeError, "child failed"):
+            with self.assertRaisesRegex(RuntimeError, "child failed") as raised:
                 host._evaluate_iteration_with_lease(
                     runtime,
                     object(),
-                    object(),
-                    object(),
+                    mock.Mock(fingerprint="c" * 64),
+                    mock.Mock(fingerprint="b" * 64),
                     execution_request=request,
                     lease_store=lease_store,
                 )
 
         lease_store.mark_cleanup_pending.assert_called_once()
+        self.assertIn(
+            "cleanup registration failed",
+            raised.exception.__notes__[0],
+        )
         self.assertIs(
             lease_store.mark_cleanup_pending.call_args.kwargs["process_stopped"],
             False,
         )
         lease_store.complete.assert_not_called()
+
+    def test_real_execution_metadata_binding_mismatch_never_completes(self):
+        import tools.p7_controlled_host as host_module
+
+        endpoint = "npipe://local"
+        request = self._formal_request(host_module, endpoint, nonce="3" * 32)
+        metadata = self._formal_execution_metadata(host_module, request)
+        metadata["wrapper_sha256"] = "9" * 64
+        receipt = self._host_evaluation_receipt(
+            execution_request=request, metadata=metadata
+        )
+        lease_store = mock.Mock()
+        lease_store.arm.return_value = object()
+        lease_store.mark_cleanup_pending.return_value = True
+        runtime = mock.Mock()
+        runtime.layout.fixtures = Path("fixture-root")
+        runtime.layout.run_id = "run-proof-mismatch"
+        runtime.harness = self._formal_harness()
+        runtime.stem.evaluate_iteration_proposal.return_value = receipt
+        host = host_module.P7ControlledHost(
+            repo_root=Path.cwd(), run_root=Path.cwd(), manifest_key="k" * 32
+        )
+        with mock.patch.object(
+            host_module,
+            "_executor_config_from_fixtures",
+            return_value=("python@sha256:" + "e" * 64, "default", sys.executable),
+        ), mock.patch.object(
+            host_module, "_local_docker_context_endpoint", return_value=endpoint
+        ):
+            with self.assertRaisesRegex(RuntimeError, "fixture binding changed"):
+                host._evaluate_iteration_with_lease(
+                    runtime, object(), mock.Mock(fingerprint="c" * 64),
+                    mock.Mock(fingerprint="b" * 64), execution_request=request,
+                    lease_store=lease_store,
+                )
+        lease_store.mark_cleanup_pending.assert_called_once_with(
+            mock.ANY, process_stopped=True
+        )
+        lease_store.complete.assert_not_called()
+
+    def test_failed_evaluation_with_closed_boundary_marks_stopped_but_never_completes(self):
+        import tools.p7_controlled_host as host_module
+
+        endpoint = "npipe://local"
+        nonce = "d" * 32
+        request = self._formal_request(host_module, endpoint, nonce=nonce)
+        receipt = self._host_evaluation_receipt(
+            execution_request=request,
+            exit_code=1,
+            startup_passed=False,
+            result_verified=False,
+            metadata={},
+            error="fixture reported failure",
+        )
+        lease_store = mock.Mock()
+        lease_store.arm.return_value = object()
+        lease_store.mark_cleanup_pending.return_value = True
+        runtime = mock.Mock()
+        runtime.layout.fixtures = Path("fixture-root")
+        runtime.layout.run_id = "run-failed-boundary"
+        runtime.harness = self._formal_harness()
+        runtime.stem.evaluate_iteration_proposal.return_value = receipt
+        host = host_module.P7ControlledHost(
+            repo_root=Path.cwd(),
+            run_root=Path.cwd(),
+            manifest_key="k" * 32,
+        )
+        with mock.patch.object(
+            host_module,
+            "_executor_config_from_fixtures",
+            return_value=("python@sha256:" + "e" * 64, "default", sys.executable),
+        ), mock.patch.object(
+            host_module, "_local_docker_context_endpoint", return_value=endpoint
+        ), mock.patch.object(host, "_validate_execution_metadata"):
+            with self.assertRaisesRegex(RuntimeError, "evaluation failed"):
+                host._evaluate_iteration_with_lease(
+                    runtime,
+                    object(),
+                    mock.Mock(fingerprint="c" * 64),
+                    mock.Mock(fingerprint="b" * 64),
+                    execution_request=request,
+                    lease_store=lease_store,
+                )
+        lease_store.mark_cleanup_pending.assert_called_once_with(
+            mock.ANY, process_stopped=True
+        )
+        lease_store.complete.assert_not_called()
+
+    def test_timeout_closed_boundary_marks_stopped_but_still_rejects_evaluation(self):
+        import tools.p7_controlled_host as host_module
+
+        endpoint = "npipe://local"
+        request = self._formal_request(host_module, endpoint, nonce="e" * 32)
+        receipt = self._host_evaluation_receipt(
+            execution_request=request, exit_code=-9, timed_out=True,
+            startup_passed=False, result_verified=False, metadata={},
+        )
+        lease_store = mock.Mock()
+        lease_store.arm.return_value = object()
+        lease_store.mark_cleanup_pending.return_value = True
+        runtime = mock.Mock()
+        runtime.layout.fixtures = Path("fixture-root")
+        runtime.layout.run_id = "run-timeout"
+        runtime.harness = self._formal_harness()
+        runtime.stem.evaluate_iteration_proposal.return_value = receipt
+        host = host_module.P7ControlledHost(
+            repo_root=Path.cwd(), run_root=Path.cwd(), manifest_key="k" * 32
+        )
+        with mock.patch.object(
+            host_module,
+            "_executor_config_from_fixtures",
+            return_value=("python@sha256:" + "e" * 64, "default", sys.executable),
+        ), mock.patch.object(
+            host_module, "_local_docker_context_endpoint", return_value=endpoint
+        ), mock.patch.object(host, "_validate_execution_metadata"):
+            with self.assertRaisesRegex(RuntimeError, "evaluation failed"):
+                host._evaluate_iteration_with_lease(
+                    runtime, object(), mock.Mock(fingerprint="c" * 64),
+                    mock.Mock(fingerprint="b" * 64), execution_request=request,
+                    lease_store=lease_store,
+                )
+        lease_store.mark_cleanup_pending.assert_called_once_with(
+            mock.ANY, process_stopped=True
+        )
+        lease_store.complete.assert_not_called()
+
+    def test_stop_proof_rejects_unclosed_or_non_boolean_timeout_evidence(self):
+        import tools.p7_controlled_host as host_module
+
+        endpoint = "npipe://local"
+        host = host_module.P7ControlledHost(
+            repo_root=Path.cwd(), run_root=Path.cwd(), manifest_key="k" * 32
+        )
+        for case, receipt_kwargs in (
+            ("missing-digest", {"error": "failed"}),
+            ("stale-digest", {"execution_request_digest": "0" * 64, "error": "failed"}),
+            ("duplicate-startup", {"duplicate_startup": True, "error": "failed"}),
+            ("candidate-binding", {"candidate_fingerprint": "9" * 64, "error": "failed"}),
+            ("fixture-binding", {"fixture_hash": "9" * 64, "error": "failed"}),
+            ("bool-exit-code", {"exit_code": True, "error": "failed"}),
+            ("none-exit-code", {"exit_code": None, "error": "failed"}),
+            ("unclosed", {"boundary_closed": False, "error": "failed"}),
+            ("timeout-unclosed", {"timed_out": True, "boundary_closed": False, "exit_code": -9, "error": "failed"}),
+            ("raw-timeout-type", {"exit_code": 1, "startup_timed_out": 1, "error": "failed"}),
+            ("timeout-mismatch", {"timed_out": True, "startup_timed_out": False, "exit_code": 1, "error": "failed"}),
+        ):
+            with self.subTest(case=case):
+                nonce = ("f" * 32) if case == "unclosed" else ("1" * 32 if case == "raw-timeout-type" else "2" * 32)
+                request = self._formal_request(host_module, endpoint, nonce=nonce)
+                receipt = self._host_evaluation_receipt(
+                    execution_request=request,
+                    startup_passed=False,
+                    result_verified=False,
+                    metadata={},
+                    **{key: value for key, value in receipt_kwargs.items()
+                       if key not in {"execution_request_digest", "duplicate_startup"}},
+                )
+                startup = receipt.gates[0]
+                evidence = dict(startup.evidence)
+                if "execution_request_digest" in receipt_kwargs:
+                    evidence["execution_request_digest"] = receipt_kwargs["execution_request_digest"]
+                elif case == "missing-digest":
+                    evidence.pop("execution_request_digest", None)
+                receipt = replace(receipt, gates=(replace(startup, evidence=evidence),) + receipt.gates[1:])
+                if receipt_kwargs.get("duplicate_startup"):
+                    receipt = replace(receipt, gates=receipt.gates + (receipt.gates[0],))
+                lease_store = mock.Mock()
+                lease_store.arm.return_value = object()
+                lease_store.mark_cleanup_pending.return_value = True
+                runtime = mock.Mock()
+                runtime.layout.fixtures = Path("fixture-root")
+                runtime.layout.run_id = "run-" + case
+                runtime.harness = self._formal_harness()
+                runtime.stem.evaluate_iteration_proposal.return_value = receipt
+                with mock.patch.object(
+                    host_module,
+                    "_executor_config_from_fixtures",
+                    return_value=("python@sha256:" + "e" * 64, "default", sys.executable),
+                ), mock.patch.object(
+                    host_module, "_local_docker_context_endpoint", return_value=endpoint
+                ), mock.patch.object(host, "_validate_execution_metadata"):
+                    with self.assertRaisesRegex(RuntimeError, "evaluation failed"):
+                        host._evaluate_iteration_with_lease(
+                            runtime, object(), mock.Mock(fingerprint="c" * 64),
+                            mock.Mock(fingerprint="b" * 64), execution_request=request,
+                            lease_store=lease_store,
+                        )
+                lease_store.mark_cleanup_pending.assert_called_once_with(
+                    mock.ANY, process_stopped=False
+                )
+                lease_store.complete.assert_not_called()
 
     def test_formal_iteration_requires_verified_isolated_receipt(self):
         import tools.p7_controlled_host as host_module
@@ -2338,6 +2611,10 @@ class P7ControlledHostContractTests(unittest.TestCase):
         request = {
             "nonce": "c" * 32,
             "endpoint_digest": host_module._digest(endpoint),
+            "candidate_fingerprint": "c" * 64,
+            "baseline_fingerprint": "b" * 64,
+            "fixture_hash": "f" * 64,
+            "evaluator_hash": "e" * 64,
         }
         invalid_hash = self._host_evaluation_receipt()
         object.__setattr__(invalid_hash, "receipt_hash", "0" * 64)
@@ -2366,13 +2643,14 @@ class P7ControlledHostContractTests(unittest.TestCase):
                     runtime = mock.Mock()
                     runtime.layout.fixtures = Path("fixture-root")
                     runtime.layout.run_id = "run-3"
+                    runtime.harness = self._formal_harness()
                     runtime.stem.evaluate_iteration_proposal.return_value = receipt
                     with self.assertRaisesRegex(RuntimeError, reason):
                         host._evaluate_iteration_with_lease(
                             runtime,
                             object(),
-                            object(),
-                            object(),
+                            mock.Mock(fingerprint="c" * 64),
+                            mock.Mock(fingerprint="b" * 64),
                             execution_request=request,
                             lease_store=lease_store,
                         )
