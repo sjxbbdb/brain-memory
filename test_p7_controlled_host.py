@@ -950,6 +950,10 @@ class P7ControlledHostContractTests(unittest.TestCase):
             need_id="need-stable",
         )
         first_binding = P7ControlledHost._need_payload(first)
+        summary = P7ControlledHost()._need_summary(first)
+        self.assertEqual(summary["need_id"], "need-stable")
+        self.assertEqual(summary["evidence_count"], 1)
+        self.assertEqual(summary["source_count"], 1)
         restored = IterationNeed.from_dict(
             {**P7ControlledHost._need_payload(first), "requires_evaluation": True}
         )
@@ -1897,6 +1901,49 @@ class P7ControlledHostContractTests(unittest.TestCase):
                 any("rm" in call.args[0] for call in switched_run.call_args_list)
             )
 
+    def test_reaper_readonly_mode_never_inspects_or_removes_nonempty_target(self):
+        import tools.p7_controlled_host as host_module
+
+        nonce = "3" * 32
+        image = "python@sha256:" + "4" * 64
+        with tempfile.TemporaryDirectory(prefix="p7-reaper-readonly-") as temp:
+            docker = self._fixture_docker_cli(Path(temp))
+            name = "brain-memory-p7-eval-" + nonce
+            listed = mock.Mock(
+                returncode=0,
+                stdout=("a" * 64 + "|" + name + "\n").encode("utf-8"),
+            )
+            empty = mock.Mock(returncode=0, stdout=b"")
+            with mock.patch.object(
+                host_module, "_local_docker_context_endpoint", return_value="npipe://local"
+            ), mock.patch.object(
+                host_module, "_run_bounded_command", return_value=self._bounded_result(listed)
+            ) as nonempty_run:
+                self.assertFalse(
+                    host_module._reap_owned_eval_container(
+                        docker, "default", nonce, image,
+                        expected_endpoint_digest=host_module._digest("npipe://local"),
+                        allow_removal=False,
+                    )
+                )
+            self.assertEqual(nonempty_run.call_count, 1)
+            self.assertNotIn("inspect", nonempty_run.call_args.args[0])
+            self.assertNotIn("rm", nonempty_run.call_args.args[0])
+
+            with mock.patch.object(
+                host_module, "_local_docker_context_endpoint", return_value="npipe://local"
+            ), mock.patch.object(
+                host_module, "_run_bounded_command", return_value=self._bounded_result(empty)
+            ) as empty_run:
+                self.assertTrue(
+                    host_module._reap_owned_eval_container(
+                        docker, "default", nonce, image,
+                        expected_endpoint_digest=host_module._digest("npipe://local"),
+                        allow_removal=False,
+                    )
+                )
+            self.assertEqual(empty_run.call_count, 2)
+
     def test_sandbox_replay_timeout_attempts_nonce_scoped_reaper(self):
         import tools.p7_controlled_host as host_module
 
@@ -2003,6 +2050,7 @@ class P7ControlledHostContractTests(unittest.TestCase):
             self.assertEqual(status["reaped_count"], 1)
             reaper.assert_called_once()
             self.assertTrue(lease.path.is_file())
+
             cleaned = json.loads(lease.path.read_text(encoding="utf-8"))
             self.assertEqual(cleaned["state"], "cleaned")
             self.assertNotIn(str(root), json.dumps(status))
@@ -2018,6 +2066,699 @@ class P7ControlledHostContractTests(unittest.TestCase):
             self.assertTrue(second["ready"])
             second_reaper.assert_called_once()
             self.assertTrue(lease.path.is_file())
+
+    def test_orphan_inspect_is_four_state_read_only_aggregate(self):
+        import tools.p7_controlled_host as host_module
+
+        image = "python@sha256:" + "a" * 64
+        endpoint = "npipe://local"
+        with tempfile.TemporaryDirectory(prefix="p7-orphan-inspect-") as temp:
+            root = Path(temp)
+            docker = self._fixture_docker_cli(root)
+            store = host_module.OrphanLeaseStore(root, "i" * 32, persistent=True)
+            base_now = int(time.time())
+
+            seed = store.arm(
+                operation="eval", nonce="1" * 32,
+                name="brain-memory-p7-eval-" + "1" * 32,
+                image=image, context="default", docker_cli=docker,
+                endpoint_digest=host_module._digest(endpoint),
+                now=base_now, ttl_sec=180,
+            )
+            seed_payload = json.loads(seed.path.read_text(encoding="utf-8"))
+            def write_signed(nonce, **changes):
+                payload = dict(seed_payload)
+                payload.update(changes, nonce=nonce, name="brain-memory-p7-eval-" + nonce)
+                payload["mac"] = store._mac({key: value for key, value in payload.items() if key != "mac"})
+                (store.directory / (nonce + ".json")).write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+
+            write_signed("2" * 32, expires_at=base_now + 30)
+            write_signed(
+                "3" * 32, expires_at=base_now + 30,
+                state="cleanup_pending", process_stopped=True,
+            )
+            write_signed(
+                "4" * 32, expires_at=base_now + 30,
+                state="cleaned", process_stopped=True, cleaned_at=base_now + 1,
+            )
+
+            registry = store.directory
+            before_names = sorted(path.name for path in registry.iterdir())
+            before_bytes = {
+                path.name: path.read_bytes()
+                for path in registry.iterdir()
+                if path.is_file()
+            }
+            with mock.patch.object(host_module, "_authorization_file_lock", side_effect=AssertionError("inspect locked")), \
+                mock.patch.object(store, "sweep", side_effect=AssertionError("inspect swept")), \
+                mock.patch.object(host_module, "_reap_owned_eval_container", side_effect=AssertionError("inspect reaped")), \
+                mock.patch.object(store, "_write_transition", side_effect=AssertionError("inspect transitioned")), \
+                mock.patch.object(host_module, "_write_json", side_effect=AssertionError("inspect wrote")):
+                result = store.inspect(now=base_now + 100)
+
+            self.assertEqual(
+                result,
+                {
+                    "inspection_verified": True,
+                    "reason": "",
+                    "record_count": 4,
+                    "live_waiting_count": 1,
+                    "expired_stop_unverified_count": 1,
+                    "stopped_pending_cleanup_count": 1,
+                    "cleaned_retained_count": 1,
+                },
+            )
+            for key in (
+                "record_count", "live_waiting_count", "expired_stop_unverified_count",
+                "stopped_pending_cleanup_count", "cleaned_retained_count",
+            ):
+                self.assertIs(type(result[key]), int)
+            self.assertEqual(before_names, sorted(path.name for path in registry.iterdir()))
+            self.assertEqual(before_bytes, {
+                path.name: path.read_bytes()
+                for path in registry.iterdir()
+                if path.is_file()
+            })
+            self.assertIsInstance(result["live_waiting_count"], int)
+            self.assertIsNot(result["live_waiting_count"], True)
+
+    def test_orphan_inspect_fail_closed_without_creating_registry(self):
+        import tools.p7_controlled_host as host_module
+
+        with tempfile.TemporaryDirectory(prefix="p7-orphan-inspect-empty-") as temp:
+            root = Path(temp)
+            store = host_module.OrphanLeaseStore(root, "j" * 32, persistent=True)
+            self.assertFalse(store.directory.exists())
+            result = store.inspect()
+            self.assertEqual(
+                result,
+                {
+                    "inspection_verified": True,
+                    "reason": "",
+                    "record_count": 0,
+                    "live_waiting_count": 0,
+                    "expired_stop_unverified_count": 0,
+                    "stopped_pending_cleanup_count": 0,
+                    "cleaned_retained_count": 0,
+                },
+            )
+            self.assertFalse(store.directory.exists())
+
+            transient = host_module.OrphanLeaseStore(root, "j" * 32, persistent=False)
+            self.assertEqual(
+                transient.inspect(),
+                {
+                    "inspection_verified": False,
+                    "reason": "orphan_lease_key_unavailable",
+                },
+            )
+            for bad_now in (True, "200", -1):
+                with self.subTest(now=bad_now):
+                    self.assertEqual(
+                        store.inspect(now=bad_now),
+                        {
+                            "inspection_verified": False,
+                            "reason": "orphan_lease_registry_invalid",
+                        },
+                    )
+
+            limited_root = root / "limited"
+            limited_root.mkdir()
+            limited_store = host_module.OrphanLeaseStore(
+                limited_root, "j" * 32, persistent=True
+            )
+            limited_store.directory.mkdir(mode=0o700)
+            for index in range(host_module._ORPHAN_LEASE_MAX_FILES + 2):
+                (limited_store.directory / (f"{index:064x}.json")).write_text(
+                    "{}", encoding="utf-8"
+                )
+            with mock.patch.object(
+                limited_store, "_read_record", side_effect=AssertionError("read past bound")
+            ) as read_record:
+                self.assertEqual(
+                    limited_store.inspect(),
+                    {
+                        "inspection_verified": False,
+                        "reason": "orphan_lease_registry_invalid",
+                    },
+                )
+            read_record.assert_not_called()
+
+    def test_orphan_inspect_grace_boundary_and_tamper_are_fail_closed(self):
+        import tools.p7_controlled_host as host_module
+
+        image = "python@sha256:" + "b" * 64
+        endpoint = "npipe://local"
+        with tempfile.TemporaryDirectory(prefix="p7-orphan-inspect-boundary-") as temp:
+            root = Path(temp)
+            docker = self._fixture_docker_cli(root)
+            store = host_module.OrphanLeaseStore(root, "g" * 32, persistent=True)
+            lease = store.arm(
+                operation="eval",
+                nonce="5" * 32,
+                name="brain-memory-p7-eval-" + "5" * 32,
+                image=image,
+                context="default",
+                docker_cli=docker,
+                endpoint_digest=host_module._digest(endpoint),
+                now=100,
+                ttl_sec=30,
+            )
+            self.assertEqual(store.inspect(now=190)["live_waiting_count"], 1)
+            self.assertEqual(store.inspect(now=191)["expired_stop_unverified_count"], 1)
+
+            original = json.loads(lease.path.read_text(encoding="utf-8"))
+            raw = dict(original)
+            raw["mac"] = "0" * 64
+            lease.path.write_text(json.dumps(raw), encoding="utf-8")
+            result = store.inspect(now=190)
+            self.assertEqual(
+                result,
+                {
+                    "inspection_verified": False,
+                    "reason": "orphan_lease_registry_invalid",
+                },
+            )
+            lease.path.write_text(json.dumps(original), encoding="utf-8")
+            (store.directory / "unexpected.txt").write_text("x", encoding="utf-8")
+            self.assertEqual(
+                store.inspect(now=190),
+                {
+                    "inspection_verified": False,
+                    "reason": "orphan_lease_registry_invalid",
+                },
+            )
+
+    def test_orphan_recovery_checkpoint_preserves_lease_and_blocks_same_boot(self):
+        import tools.p7_controlled_host as host_module
+
+        image = "python@sha256:" + "c" * 64
+        endpoint = "npipe://local"
+        with tempfile.TemporaryDirectory(prefix="p7-orphan-recovery-") as temp:
+            root = Path(temp)
+            docker = self._fixture_docker_cli(root)
+            store = host_module.OrphanLeaseStore(root, "r" * 32, persistent=True)
+            lease = store.arm(
+                operation="eval",
+                nonce="6" * 32,
+                name="brain-memory-p7-eval-" + "6" * 32,
+                image=image,
+                context="default",
+                docker_cli=docker,
+                endpoint_digest=host_module._digest(endpoint),
+                now=100,
+                ttl_sec=30,
+            )
+            original_lease = lease.path.read_bytes()
+            with mock.patch.object(
+                host_module, "_read_host_epoch", return_value={
+                    "provider": "windows-kuser-v1",
+                    "machine_sha256": "a" * 64,
+                    "boot_id": 7,
+                    "hiberboot": True,
+                    "unbiased_interrupt_100ns": 10_000_000_000,
+                }
+            ):
+                prepared = store.prepare_recovery(now=200)
+            self.assertEqual(prepared["phase"], "recovery_pending")
+            self.assertEqual(prepared["reason"], "orphan_recovery_reboot_required")
+            self.assertEqual(prepared["affected_count"], 1)
+            recovery_id = prepared["recovery_id"]
+            self.assertRegex(recovery_id, r"^[0-9a-f]{32}$")
+            self.assertEqual(lease.path.read_bytes(), original_lease)
+            self.assertTrue(store.recovery_path.is_file())
+
+            with mock.patch.object(
+                host_module, "_read_host_epoch", return_value={
+                    "provider": "windows-kuser-v1",
+                    "machine_sha256": "a" * 64,
+                    "boot_id": 7,
+                    "hiberboot": False,
+                    "unbiased_interrupt_100ns": 10_000_000_000,
+                }
+            ), mock.patch.object(
+                host_module, "_reap_owned_eval_container", side_effect=AssertionError("same boot must not reap")
+            ):
+                rejected = store.verify_recovery(recovery_id)
+            self.assertEqual(rejected["phase"], "blocked")
+            self.assertEqual(rejected["reason"], "orphan_recovery_reboot_required")
+            self.assertEqual(lease.path.read_bytes(), original_lease)
+
+    def test_host_epoch_bootflags_uses_offset_24_not_padding(self):
+        import struct
+        import tools.p7_controlled_host as host_module
+
+        class FakeFunction:
+            def __init__(self, callback):
+                self.callback = callback
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                return self.callback(*args)
+
+        class FakeKernel32:
+            def __init__(self):
+                self.boot_id = 9
+                self.ReadProcessMemory = FakeFunction(self.read_memory)
+                self.GetCurrentProcess = FakeFunction(lambda: 1)
+                self.QueryUnbiasedInterruptTime = FakeFunction(self.query_unbiased)
+
+            def read_memory(self, _process, _address, value_ptr, _size, copied_ptr):
+                ctypes = host_module.ctypes
+                ctypes.cast(value_ptr, ctypes.POINTER(ctypes.c_uint32)).contents.value = self.boot_id
+                ctypes.cast(copied_ptr, ctypes.POINTER(ctypes.c_size_t)).contents.value = 4
+                return 1
+
+            def query_unbiased(self, value_ptr):
+                ctypes = host_module.ctypes
+                ctypes.cast(value_ptr, ctypes.POINTER(ctypes.c_ulonglong)).contents.value = 10_000_000_000
+                return 1
+
+        class FakeNtdll:
+            def __init__(self, padding, boot_flags):
+                self.padding = padding
+                self.boot_flags = boot_flags
+                self.NtQuerySystemInformation = FakeFunction(self.query)
+
+            def query(self, _class, info_ptr, size, returned_ptr):
+                ctypes = host_module.ctypes
+                payload = struct.pack("<16sIIQ", b"boot-identifier-1", 1, self.padding, self.boot_flags)
+                ctypes.memmove(info_ptr, payload, size)
+                ctypes.cast(returned_ptr, ctypes.POINTER(ctypes.c_ulong)).contents.value = 32
+                return 0
+
+        class FakeKey:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        fake_winreg = SimpleNamespace(
+            HKEY_LOCAL_MACHINE=1,
+            KEY_READ=2,
+            KEY_WOW64_64KEY=4,
+            OpenKey=lambda *_args: FakeKey(),
+            QueryValueEx=lambda *_args: ("12345678-1234-1234-1234-123456789abc", 1),
+        )
+        import ctypes
+        for padding, boot_flags, expected in ((0x2, 0, False), (0, 0x2, True)):
+            with self.subTest(padding=padding, boot_flags=boot_flags):
+                kernel = FakeKernel32()
+                ntdll = FakeNtdll(padding, boot_flags)
+                def fake_windll(name, **_kwargs):
+                    return kernel if name == "kernel32" else ntdll
+                payload = struct.pack("<16sIIQ", b"boot-identifier-1", 1, padding, boot_flags)
+                self.assertEqual(len(payload), 32)
+                with mock.patch.object(host_module, "os", SimpleNamespace(name="nt")), \
+                    mock.patch.object(host_module.sys, "platform", "win32"), \
+                    mock.patch.object(host_module.sys, "getwindowsversion", return_value=SimpleNamespace(major=10), create=True), \
+                    mock.patch.dict(sys.modules, {"winreg": fake_winreg}), \
+                    mock.patch.object(host_module.ctypes, "WinDLL", side_effect=fake_windll, create=True):
+                    epoch = host_module._read_host_epoch()
+                self.assertEqual(epoch["hiberboot"], expected)
+
+    def test_orphan_recovery_new_boot_empty_resources_seals_and_allows_new_arm(self):
+        import tools.p7_controlled_host as host_module
+
+        image = "python@sha256:" + "d" * 64
+        endpoint = "npipe://local"
+        before = {
+            "provider": "windows-kuser-v1", "machine_sha256": "b" * 64,
+            "boot_id": 11, "hiberboot": True, "unbiased_interrupt_100ns": 10_000_000_000,
+        }
+        after = {**before, "boot_id": 12, "hiberboot": False, "unbiased_interrupt_100ns": 100_000_000}
+        with tempfile.TemporaryDirectory(prefix="p7-orphan-recovery-success-") as temp:
+            root = Path(temp)
+            docker = self._fixture_docker_cli(root)
+            store = host_module.OrphanLeaseStore(root, "s" * 32, persistent=True)
+            lease = store.arm(
+                operation="eval", nonce="7" * 32,
+                name="brain-memory-p7-eval-" + "7" * 32,
+                image=image, context="default", docker_cli=docker,
+                endpoint_digest=host_module._digest(endpoint), now=100, ttl_sec=30,
+            )
+            original = lease.path.read_bytes()
+            with mock.patch.object(host_module, "_read_host_epoch", return_value=before):
+                prepared = store.prepare_recovery(now=200)
+            recovery_id = prepared["recovery_id"]
+            with mock.patch.object(
+                host_module, "_read_host_epoch", return_value=after
+            ), mock.patch.object(
+                host_module, "_reap_owned_eval_container", return_value=True
+            ) as reaper:
+                verified = store.verify_recovery(recovery_id)
+            self.assertEqual(verified["phase"], "recovery_verified")
+            self.assertEqual(verified["reason"], "")
+            reaper.assert_called_once()
+            self.assertEqual(lease.path.read_bytes(), original)
+            later = {**after, "boot_id": 13, "unbiased_interrupt_100ns": 50_000_000}
+            with mock.patch.object(host_module, "_read_host_epoch", return_value=later), mock.patch.object(
+                host_module, "_reap_owned_eval_container", return_value=True
+            ):
+                self.assertTrue(store.sweep(now=300)["ready"])
+                repeated_after_reboot = store.verify_recovery(recovery_id)
+            self.assertEqual(repeated_after_reboot["phase"], "recovery_verified")
+            recovery_bytes = store.recovery_path.read_bytes()
+            with mock.patch.object(host_module, "_read_host_epoch", return_value=after):
+                no_new_targets = store.prepare_recovery(now=300)
+            self.assertEqual(no_new_targets["phase"], "no_recovery_needed")
+            self.assertEqual(store.recovery_path.read_bytes(), recovery_bytes)
+
+            with mock.patch.object(
+                host_module, "_read_host_epoch", return_value=after
+            ), mock.patch.object(
+                host_module, "_reap_owned_eval_container", return_value=True
+            ) as sweep_reaper:
+                new_lease = store.arm(
+                    operation="eval", nonce="8" * 32,
+                    name="brain-memory-p7-eval-" + "8" * 32,
+                    image=image, context="default", docker_cli=docker,
+                    endpoint_digest=host_module._digest(endpoint), now=300, ttl_sec=30,
+                )
+            self.assertTrue(sweep_reaper.called)
+            self.assertTrue(all(call.kwargs.get("allow_removal") is False for call in sweep_reaper.call_args_list))
+            self.assertTrue(new_lease.path.is_file())
+            with mock.patch.object(
+                host_module, "_read_host_epoch", return_value=after
+            ), mock.patch.object(
+                host_module, "_reap_owned_eval_container", return_value=True
+            ):
+                repeated = store.verify_recovery(recovery_id)
+            self.assertEqual(repeated["phase"], "recovery_verified")
+
+    def test_orphan_recovery_resource_reappearance_stays_unverified(self):
+        import tools.p7_controlled_host as host_module
+
+        image = "python@sha256:" + "e" * 64
+        endpoint = "npipe://local"
+        before = {
+            "provider": "windows-kuser-v1", "machine_sha256": "c" * 64,
+            "boot_id": 21, "hiberboot": True, "unbiased_interrupt_100ns": 10_000_000_000,
+        }
+        after = {**before, "boot_id": 22, "hiberboot": False, "unbiased_interrupt_100ns": 100_000_000}
+        with tempfile.TemporaryDirectory(prefix="p7-orphan-recovery-resource-") as temp:
+            root = Path(temp)
+            docker = self._fixture_docker_cli(root)
+            store = host_module.OrphanLeaseStore(root, "t" * 32, persistent=True)
+            lease = store.arm(
+                operation="eval", nonce="9" * 32,
+                name="brain-memory-p7-eval-" + "9" * 32,
+                image=image, context="default", docker_cli=docker,
+                endpoint_digest=host_module._digest(endpoint), now=100, ttl_sec=30,
+            )
+            original = lease.path.read_bytes()
+            with mock.patch.object(host_module, "_read_host_epoch", return_value=before):
+                recovery_id = store.prepare_recovery(now=200)["recovery_id"]
+            with mock.patch.object(
+                host_module, "_read_host_epoch", return_value=after
+            ), mock.patch.object(
+                host_module, "_reap_owned_eval_container", return_value=False
+            ) as reaper:
+                result = store.verify_recovery(recovery_id)
+            self.assertEqual(result["phase"], "blocked")
+            self.assertEqual(result["reason"], "orphan_recovery_resources_unverified")
+            reaper.assert_called_once()
+            self.assertEqual(lease.path.read_bytes(), original)
+
+    def test_orphan_recovery_wrong_key_tamper_and_foreign_epoch_fail_closed(self):
+        import tools.p7_controlled_host as host_module
+
+        image = "python@sha256:" + "f" * 64
+        endpoint = "npipe://local"
+        before = {
+            "provider": "windows-kuser-v1", "machine_sha256": "d" * 64,
+            "boot_id": 31, "hiberboot": True, "unbiased_interrupt_100ns": 10_000_000_000,
+        }
+        after = {**before, "boot_id": 32, "hiberboot": False, "unbiased_interrupt_100ns": 100_000_000}
+
+        def make_checkpoint(root, key):
+            docker = self._fixture_docker_cli(root)
+            store = host_module.OrphanLeaseStore(root, key, persistent=True)
+            lease = store.arm(
+                operation="eval", nonce="a" * 32,
+                name="brain-memory-p7-eval-" + "a" * 32,
+                image=image, context="default", docker_cli=docker,
+                endpoint_digest=host_module._digest(endpoint), now=100, ttl_sec=30,
+            )
+            with mock.patch.object(host_module, "_read_host_epoch", return_value=before):
+                recovery_id = store.prepare_recovery(now=200)["recovery_id"]
+            return store, lease, recovery_id
+
+        with tempfile.TemporaryDirectory(prefix="p7-orphan-recovery-negative-") as temp:
+            root = Path(temp)
+            store, lease, recovery_id = make_checkpoint(root, "w" * 32)
+            original = lease.path.read_bytes()
+
+            wrong_key = host_module.OrphanLeaseStore(root, "x" * 32, persistent=True)
+            self.assertEqual(
+                wrong_key.verify_recovery(recovery_id)["reason"],
+                "orphan_recovery_registry_invalid",
+            )
+            raw = json.loads(store.recovery_path.read_text(encoding="utf-8"))
+            raw["entries"][0]["checkpoint"]["targets"] = []
+            store.recovery_path.write_text(json.dumps(raw), encoding="utf-8")
+            with mock.patch.object(host_module, "_read_host_epoch", return_value=after):
+                tampered = store.verify_recovery(recovery_id)
+            self.assertEqual(tampered["reason"], "orphan_recovery_registry_invalid")
+            self.assertEqual(lease.path.read_bytes(), original)
+
+        for label, epoch in (
+            ("foreign", {**after, "machine_sha256": "e" * 64}),
+            ("boot_backwards", {**before, "boot_id": 30, "hiberboot": False}),
+            ("hiberboot", {**after, "hiberboot": True}),
+            ("uptime_not_reset", {**after, "unbiased_interrupt_100ns": 10_000_000_000}),
+        ):
+            with self.subTest(epoch=label), tempfile.TemporaryDirectory(prefix="p7-orphan-recovery-epoch-") as temp:
+                store, lease, recovery_id = make_checkpoint(Path(temp), "y" * 32)
+                original = lease.path.read_bytes()
+                with mock.patch.object(host_module, "_read_host_epoch", return_value=epoch), mock.patch.object(
+                    host_module, "_reap_owned_eval_container", side_effect=AssertionError("epoch rejection must precede Docker")
+                ) as reaper:
+                    rejected = store.verify_recovery(recovery_id)
+                self.assertEqual(rejected["phase"], "blocked")
+                self.assertIn(rejected["reason"], {
+                    "orphan_recovery_host_mismatch", "orphan_recovery_reboot_required",
+                })
+                reaper.assert_not_called()
+                self.assertEqual(lease.path.read_bytes(), original)
+
+    def test_orphan_recovery_authenticated_snapshot_change_requires_new_checkpoint(self):
+        import tools.p7_controlled_host as host_module
+
+        image = "python@sha256:" + "1" * 64
+        endpoint = "npipe://local"
+        epoch = {
+            "provider": "windows-kuser-v1", "machine_sha256": "f" * 64,
+            "boot_id": 41, "hiberboot": True, "unbiased_interrupt_100ns": 10_000_000_000,
+        }
+        with tempfile.TemporaryDirectory(prefix="p7-orphan-recovery-snapshot-") as temp:
+            root = Path(temp)
+            docker = self._fixture_docker_cli(root)
+            store = host_module.OrphanLeaseStore(root, "z" * 32, persistent=True)
+            lease = store.arm(
+                operation="eval", nonce="b" * 32,
+                name="brain-memory-p7-eval-" + "b" * 32,
+                image=image, context="default", docker_cli=docker,
+                endpoint_digest=host_module._digest(endpoint), now=100, ttl_sec=30,
+            )
+            with mock.patch.object(host_module, "_read_host_epoch", return_value=epoch):
+                first = store.prepare_recovery(now=200)
+            original = json.loads(lease.path.read_text(encoding="utf-8"))
+            changed = dict(original, expires_at=original["expires_at"] + 1)
+            changed["mac"] = store._mac({key: value for key, value in changed.items() if key != "mac"})
+            lease.path.write_text(json.dumps(changed), encoding="utf-8")
+            with mock.patch.object(host_module, "_read_host_epoch", return_value=epoch):
+                rejected = store.verify_recovery(first["recovery_id"])
+                appended = store.prepare_recovery(now=300)
+            self.assertEqual(rejected["phase"], "blocked")
+            self.assertEqual(rejected["reason"], "orphan_recovery_registry_changed")
+            self.assertEqual(appended["phase"], "recovery_pending")
+            self.assertNotEqual(appended["recovery_id"], first["recovery_id"])
+            with mock.patch.object(host_module, "_read_host_epoch", return_value={**epoch, "boot_id": 42, "hiberboot": False}):
+                superseded = store.verify_recovery(first["recovery_id"])
+            self.assertEqual(superseded["phase"], "blocked")
+            self.assertEqual(superseded["reason"], "orphan_recovery_checkpoint_superseded")
+
+    def test_orphan_recovery_cli_key_errors_are_static_and_do_not_import_brain(self):
+        script = (
+            "import builtins, runpy\n"
+            "real_import = builtins.__import__\n"
+            "def guarded(name, *args, **kwargs):\n"
+            "    if name == 'brain' or name.startswith('brain.') or name == 'services' or name.startswith('services.'):\n"
+            "        raise AssertionError('forbidden import: ' + name)\n"
+            "    return real_import(name, *args, **kwargs)\n"
+            "builtins.__import__ = guarded\n"
+            "try:\n"
+            "    runpy.run_path(r'tools/p7_controlled_host.py', run_name='__main__')\n"
+            "except SystemExit as exc:\n"
+            "    raise SystemExit(exc.code)\n"
+        )
+        for key, expected in ((None, "manifest_key_unavailable"), ("short", "manifest_key_invalid")):
+            with self.subTest(key=key):
+                isolated = tempfile.mkdtemp(prefix="p7-recovery-cli-")
+                env = {
+                    name: value for name, value in os.environ.items()
+                    if name in {"PATH", "Path", "SystemRoot", "SYSTEMROOT", "PATHEXT"}
+                }
+                env.update({
+                    "OFFLINE": "1", "BRAIN_MEMORY_OFFLINE": "1",
+                    "PYTHONDONTWRITEBYTECODE": "1", "TEMP": isolated, "TMP": isolated,
+                })
+                if key is not None:
+                    env["BRAIN_MEMORY_P7_MANIFEST_KEY"] = key
+                completed = subprocess.run(
+                    [sys.executable, "-c", script, "--prepare-orphan-recovery"],
+                    cwd=Path.cwd(), env=env, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    timeout=20, check=False,
+                )
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertEqual(completed.stderr, "")
+                report = json.loads(completed.stdout.strip())
+                self.assertEqual(report["phase"], "blocked")
+                self.assertTrue(report["evidence_only"])
+                self.assertEqual(report["reason"], expected)
+                self.assertNotIn("authorization_required", report)
+
+    def test_recovery_sidecar_without_registry_fails_closed_everywhere(self):
+        import tools.p7_controlled_host as host_module
+
+        with tempfile.TemporaryDirectory(prefix="p7-recovery-sidecar-") as temp:
+            root = Path(temp)
+            docker = self._fixture_docker_cli(root)
+            store = host_module.OrphanLeaseStore(root, "q" * 32, persistent=True)
+            store.recovery_path.write_text("{}", encoding="utf-8")
+            self.assertFalse(store.directory.exists())
+            self.assertIn("registry", store.inspect()["reason"])
+            self.assertFalse(store.sweep(now=200)["ready"])
+            with self.assertRaisesRegex(RuntimeError, "cleanup is pending"):
+                store.arm(
+                    operation="eval", nonce="c" * 32,
+                    name="brain-memory-p7-eval-" + "c" * 32,
+                    image="python@sha256:" + "2" * 64,
+                    context="default", docker_cli=docker,
+                    endpoint_digest=host_module._digest("npipe://local"),
+                    now=100, ttl_sec=30,
+                )
+
+    def test_inspect_orphans_cli_requires_own_mode_and_does_not_construct_without_key(self):
+        import tools.p7_controlled_host as host_module
+
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            sys, "argv", ["p7_controlled_host.py", "--inspect-orphans"]
+        ), mock.patch.object(host_module, "P7ControlledHost") as host:
+            with mock.patch("builtins.print") as output:
+                self.assertEqual(host_module._cli(), 2)
+            host.assert_not_called()
+            report = json.loads(output.call_args.args[0])
+            self.assertEqual(report["phase"], "blocked")
+            self.assertTrue(report["observation_only"])
+            self.assertEqual(report["reason_code"], "manifest_key_unavailable")
+            self.assertNotIn("clear", report)
+            self.assertNotIn("ready", report)
+
+        with mock.patch.object(
+            sys, "argv", ["p7_controlled_host.py", "--inspect-orphans", "--prepare"]
+        ):
+            with self.assertRaises(SystemExit):
+                host_module._cli()
+
+        fake_store = SimpleNamespace(
+            inspect=lambda: {
+                "inspection_verified": True,
+                "reason": "",
+                "record_count": 0,
+                "live_waiting_count": 0,
+                "expired_stop_unverified_count": 0,
+                "stopped_pending_cleanup_count": 0,
+                "cleaned_retained_count": 0,
+            }
+        )
+        fake_host = SimpleNamespace(
+            run_root=Path(tempfile.gettempdir()),
+            _orphan_lease_store=lambda: fake_store,
+        )
+        with mock.patch.dict(
+            os.environ, {host_module.MANIFEST_KEY_ENV: "v" * 32}, clear=False
+        ), mock.patch.object(
+            sys, "argv", ["p7_controlled_host.py", "--inspect-orphans"]
+        ), mock.patch.object(
+            host_module, "P7ControlledHost", return_value=fake_host
+        ), mock.patch.object(
+            host_module, "_authorization_file_lock", side_effect=AssertionError("inspect host lock")
+        ) as host_lock, mock.patch("builtins.print") as output:
+            self.assertEqual(host_module._cli(), 0)
+        host_lock.assert_not_called()
+        valid_report = json.loads(output.call_args.args[0])
+        self.assertEqual(valid_report["phase"], "inspected")
+        self.assertTrue(valid_report["observation_only"])
+        self.assertNotIn("authorization_required", valid_report)
+
+    def test_inspect_orphans_fresh_process_key_modes_never_imports_brain_or_services(self):
+        script = (
+            "import builtins, runpy\n"
+            "real_import = builtins.__import__\n"
+            "def guarded(name, *args, **kwargs):\n"
+            "    if name == 'brain' or name.startswith('brain.') or name == 'services' or name.startswith('services.'):\n"
+            "        raise AssertionError('diagnostic imported forbidden module: ' + name)\n"
+            "    return real_import(name, *args, **kwargs)\n"
+            "builtins.__import__ = guarded\n"
+            "try:\n"
+            "    runpy.run_path(r'tools/p7_controlled_host.py', run_name='__main__')\n"
+            "except SystemExit as exc:\n"
+            "    raise SystemExit(exc.code)\n"
+        )
+        for label, key, expected_code, expected_phase, expected_reason in (
+            ("missing", None, 2, "blocked", "manifest_key_unavailable"),
+            ("invalid", "short", 2, "blocked", "manifest_key_invalid"),
+            ("valid", "v" * 32, 0, "inspected", None),
+        ):
+            with self.subTest(key_mode=label):
+                isolated_temp = tempfile.mkdtemp(prefix="p7-inspect-cli-")
+                child_env = {
+                    key_name: value
+                    for key_name, value in os.environ.items()
+                    if key_name in {"PATH", "Path", "SystemRoot", "SYSTEMROOT", "PATHEXT"}
+                }
+                child_env.update(
+                    {
+                        "OFFLINE": "1",
+                        "BRAIN_MEMORY_OFFLINE": "1",
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                        "TEMP": isolated_temp,
+                        "TMP": isolated_temp,
+                    }
+                )
+                child_env.pop("BRAIN_MEMORY_P7_MANIFEST_KEY", None)
+                if key is not None:
+                    child_env["BRAIN_MEMORY_P7_MANIFEST_KEY"] = key
+                completed = subprocess.run(
+                    [sys.executable, "-c", script, "--inspect-orphans"],
+                    cwd=Path.cwd(),
+                    env=child_env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, expected_code, completed.stderr)
+                self.assertEqual(completed.stderr, "")
+                report = json.loads(completed.stdout.strip())
+                self.assertEqual(report["phase"], expected_phase)
+                self.assertTrue(report["observation_only"])
+                self.assertNotIn("authorization_required", report)
+                if expected_reason:
+                    self.assertEqual(report["reason_code"], expected_reason)
+                else:
+                    self.assertNotIn("reason_code", report)
+                    self.assertNotIn("ready", report)
+                    self.assertNotIn("clear", report)
 
     def test_orphan_lease_registry_never_reaps_an_unstopped_creator(self):
         import tools.p7_controlled_host as host_module

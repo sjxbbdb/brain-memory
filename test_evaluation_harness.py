@@ -737,6 +737,33 @@ class EvaluationHarnessTests(unittest.TestCase):
                 receipt = harness.evaluate(candidate, baseline)
             self.assertTrue(receipt.accepted, receipt.to_dict())
 
+    def test_safe_environment_preserves_docker_context_location_hints(self):
+        import brain.evaluation_harness as harness_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "USERPROFILE": r"C:\Users\operator",
+                    "APPDATA": r"C:\Users\operator\AppData\Roaming",
+                    "DOCKER_CONFIG": r"C:\Users\operator\.docker",
+                    "DOCKER_API_KEY": "must-not-cross-boundary",
+                    "HTTPS_PROXY": "https://proxy.invalid",
+                },
+                clear=False,
+            ):
+                env = harness_module._safe_environment(
+                    root / "candidate",
+                    root / "fixtures",
+                    harness_module.ResourceBudget(),
+                )
+            self.assertEqual(env["USERPROFILE"], r"C:\Users\operator")
+            self.assertEqual(env["APPDATA"], r"C:\Users\operator\AppData\Roaming")
+            self.assertEqual(env["DOCKER_CONFIG"], r"C:\Users\operator\.docker")
+            self.assertNotIn("DOCKER_API_KEY", env)
+            self.assertNotIn("HTTPS_PROXY", env)
+
     def test_shell_and_remote_commands_are_rejected(self):
         with self.assertRaises(HarnessConfigurationError):
             EvaluationHarness(command=["cmd.exe", "/c", "echo", "x"])

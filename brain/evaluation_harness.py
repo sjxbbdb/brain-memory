@@ -1227,6 +1227,12 @@ def _safe_environment(
         "TMP",
         "LANG",
         "LC_ALL",
+        # Docker Desktop resolves named contexts from these user-local
+        # location hints.  They are paths, not credentials; the evaluator
+        # still excludes Docker tokens, proxies, and all other secret names.
+        "USERPROFILE",
+        "APPDATA",
+        "DOCKER_CONFIG",
     }
     env: dict[str, str] = {}
     for key, value in os.environ.items():

@@ -10,11 +10,19 @@ The module can be used as a small library or as a two-phase CLI::
 
     python tools/p7_controlled_host.py --prepare
     python tools/p7_controlled_host.py --authorize <run-id>
+    python tools/p7_controlled_host.py --inspect-orphans
+    python tools/p7_controlled_host.py --prepare-orphan-recovery
+    python tools/p7_controlled_host.py --verify-orphan-recovery <recovery-id>
 
 ``--prepare`` leaves a bounded run directory in the OS temporary directory so
 an operator can inspect the public receipt before authorizing the second
 phase.  The directory contains the isolated runtime trees and no model key,
 prompt, raw source evidence, or full evaluation receipt.
+
+``--inspect-orphans`` performs an observation-only, non-atomic lease snapshot;
+exit 0 means only that the snapshot was authenticated, never that P7 is ready.
+Recovery preparation/verification records evidence only; verification requires
+a full host restart and nonce-scoped Docker absence and never removes or rewrites the old lease.
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ import asyncio
 import copy
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+import ctypes
 import difflib
 import hashlib
 import hmac
@@ -42,6 +51,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Mapping, Sequence
+import uuid
 
 
 # ``python tools/p7_controlled_host.py`` sets ``sys.path[0]`` to ``tools``
@@ -2363,6 +2373,7 @@ def _reap_owned_eval_container(
     name_prefix: str = "brain-memory-p7-eval-",
     expected_endpoint_digest: str | None = None,
     expected_docker_cli_digest: str | None = None,
+    allow_removal: bool = True,
 ) -> bool:
     """Remove one orphaned evaluation container, only after proving ownership.
 
@@ -2385,6 +2396,7 @@ def _reap_owned_eval_container(
         or not re.fullmatch(r"[0-9a-f]{32,128}", str(nonce or ""))
         or not _DOCKER_IMAGE_RE.fullmatch(str(image or ""))
         or not re.fullmatch(r"brain-memory-p7-(?:eval|probe)-", str(name_prefix or ""))
+        or not isinstance(allow_removal, bool)
         or (
             expected_endpoint_digest is not None
             and not re.fullmatch(r"[0-9a-f]{64}", str(expected_endpoint_digest or ""))
@@ -2486,6 +2498,8 @@ def _reap_owned_eval_container(
     # just after the wrapper process is terminated.
     if not listed:
         return owned_listing() == []
+    if allow_removal is not True:
+        return False
     container_id, rendered_name = listed[0]
     try:
         if not endpoint_matches():
@@ -3380,6 +3394,145 @@ def _write_json(path: Path, value: Mapping[str, Any]) -> None:
                 pass
 
 
+def _read_host_epoch() -> dict[str, Any]:
+    """Read a fail-closed Windows host epoch without using wall-clock time."""
+
+    unavailable = "orphan_recovery_host_epoch_unavailable"
+    if os.name != "nt" or sys.platform != "win32" or ctypes.sizeof(ctypes.c_void_p) != 8:
+        raise ValueError(unavailable)
+    try:
+        version = sys.getwindowsversion()
+        if int(version.major) < 10:
+            raise ValueError(unavailable)
+
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Cryptography",
+            0,
+            winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+        ) as key:
+            machine_guid = winreg.QueryValueEx(key, "MachineGuid")[0]
+        if not isinstance(machine_guid, str) or not re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            machine_guid,
+        ):
+            raise ValueError(unavailable)
+        parsed_machine_guid = uuid.UUID(machine_guid)
+        if parsed_machine_guid.int == 0:
+            raise ValueError(unavailable)
+        machine_sha256 = hashlib.sha256(
+            str(parsed_machine_guid).encode("ascii")
+        ).hexdigest()
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        read_process_memory = kernel32.ReadProcessMemory
+        read_process_memory.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        read_process_memory.restype = ctypes.c_int
+        get_current_process = kernel32.GetCurrentProcess
+        get_current_process.restype = ctypes.c_void_p
+
+        def read_boot_id() -> int:
+            value = ctypes.c_uint32()
+            copied = ctypes.c_size_t()
+            if not read_process_memory(
+                get_current_process(),
+                ctypes.c_void_p(0x7FFE02C4),
+                ctypes.byref(value),
+                ctypes.sizeof(value),
+                ctypes.byref(copied),
+            ) or copied.value != 4:
+                raise ValueError(unavailable)
+            boot_id = int(value.value)
+            if not 0 < boot_id <= 0xFFFFFFFF:
+                raise ValueError(unavailable)
+            return boot_id
+
+        before_boot_id = read_boot_id()
+
+        # Microsoft documents this counter as starting at zero, accumulating
+        # awake running time, excluding sleep/hibernate, and ignoring wall-
+        # clock adjustments.  It supplements BootId/DbgHiberBoot; neither of
+        # those fields alone is treated as proof of a full reboot.
+        # https://learn.microsoft.com/en-us/windows/win32/api/realtimeapiset/nf-realtimeapiset-queryunbiasedinterrupttime
+        query_unbiased_interrupt_time = kernel32.QueryUnbiasedInterruptTime
+        query_unbiased_interrupt_time.argtypes = [
+            ctypes.POINTER(ctypes.c_ulonglong),
+        ]
+        query_unbiased_interrupt_time.restype = ctypes.c_int
+        unbiased_interrupt_time = ctypes.c_ulonglong()
+        if not query_unbiased_interrupt_time(ctypes.byref(unbiased_interrupt_time)):
+            raise ValueError(unavailable)
+        unbiased_interrupt_100ns = int(unbiased_interrupt_time.value)
+        if not 0 < unbiased_interrupt_100ns <= 2**64 - 1:
+            raise ValueError(unavailable)
+
+        ntdll = ctypes.WinDLL("ntdll")
+        query_system_information = ntdll.NtQuerySystemInformation
+        query_system_information.argtypes = [
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+        ]
+        query_system_information.restype = ctypes.c_long
+        class _SystemBootEnvironmentInformation(ctypes.Structure):
+            _fields_ = [
+                ("BootIdentifier", ctypes.c_ubyte * 16),
+                ("FirmwareType", ctypes.c_uint32),
+                ("BootFlags", ctypes.c_uint64),
+            ]
+
+        if (
+            ctypes.sizeof(_SystemBootEnvironmentInformation) != 32
+            or _SystemBootEnvironmentInformation.BootFlags.offset != 24
+        ):
+            raise ValueError(unavailable)
+        information = _SystemBootEnvironmentInformation()
+        returned = ctypes.c_ulong()
+        status = query_system_information(
+            90,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+            ctypes.byref(returned),
+        )
+        if status != 0 or returned.value != 32:
+            raise ValueError(unavailable)
+        boot_identifier = bytes(information.BootIdentifier)
+        if not any(boot_identifier):
+            raise ValueError(unavailable)
+        firmware_type = int(information.FirmwareType)
+        if firmware_type not in (1, 2):
+            raise ValueError(unavailable)
+        boot_flags = int(information.BootFlags)
+        hiberboot = bool(boot_flags & 0x2)
+
+        after_boot_id = read_boot_id()
+        if before_boot_id != after_boot_id:
+            raise ValueError(unavailable)
+        return {
+            "provider": "windows-kuser-v1",
+            "machine_sha256": machine_sha256,
+            "boot_id": after_boot_id,
+            "hiberboot": hiberboot,
+            "unbiased_interrupt_100ns": unbiased_interrupt_100ns,
+        }
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        if isinstance(exc, ValueError) and str(exc) == unavailable:
+            raise
+        raise ValueError(unavailable) from None
+
+
 _ORPHAN_LEASE_PROTOCOL = "p7-orphan-lease-v1"
 _ORPHAN_LEASE_DIRECTORY = ".brain-memory-p7-orphan-leases"
 _ORPHAN_LEASE_LOCK = ".registry.lock"
@@ -3409,6 +3562,12 @@ _ORPHAN_LEASE_UNSIGNED_FIELDS = frozenset(
         "sequence",
         "cleaned_at",
     }
+)
+_ORPHAN_RECOVERY_PROTOCOL = "p7-orphan-recovery-v1"
+_ORPHAN_RECOVERY_MAX_ENTRIES = 16
+_ORPHAN_RECOVERY_MAX_BYTES = 2 * 1024 * 1024
+_ORPHAN_RECOVERY_EPOCH_FIELDS = frozenset(
+    {"provider", "machine_sha256", "boot_id", "hiberboot", "unbiased_interrupt_100ns"}
 )
 
 
@@ -3480,6 +3639,413 @@ class OrphanLeaseStore:
     def lock_path(self) -> Path:
         return self.directory / _ORPHAN_LEASE_LOCK
 
+    @property
+    def recovery_path(self) -> Path:
+        return self.root / (
+            ".brain-memory-p7-recovery-" + self._namespace_digest[:16] + ".json"
+        )
+
+    def _recovery_mac(self, payload: Mapping[str, Any]) -> str:
+        material = (
+            "brain-memory-p7-recovery-v1:" + self._namespace_digest
+        ).encode("utf-8")
+        key = hmac.new(self._key, material, hashlib.sha256).digest()
+        return hmac.new(key, _canonical(payload).encode("utf-8"), hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def _validate_recovery_epoch(value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != _ORPHAN_RECOVERY_EPOCH_FIELDS:
+            raise ValueError("orphan recovery epoch is invalid")
+        if (
+            value["provider"] != "windows-kuser-v1"
+            or not isinstance(value["machine_sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value["machine_sha256"])
+            or not isinstance(value["boot_id"], int)
+            or isinstance(value["boot_id"], bool)
+            or not 1 <= value["boot_id"] <= 2**32 - 1
+            or not isinstance(value["hiberboot"], bool)
+            or not isinstance(value["unbiased_interrupt_100ns"], int)
+            or isinstance(value["unbiased_interrupt_100ns"], bool)
+            or not 1 <= value["unbiased_interrupt_100ns"] <= 2**64 - 1
+        ):
+            raise ValueError("orphan recovery epoch is invalid")
+        return dict(value)
+
+    @staticmethod
+    def _read_bounded_json(path: Path, *, max_bytes: int, label: str = "orphan recovery ledger") -> Any:
+        if _is_link_like(path) or not path.is_file():
+            raise ValueError(label + " is unsafe")
+        descriptor: int | None = None
+        try:
+            flags = os.O_RDONLY | int(getattr(os, "O_NOFOLLOW", 0)) | int(
+                getattr(os, "O_BINARY", 0)
+            )
+            descriptor = os.open(os.fspath(path), flags)
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or getattr(before, "st_nlink", 1) != 1
+                or before.st_size > max_bytes
+            ):
+                raise ValueError(label + " is unsafe")
+            data = bytearray()
+            while len(data) <= max_bytes:
+                chunk = os.read(descriptor, min(64 * 1024, max_bytes + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            after = os.fstat(descriptor)
+            if (
+                len(data) > max_bytes
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+                or getattr(before, "st_ino", 0) != getattr(after, "st_ino", 0)
+            ):
+                raise ValueError(label + " changed while being read")
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, ValueError):
+                raise
+            raise ValueError(label + " unavailable") from exc
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        try:
+            return json.loads(bytes(data).decode("utf-8", errors="strict"))
+        except (UnicodeError, ValueError) as exc:
+            raise ValueError(label + " is invalid") from exc
+
+    def _validate_recovery_ledger(
+        self, value: Any, records: list[tuple[Path, dict[str, Any]]]
+    ) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != {
+            "schema_version", "protocol", "namespace_sha256", "entries", "mac"
+        }:
+            raise ValueError("orphan recovery ledger is invalid")
+        unsigned = {key: value[key] for key in value if key != "mac"}
+        if (
+            type(unsigned["schema_version"]) is not int
+            or unsigned["schema_version"] != 1
+            or unsigned["protocol"] != _ORPHAN_RECOVERY_PROTOCOL
+            or unsigned["namespace_sha256"] != self._namespace_digest
+            or not isinstance(unsigned["entries"], list)
+            or len(unsigned["entries"]) > _ORPHAN_RECOVERY_MAX_ENTRIES
+            or not isinstance(value["mac"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value["mac"])
+            or not hmac.compare_digest(value["mac"], self._recovery_mac(unsigned))
+        ):
+            raise ValueError("orphan recovery ledger is invalid")
+        current_digests = {
+            payload["nonce"]: _digest(_canonical(payload)) for _path, payload in records
+        }
+        seen_ids: set[str] = set()
+        pending_index: int | None = None
+        validated: list[dict[str, Any]] = []
+        for index, entry in enumerate(unsigned["entries"]):
+            if not isinstance(entry, dict) or set(entry) != {"checkpoint", "receipt"}:
+                raise ValueError("orphan recovery ledger is invalid")
+            checkpoint = entry["checkpoint"]
+            if not isinstance(checkpoint, dict) or set(checkpoint) != {
+                "recovery_id", "host_epoch", "records", "targets"
+            }:
+                raise ValueError("orphan recovery ledger is invalid")
+            recovery_id = checkpoint["recovery_id"]
+            if not isinstance(recovery_id, str) or not re.fullmatch(r"[0-9a-f]{32}", recovery_id):
+                raise ValueError("orphan recovery ledger is invalid")
+            if recovery_id in seen_ids:
+                raise ValueError("orphan recovery ledger is invalid")
+            seen_ids.add(recovery_id)
+            self._validate_recovery_epoch(checkpoint["host_epoch"])
+            snapshot = checkpoint["records"]
+            targets = checkpoint["targets"]
+            if (
+                not isinstance(snapshot, dict)
+                or not snapshot
+                or len(snapshot) > _ORPHAN_LEASE_MAX_FILES
+                or any(
+                    not isinstance(nonce, str)
+                    or not re.fullmatch(r"[0-9a-f]{32,128}", nonce)
+                    or not isinstance(digest, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                    for nonce, digest in snapshot.items()
+                )
+                or not isinstance(targets, list)
+                or len(targets) > len(snapshot)
+                or targets != sorted(set(targets))
+                or any(target not in snapshot for target in targets)
+            ):
+                raise ValueError("orphan recovery ledger is invalid")
+            receipt = entry["receipt"]
+            if receipt is None:
+                if index == len(unsigned["entries"]) - 1:
+                    pending_index = index
+            else:
+                if not isinstance(receipt, dict) or set(receipt) != {
+                    "checkpoint_sha256", "host_epoch", "containers_absent"
+                }:
+                    raise ValueError("orphan recovery ledger is invalid")
+                receipt_epoch = self._validate_recovery_epoch(receipt["host_epoch"])
+                if (
+                    not isinstance(receipt["checkpoint_sha256"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", receipt["checkpoint_sha256"])
+                    or receipt["checkpoint_sha256"] != _digest(_canonical(checkpoint))
+                    or receipt_epoch["provider"] != checkpoint["host_epoch"]["provider"]
+                    or receipt_epoch["machine_sha256"] != checkpoint["host_epoch"]["machine_sha256"]
+                    or receipt_epoch["boot_id"] <= checkpoint["host_epoch"]["boot_id"]
+                    or receipt_epoch["unbiased_interrupt_100ns"] >= checkpoint["host_epoch"]["unbiased_interrupt_100ns"]
+                    or receipt_epoch["hiberboot"] is not False
+                    or receipt["containers_absent"] is not True
+                ):
+                    raise ValueError("orphan recovery ledger is invalid")
+                if any(current_digests.get(target) != snapshot[target] for target in targets):
+                    raise ValueError("orphan recovery ledger is invalid")
+            validated.append({"checkpoint": checkpoint, "receipt": receipt})
+        return {
+            "entries": validated,
+            "pending_index": pending_index,
+            "current_digests": current_digests,
+        }
+
+    def _load_recovery_ledger(
+        self,
+        records: list[tuple[Path, dict[str, Any]]],
+        *,
+        verify_epoch: bool = False,
+    ) -> dict[str, Any] | None:
+        if not _lexists(self.recovery_path):
+            return None
+        parent = self.recovery_path.parent
+        if _is_link_like(parent) or not parent.is_dir():
+            raise ValueError("orphan recovery ledger is unsafe")
+        raw = self._read_bounded_json(self.recovery_path, max_bytes=_ORPHAN_RECOVERY_MAX_BYTES)
+        ledger = self._validate_recovery_ledger(raw, records)
+        if verify_epoch:
+            try:
+                current = self._validate_recovery_epoch(_read_host_epoch())
+            except Exception as exc:
+                raise ValueError("orphan_recovery_host_epoch_unavailable") from exc
+            for entry in ledger["entries"]:
+                receipt = entry["receipt"]
+                if receipt is None:
+                    continue
+                epoch = receipt["host_epoch"]
+                if (
+                    current["provider"] != epoch["provider"]
+                    or current["machine_sha256"] != epoch["machine_sha256"]
+                    or current["boot_id"] < epoch["boot_id"]
+                ):
+                    raise ValueError("orphan_recovery_host_mismatch")
+        return ledger
+
+    def _recovery_ledger_value(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        unsigned = {
+            "schema_version": 1,
+            "protocol": _ORPHAN_RECOVERY_PROTOCOL,
+            "namespace_sha256": self._namespace_digest,
+            "entries": entries,
+        }
+        value = dict(unsigned)
+        value["mac"] = self._recovery_mac(unsigned)
+        if len((_canonical(value) + "\n").encode("utf-8")) > _ORPHAN_RECOVERY_MAX_BYTES:
+            raise ValueError("orphan recovery ledger exceeds its bound")
+        return value
+
+    @staticmethod
+    def _recovery_result(
+        phase: str, recovery_id: str = "", count: int = 0, reason: str = ""
+    ) -> dict[str, Any]:
+        result = {
+            "phase": phase,
+            "recovery_id": recovery_id,
+            "affected_count": int(count),
+            "reason": reason,
+        }
+        return result
+
+    def prepare_recovery(self, *, now: int | None = None) -> dict[str, Any]:
+        if not self.persistent:
+            return self._recovery_result("blocked", reason="orphan_lease_key_unavailable")
+        if now is not None and (not isinstance(now, int) or isinstance(now, bool) or now < 0):
+            return self._recovery_result("blocked", reason="orphan_recovery_invalid")
+        try:
+            directory = self._ensure_directory(create=False)
+            if directory is None:
+                return self._recovery_result("blocked", reason="orphan_recovery_registry_unavailable")
+            current = int(time.time()) if now is None else now
+            with _authorization_file_lock(self.lock_path):
+                records = self._records(directory)
+                ledger = self._load_recovery_ledger(records)
+                if ledger is not None and ledger["pending_index"] is not None:
+                    entry = ledger["entries"][ledger["pending_index"]]
+                    if entry["checkpoint"]["records"] == ledger["current_digests"]:
+                        try:
+                            current_epoch = self._validate_recovery_epoch(_read_host_epoch())
+                        except Exception:
+                            return self._recovery_result(
+                                "blocked", reason="orphan_recovery_host_epoch_unavailable"
+                            )
+                        before_epoch = entry["checkpoint"]["host_epoch"]
+                        stale_epoch = (
+                            current_epoch["provider"] == before_epoch["provider"]
+                            and current_epoch["machine_sha256"] == before_epoch["machine_sha256"]
+                            and current_epoch["boot_id"] > before_epoch["boot_id"]
+                            and current_epoch["unbiased_interrupt_100ns"] >= before_epoch["unbiased_interrupt_100ns"]
+                        )
+                        if not stale_epoch:
+                            return self._recovery_result(
+                                "recovery_pending",
+                                entry["checkpoint"]["recovery_id"],
+                                len(entry["checkpoint"]["targets"]),
+                                "orphan_recovery_reboot_required",
+                            )
+                recovered = {
+                    target
+                    for entry in (ledger["entries"] if ledger else [])
+                    if entry["receipt"] is not None
+                    for target in entry["checkpoint"]["targets"]
+                }
+                targets = [
+                    payload["nonce"]
+                    for _path, payload in records
+                    if payload["nonce"] not in recovered
+                    and payload["state"] != "cleaned"
+                    and current > int(payload["expires_at"]) + _ORPHAN_LEASE_GRACE_SEC
+                    and payload["process_stopped"] is not True
+                ]
+                if any(
+                    payload["state"] != "cleaned"
+                    and current <= int(payload["expires_at"]) + _ORPHAN_LEASE_GRACE_SEC
+                    for _path, payload in records
+                ):
+                    return self._recovery_result("blocked", reason="orphan_recovery_live")
+                if not targets and (ledger is None or ledger["pending_index"] is None):
+                    return self._recovery_result("no_recovery_needed", reason="orphan_recovery_not_needed")
+                try:
+                    epoch = self._validate_recovery_epoch(_read_host_epoch())
+                except Exception:
+                    return self._recovery_result("blocked", reason="orphan_recovery_host_epoch_unavailable")
+                checkpoint = {
+                    "recovery_id": secrets.token_hex(16),
+                    "host_epoch": epoch,
+                    "records": {
+                        payload["nonce"]: _digest(_canonical(payload))
+                        for _path, payload in records
+                    },
+                    "targets": sorted(set(targets)),
+                }
+                entries = list(ledger["entries"] if ledger else [])
+                if len(entries) >= _ORPHAN_RECOVERY_MAX_ENTRIES:
+                    return self._recovery_result("blocked", reason="orphan_recovery_ledger_full")
+                entries.append({"checkpoint": checkpoint, "receipt": None})
+                _write_json(self.recovery_path, self._recovery_ledger_value(entries))
+                return self._recovery_result(
+                    "recovery_pending", checkpoint["recovery_id"], len(targets),
+                    "orphan_recovery_reboot_required",
+                )
+        except Exception:
+            return self._recovery_result("blocked", reason="orphan_recovery_registry_invalid")
+
+    def verify_recovery(self, recovery_id: str) -> dict[str, Any]:
+        if not self.persistent:
+            return self._recovery_result("blocked", reason="orphan_lease_key_unavailable")
+        if not isinstance(recovery_id, str) or not re.fullmatch(r"[0-9a-f]{32}", recovery_id):
+            return self._recovery_result("blocked", reason="orphan_recovery_invalid")
+        try:
+            directory = self._ensure_directory(create=False)
+            if directory is None:
+                return self._recovery_result("blocked", recovery_id, reason="orphan_recovery_registry_unavailable")
+            with _authorization_file_lock(self.lock_path):
+                records = self._records(directory)
+                ledger = self._load_recovery_ledger(records)
+                if ledger is None:
+                    return self._recovery_result("blocked", recovery_id, reason="orphan_recovery_registry_invalid")
+                start_digests = dict(ledger["current_digests"])
+                selected_index, selected = next(
+                    ((index, entry) for index, entry in enumerate(ledger["entries"])
+                     if entry["checkpoint"]["recovery_id"] == recovery_id),
+                    None,
+                ) or (None, None)
+                if selected is None or selected_index is None:
+                    return self._recovery_result("blocked", recovery_id, reason="orphan_recovery_not_found")
+                if selected["receipt"] is None and selected_index != ledger["pending_index"]:
+                    return self._recovery_result("blocked", recovery_id, reason="orphan_recovery_checkpoint_superseded")
+                if selected["receipt"] is None and selected["checkpoint"]["records"] != ledger["current_digests"]:
+                    return self._recovery_result("blocked", recovery_id, reason="orphan_recovery_registry_changed")
+                before = self._validate_recovery_epoch(selected["checkpoint"]["host_epoch"])
+                try:
+                    after = self._validate_recovery_epoch(_read_host_epoch())
+                except Exception:
+                    return self._recovery_result("blocked", recovery_id, reason="orphan_recovery_host_epoch_unavailable")
+                receipt = selected["receipt"]
+                same_machine = (
+                    after["provider"] == before["provider"]
+                    and after["machine_sha256"] == before["machine_sha256"]
+                )
+                rebooted = (
+                    same_machine
+                    and after["boot_id"] > before["boot_id"]
+                    and after["unbiased_interrupt_100ns"] < before["unbiased_interrupt_100ns"]
+                )
+                receipt_valid_now = receipt is not None and same_machine and after["boot_id"] >= receipt["host_epoch"]["boot_id"]
+                if (receipt is None and (not rebooted or after["hiberboot"] is not False)) or (
+                    receipt is not None and not receipt_valid_now
+                ):
+                    return self._recovery_result(
+                        "blocked", recovery_id,
+                        len(selected["checkpoint"]["targets"]),
+                        "orphan_recovery_reboot_required"
+                        if same_machine else "orphan_recovery_host_mismatch",
+                    )
+                by_nonce = {payload["nonce"]: payload for _path, payload in records}
+                for nonce in selected["checkpoint"]["targets"]:
+                    payload = by_nonce.get(nonce)
+                    if payload is None or _digest(_canonical(payload)) != selected["checkpoint"]["records"].get(nonce):
+                        return self._recovery_result("blocked", recovery_id, reason="orphan_recovery_registry_invalid")
+                    if not _reap_owned_eval_container(
+                        payload["docker_cli"], payload["context"], payload["nonce"], payload["image"],
+                        name_prefix="brain-memory-p7-" + payload["operation"] + "-",
+                        expected_endpoint_digest=payload["endpoint_sha256"],
+                        expected_docker_cli_digest=payload["docker_cli_sha256"],
+                        allow_removal=False,
+                    ):
+                        return self._recovery_result("blocked", recovery_id, reason="orphan_recovery_resources_unverified")
+                records_after = self._records(directory)
+                if {
+                    payload["nonce"]: _digest(_canonical(payload))
+                    for _path, payload in records_after
+                } != start_digests:
+                    return self._recovery_result("blocked", recovery_id, reason="orphan_recovery_registry_invalid")
+                try:
+                    after_final = self._validate_recovery_epoch(_read_host_epoch())
+                except Exception:
+                    return self._recovery_result("blocked", recovery_id, reason="orphan_recovery_host_epoch_unavailable")
+                if (
+                    after_final["provider"] != after["provider"]
+                    or after_final["machine_sha256"] != after["machine_sha256"]
+                    or after_final["boot_id"] != after["boot_id"]
+                    or after_final["unbiased_interrupt_100ns"] < after["unbiased_interrupt_100ns"]
+                ):
+                    return self._recovery_result("blocked", recovery_id, reason="orphan_recovery_host_epoch_changed")
+                if selected["receipt"] is None:
+                    selected["receipt"] = {
+                        "checkpoint_sha256": _digest(_canonical(selected["checkpoint"])),
+                        "host_epoch": after,
+                        "containers_absent": True,
+                    }
+                    entries = [
+                        selected if entry["checkpoint"]["recovery_id"] == recovery_id else entry
+                        for entry in ledger["entries"]
+                    ]
+                    _write_json(self.recovery_path, self._recovery_ledger_value(entries))
+                return self._recovery_result(
+                    "recovery_verified", recovery_id,
+                    len(selected["checkpoint"]["targets"]), "",
+                )
+        except Exception:
+            return self._recovery_result("blocked", recovery_id, reason="orphan_recovery_registry_invalid")
+
     def _ensure_directory(self, *, create: bool) -> Path | None:
         directory = self.directory
         legacy = self.root / _ORPHAN_LEASE_DIRECTORY
@@ -3487,6 +4053,8 @@ class OrphanLeaseStore:
             # The old shared namespace cannot be attributed to one repository
             # safely.  Never ignore or automatically migrate it.
             raise ValueError("legacy orphan lease registry requires review")
+        if not _lexists(directory) and _lexists(self.recovery_path):
+            raise ValueError("orphan recovery registry is unavailable")
         if _lexists(directory):
             if _is_link_like(directory) or not directory.is_dir():
                 raise ValueError("orphan lease registry is unsafe")
@@ -3648,61 +4216,22 @@ class OrphanLeaseStore:
         return dict(unsigned)
 
     def _read_record(self, path: Path) -> dict[str, Any]:
-        if _is_link_like(path) or not path.is_file():
-            raise ValueError("orphan lease record is unsafe")
-        descriptor: int | None = None
-        try:
-            flags = os.O_RDONLY | int(getattr(os, "O_NOFOLLOW", 0)) | int(
-                getattr(os, "O_BINARY", 0)
-            )
-            descriptor = os.open(os.fspath(path), flags)
-            before = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(before.st_mode)
-                or getattr(before, "st_nlink", 1) != 1
-                or before.st_size > _ORPHAN_LEASE_MAX_BYTES
-            ):
-                raise ValueError("orphan lease record is unsafe")
-            data = bytearray()
-            while len(data) <= _ORPHAN_LEASE_MAX_BYTES:
-                chunk = os.read(
-                    descriptor,
-                    min(64 * 1024, _ORPHAN_LEASE_MAX_BYTES + 1 - len(data)),
-                )
-                if not chunk:
-                    break
-                data.extend(chunk)
-            after = os.fstat(descriptor)
-            if (
-                len(data) > _ORPHAN_LEASE_MAX_BYTES
-                or before.st_size != after.st_size
-                or before.st_mtime_ns != after.st_mtime_ns
-                or getattr(before, "st_ino", 0) != getattr(after, "st_ino", 0)
-            ):
-                raise ValueError("orphan lease record changed while being read")
-        except (OSError, ValueError) as exc:
-            if isinstance(exc, ValueError):
-                raise
-            raise ValueError("orphan lease record is unavailable") from exc
-        finally:
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-        try:
-            payload = json.loads(bytes(data).decode("utf-8", errors="strict"))
-        except (UnicodeError, ValueError) as exc:
-            raise ValueError("orphan lease record is invalid") from exc
+        payload = self._read_bounded_json(
+            path, max_bytes=_ORPHAN_LEASE_MAX_BYTES, label="orphan lease record"
+        )
         return self._validate_payload(payload, expected_nonce=path.stem)
 
     def _records(self, directory: Path) -> list[tuple[Path, dict[str, Any]]]:
         try:
-            entries = sorted(directory.iterdir(), key=lambda item: item.name)
+            entries: list[Path] = []
+            with os.scandir(directory) as scan:
+                for index, entry in enumerate(scan):
+                    if index > _ORPHAN_LEASE_MAX_FILES:
+                        raise ValueError("orphan lease registry exceeds its bound")
+                    entries.append(Path(entry.path))
+            entries.sort(key=lambda item: item.name)
         except OSError as exc:
             raise ValueError("orphan lease registry is unavailable") from exc
-        if len(entries) > _ORPHAN_LEASE_MAX_FILES + 1:
-            raise ValueError("orphan lease registry exceeds its bound")
         records: list[tuple[Path, dict[str, Any]]] = []
         for entry in entries:
             if entry.name == _ORPHAN_LEASE_LOCK:
@@ -3713,6 +4242,89 @@ class OrphanLeaseStore:
         if len(records) > _ORPHAN_LEASE_MAX_FILES:
             raise ValueError("orphan lease registry exceeds its bound")
         return records
+
+    def inspect(self, *, now: int | None = None) -> dict[str, Any]:
+        """Read and aggregate authenticated leases without acquiring a lock."""
+
+        if not self.persistent:
+            return {
+                "inspection_verified": False,
+                "reason": "orphan_lease_key_unavailable",
+            }
+        if now is not None and (
+            not isinstance(now, int) or isinstance(now, bool) or now < 0
+        ):
+            return {
+                "inspection_verified": False,
+                "reason": "orphan_lease_registry_invalid",
+            }
+        try:
+            current = int(time.time()) if now is None else now
+            if not self._valid_int(current):
+                return {
+                    "inspection_verified": False,
+                    "reason": "orphan_lease_registry_invalid",
+                }
+            directory = self._ensure_directory(create=False)
+            records = [] if directory is None else self._records(directory)
+            ledger = None if directory is None else self._load_recovery_ledger(records, verify_epoch=True)
+            if ledger is not None and ledger["pending_index"] is not None:
+                pending = ledger["entries"][ledger["pending_index"]]
+                if pending["checkpoint"]["records"] != ledger["current_digests"]:
+                    raise ValueError("orphan recovery registry changed")
+            counts = {
+                "inspection_verified": True,
+                "reason": "",
+                "record_count": len(records),
+                "live_waiting_count": 0,
+                "expired_stop_unverified_count": 0,
+                "stopped_pending_cleanup_count": 0,
+                "cleaned_retained_count": 0,
+            }
+            if ledger is not None:
+                counts["recovery_pending"] = ledger["pending_index"] is not None
+                counts["recovery_checkpoint_count"] = len(ledger["entries"])
+                counts["recovered_retained_count"] = sum(
+                    len(entry["checkpoint"]["targets"])
+                    for entry in ledger["entries"]
+                    if entry["receipt"] is not None
+                )
+            recovered = {
+                target
+                for entry in (ledger["entries"] if ledger else [])
+                if entry["receipt"] is not None
+                for target in entry["checkpoint"]["targets"]
+            }
+            for _path, payload in records:
+                if payload["state"] == "cleaned":
+                    counts["cleaned_retained_count"] += 1
+                elif payload["nonce"] in recovered:
+                    continue
+                elif current <= int(payload["expires_at"]) + _ORPHAN_LEASE_GRACE_SEC:
+                    counts["live_waiting_count"] += 1
+                elif payload["process_stopped"] is True:
+                    counts["stopped_pending_cleanup_count"] += 1
+                else:
+                    counts["expired_stop_unverified_count"] += 1
+            return counts
+        except ValueError as exc:
+            reason = str(exc)
+            if reason not in {
+                "orphan_recovery_host_epoch_unavailable",
+                "orphan_recovery_host_mismatch",
+                "orphan recovery registry is unavailable",
+                "orphan recovery registry changed",
+            }:
+                reason = "orphan_lease_registry_invalid"
+            return {
+                "inspection_verified": False,
+                "reason": reason,
+            }
+        except Exception:
+            return {
+                "inspection_verified": False,
+                "reason": "orphan_lease_registry_invalid",
+            }
 
     def _write_transition(
         self,
@@ -3812,10 +4424,26 @@ class OrphanLeaseStore:
         with _authorization_file_lock(self.lock_path):
             if _lexists(path):
                 raise ValueError("orphan lease nonce is already registered")
+            current_records = self._records(directory)
+            recovery_ledger = self._load_recovery_ledger(current_records, verify_epoch=True)
+            if recovery_ledger is not None and recovery_ledger["pending_index"] is not None:
+                pending = recovery_ledger["entries"][recovery_ledger["pending_index"]]
+                if pending["checkpoint"]["records"] != {
+                    payload["nonce"]: _digest(_canonical(payload))
+                    for _path, payload in current_records
+                }:
+                    raise RuntimeError("orphan recovery registry changed")
+                raise RuntimeError("orphan recovery checkpoint is pending")
+            recovered = {
+                target
+                for entry in (recovery_ledger["entries"] if recovery_ledger else [])
+                if entry["receipt"] is not None
+                for target in entry["checkpoint"]["targets"]
+            }
             # Do not arm a second operation while an earlier operation is
             # still live or awaiting cleanup.  Cleaned tombstones are safe.
-            for _other_path, other in self._records(directory):
-                if other["state"] != "cleaned":
+            for _other_path, other in current_records:
+                if other["state"] != "cleaned" and other["nonce"] not in recovered:
                     raise RuntimeError("orphan lease cleanup is pending")
             unsigned = {
                 "schema_version": HOST_SCHEMA_VERSION,
@@ -4021,6 +4649,66 @@ class OrphanLeaseStore:
                 }
             with _authorization_file_lock(self.lock_path):
                 records = self._records(directory)
+                try:
+                    recovery_ledger = self._load_recovery_ledger(records, verify_epoch=True)
+                except ValueError as exc:
+                    reason = str(exc)
+                    if reason not in {
+                        "orphan_recovery_host_epoch_unavailable",
+                        "orphan_recovery_host_mismatch",
+                    }:
+                        reason = "orphan_recovery_registry_invalid"
+                    return {
+                        **empty,
+                        "ready": False,
+                        "reason": reason,
+                    }
+                except Exception:
+                    return {
+                        **empty,
+                        "ready": False,
+                        "reason": "orphan_recovery_registry_invalid",
+                    }
+                recovered: set[str] = set()
+                if recovery_ledger is not None:
+                    if recovery_ledger["pending_index"] is not None:
+                        pending = recovery_ledger["entries"][recovery_ledger["pending_index"]]
+                        current_snapshot = {
+                            payload["nonce"]: _digest(_canonical(payload))
+                            for _path, payload in records
+                        }
+                        if pending["checkpoint"]["records"] != current_snapshot:
+                            return {
+                                **empty,
+                                "ready": False,
+                                "reason": "orphan_recovery_registry_changed",
+                            }
+                        return {
+                            **empty,
+                            "ready": False,
+                            "reason": "orphan_recovery_checkpoint_pending",
+                        }
+                    for entry in recovery_ledger["entries"]:
+                        if entry["receipt"] is None:
+                            continue
+                        for nonce in entry["checkpoint"]["targets"]:
+                            payload = next(
+                                (item for _path, item in records if item["nonce"] == nonce),
+                                None,
+                            )
+                            if payload is None or not _reap_owned_eval_container(
+                                payload["docker_cli"], payload["context"], payload["nonce"], payload["image"],
+                                name_prefix="brain-memory-p7-" + payload["operation"] + "-",
+                                expected_endpoint_digest=payload["endpoint_sha256"],
+                                expected_docker_cli_digest=payload["docker_cli_sha256"],
+                                allow_removal=False,
+                            ):
+                                return {
+                                    **empty,
+                                    "ready": False,
+                                    "reason": "orphan_recovery_resources_unverified",
+                                }
+                            recovered.add(nonce)
                 # Validate every record before issuing any Docker command.  A
                 # malformed sibling must not be hidden by a successful one.
                 pending: list[tuple[Path, dict[str, Any]]] = []
@@ -4030,6 +4718,8 @@ class OrphanLeaseStore:
                 for path, payload in records:
                     if payload["state"] == "cleaned":
                         tombstones.append((path, payload))
+                    elif payload["nonce"] in recovered:
+                        continue
                     elif current <= int(payload["expires_at"]) + _ORPHAN_LEASE_GRACE_SEC:
                         pending.append((path, payload))
                         deferred += 1
@@ -6366,6 +7056,7 @@ if __name__ == '__main__':
             "created_at": _safe_text(getattr(need, "created_at", ""), 100),
         }
 
+    @staticmethod
     def _need_summary(need: Any) -> dict[str, Any]:
         payload = P7ControlledHost._need_payload(need)
         payload.update(
@@ -7949,7 +8640,130 @@ def _cli() -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--prepare", action="store_true")
     group.add_argument("--authorize", metavar="RUN_ID")
+    group.add_argument(
+        "--inspect-orphans",
+        action="store_true",
+        help="observation-only orphan lease snapshot; no cleanup or authorization",
+    )
+    group.add_argument(
+        "--prepare-orphan-recovery",
+        action="store_true",
+        help="seal read-only recovery evidence; requires a real reboot before verification",
+    )
+    group.add_argument(
+        "--verify-orphan-recovery",
+        metavar="RECOVERY_ID",
+        help="verify sealed evidence after full host restart and nonce-scoped Docker absence",
+    )
     args = parser.parse_args()
+    recovery_action = args.prepare_orphan_recovery or args.verify_orphan_recovery
+    if recovery_action:
+        if not os.environ.get(MANIFEST_KEY_ENV):
+            report = {
+                "schema_version": HOST_SCHEMA_VERSION,
+                "phase": "blocked",
+                "evidence_only": True,
+                "reason": "manifest_key_unavailable",
+            }
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            return 2
+        try:
+            host = P7ControlledHost()
+        except (TypeError, ValueError):
+            report = {
+                "schema_version": HOST_SCHEMA_VERSION,
+                "phase": "blocked",
+                "evidence_only": True,
+                "reason": "manifest_key_invalid",
+            }
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            return 2
+        except (Exception, KeyboardInterrupt):
+            report = {
+                "schema_version": HOST_SCHEMA_VERSION,
+                "phase": "blocked",
+                "evidence_only": True,
+                "reason": "orphan_recovery_registry_invalid",
+            }
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            return 2
+        try:
+            with _authorization_file_lock(host.run_root / ".p7-host.lock"):
+                store = host._orphan_lease_store()
+                result = (
+                    store.prepare_recovery()
+                    if args.prepare_orphan_recovery
+                    else store.verify_recovery(args.verify_orphan_recovery)
+                )
+        except (Exception, KeyboardInterrupt):
+            result = {
+                "phase": "blocked",
+                "recovery_id": args.verify_orphan_recovery or "",
+                "affected_count": 0,
+                "reason": "orphan_recovery_registry_invalid",
+            }
+        report = {
+            "schema_version": HOST_SCHEMA_VERSION,
+            "phase": result.get("phase", "blocked"),
+            "evidence_only": True,
+            "recovery": result,
+        }
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        return 0 if result.get("phase") in {"recovery_pending", "no_recovery_needed", "recovery_verified"} else 2
+    # Inspect emits only fixed aggregate fields directly; avoid public_report,
+    # whose import path loads brain/services and may read .env.
+    if args.inspect_orphans:
+        if not os.environ.get(MANIFEST_KEY_ENV):
+            report = {
+                "schema_version": HOST_SCHEMA_VERSION,
+                "phase": "blocked",
+                "reason": "manifest_key_unavailable",
+                "reason_code": "manifest_key_unavailable",
+                "stage": "startup",
+                "observation_only": True,
+            }
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            return 2
+        try:
+            host = P7ControlledHost()
+        except (TypeError, ValueError):
+            report = {
+                "schema_version": HOST_SCHEMA_VERSION,
+                "phase": "blocked",
+                "reason": "manifest_key_invalid",
+                "reason_code": "manifest_key_invalid",
+                "stage": "startup",
+                "observation_only": True,
+            }
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            return 2
+        except (Exception, KeyboardInterrupt):
+            report = {
+                "schema_version": HOST_SCHEMA_VERSION,
+                "phase": "blocked",
+                "observation_only": True,
+                "orphan_leases": {
+                    "inspection_verified": False,
+                    "reason": "orphan_lease_registry_invalid",
+                },
+            }
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            return 2
+        try:
+            inspection = host._orphan_lease_store().inspect()
+        except (Exception, KeyboardInterrupt):
+            inspection = {
+                "inspection_verified": False,
+                "reason": "orphan_lease_registry_invalid",
+            }
+        report = {
+            "schema_version": HOST_SCHEMA_VERSION,
+            "phase": "inspected" if inspection.get("inspection_verified") else "blocked",
+            "observation_only": True,
+            "orphan_leases": inspection,
+        }
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        return 0 if inspection.get("inspection_verified") else 2
     # Separate CLI invocations must share an external manifest key.  The
     # library keeps an ephemeral key only for in-process tests; never present
     # that mode as an authorizable production run.
