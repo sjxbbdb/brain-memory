@@ -24,6 +24,29 @@ from unittest import mock
 
 
 class P7ControlledHostContractTests(unittest.TestCase):
+    @staticmethod
+    def _legacy_drive_engine_source() -> str:
+        """Build the pre-iteration fixture used by P7 gap-contract tests."""
+
+        source = (Path.cwd() / "brain" / "drive_engine.py").read_text(
+            encoding="utf-8"
+        )
+        approved_block = (
+            "            entity = entities_pool[\n"
+            "                int(hashlib.sha256((str(current_tick) + drive_name).encode(\"utf-8\")).hexdigest(), 16)\n"
+            "                % len(entities_pool)\n"
+            "            ] if entities_pool else \"未知领域\"\n"
+        )
+        legacy_line = (
+            "            entity = entities_pool[hash(str(current_tick) + drive_name) % len(entities_pool)]"
+            " if entities_pool else \"未知领域\"\n"
+        )
+        if "import hashlib\n" not in source or approved_block not in source:
+            raise AssertionError("repository no longer contains the validated iteration target")
+        return source.replace("import hashlib\n", "", 1).replace(
+            approved_block, legacy_line, 1
+        )
+
     def test_normalized_container_contract_digest_matches_wrapper_shape(self):
         import tools.p7_controlled_host as host_module
 
@@ -812,7 +835,15 @@ class P7ControlledHostContractTests(unittest.TestCase):
         from tools.p7_controlled_host import replay_probe
 
         with tempfile.TemporaryDirectory(prefix="p7-probe-contract-") as temp:
-            result = replay_probe(Path.cwd())
+            root = Path(temp)
+            import tools.p7_controlled_host as host_module
+
+            checkout = root / "checkout"
+            host_module._safe_copy_tree(Path.cwd(), checkout)
+            (checkout / "brain" / "drive_engine.py").write_text(
+                self._legacy_drive_engine_source(), encoding="utf-8"
+            )
+            result = replay_probe(checkout)
         self.assertEqual(result["source_kind"], "runtime_replay")
         self.assertEqual(result["seed_count"], 8)
         self.assertGreaterEqual(result["unique_description_count"], 2)
@@ -821,9 +852,7 @@ class P7ControlledHostContractTests(unittest.TestCase):
     def test_low_risk_transform_requires_the_exact_deterministic_index_ast(self):
         from tools.p7_controlled_host import _assert_low_risk_transform
 
-        baseline_source = (Path.cwd() / "brain" / "drive_engine.py").read_text(
-            encoding="utf-8"
-        )
+        baseline_source = self._legacy_drive_engine_source()
         old_index = "hash(str(current_tick) + drive_name) % len(entities_pool)"
         approved_index = (
             "int(hashlib.sha256((str(current_tick) + drive_name).encode(\"utf-8\")).hexdigest(), 16)"
@@ -887,7 +916,7 @@ class P7ControlledHostContractTests(unittest.TestCase):
                 "unified_diff": raw_diff,
             }
         )
-        baseline_source = (Path.cwd() / TARGET_SCOPE).read_text(encoding="utf-8")
+        baseline_source = self._legacy_drive_engine_source()
         with tempfile.TemporaryDirectory(prefix="p7-canonical-diff-") as temp:
             root = Path(temp)
             baseline = root / "baseline"
@@ -930,8 +959,14 @@ class P7ControlledHostContractTests(unittest.TestCase):
                 "unified_diff": raw_diff,
             }
         )
-        with self.assertRaisesRegex(RuntimeError, "approved deterministic"):
-            _canonical_model_patch(patch, Path.cwd())
+        with tempfile.TemporaryDirectory(prefix="p7-canonical-bypass-") as temp:
+            baseline = Path(temp) / "baseline"
+            (baseline / "brain").mkdir(parents=True)
+            (baseline / "brain" / "drive_engine.py").write_text(
+                self._legacy_drive_engine_source(), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "approved deterministic"):
+                _canonical_model_patch(patch, baseline)
 
     def test_need_binding_payload_preserves_normalized_created_at(self):
         from brain.motivation import IterationNeed

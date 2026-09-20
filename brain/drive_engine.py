@@ -14,6 +14,7 @@ V7 核心：驱动力不再是静态配置项，而是持续响应客观信号�
 """
 
 import logging
+import hashlib
 from datetime import datetime, timezone
 
 from brain.goal_system import Goal, GoalStatus
@@ -372,7 +373,10 @@ class GoalGenerator:
             if intensity < 0.4:  # 驱动力太弱，不生成目标
                 continue
 
-            entity = entities_pool[hash(str(current_tick) + drive_name) % len(entities_pool)] if entities_pool else "未知领域"
+            entity = entities_pool[
+                int(hashlib.sha256((str(current_tick) + drive_name).encode("utf-8")).hexdigest(), 16)
+                % len(entities_pool)
+            ] if entities_pool else "未知领域"
             drive_type = DRIVE_TO_GOAL_TYPE.get(drive_name, "growth")
 
             # 根据驱动力类型生成目标描述
