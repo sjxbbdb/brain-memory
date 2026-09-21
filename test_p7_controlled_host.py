@@ -488,6 +488,32 @@ class P7ControlledHostContractTests(unittest.TestCase):
         self.assertEqual(parsed.scope, "brain/drive_engine.py")
         self.assertIn("unified_diff", parsed.to_dict())
 
+    def test_iteration_target_registry_is_allowlisted_and_path_free(self):
+        import tools.p7_controlled_host as host_module
+
+        target = host_module.resolve_iteration_target("goal_determinism")
+        self.assertEqual(target.scope, host_module.TARGET_SCOPE)
+        self.assertEqual(target.public_summary()["target_id"], "goal_determinism")
+        self.assertRegex(target.public_summary()["contract_digest"], r"^[0-9a-f]{64}$")
+        with self.assertRaises(ValueError):
+            host_module.resolve_iteration_target("brain/brain_stem.py")
+        with self.assertRaises(ValueError):
+            host_module.resolve_iteration_target("../brain/drive_engine.py")
+        self.assertNotIn("\\", target.scope)
+        self.assertNotIn("/D:", target.scope)
+
+    def test_iteration_target_binding_rejects_contract_drift(self):
+        import tools.p7_controlled_host as host_module
+
+        host = host_module.P7ControlledHost(repo_root=Path.cwd())
+        summary = host._target_summary()
+        self.assertTrue(host._target_binding_matches(summary))
+        tampered = dict(summary, contract_digest="0" * 64)
+        self.assertFalse(host._target_binding_matches(tampered))
+        public = host_module.public_report({"target": summary})
+        self.assertEqual(public["target"]["target_id"], "goal_determinism")
+        self.assertEqual(public["target"]["scope"], host_module.TARGET_SCOPE)
+
     def test_model_patch_validation_rejects_scope_escape_and_multiple_files(self):
         from tools.p7_controlled_host import validate_model_patch
 
@@ -1029,6 +1055,7 @@ class P7ControlledHostContractTests(unittest.TestCase):
                         "run_id": layout.run_id,
                         "phase": "authorizing",
                         "authorization_claim_id": "a" * 32,
+                        "target": host._target_summary(),
                     },
                     "",
                 ),
@@ -1039,6 +1066,7 @@ class P7ControlledHostContractTests(unittest.TestCase):
                     "run_id": layout.run_id,
                     "phase": "authorizing",
                     "authorization_claim_id": "a" * 32,
+                    "target": host._target_summary(),
                 },
             ), mock.patch(
                 "tools.p7_controlled_host._sandbox_capability_report",

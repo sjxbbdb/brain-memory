@@ -51,6 +51,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Mapping, Sequence
+from types import MappingProxyType
 import uuid
 
 
@@ -64,7 +65,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 
-TARGET_SCOPE = "brain/drive_engine.py"
+DEFAULT_TARGET_ID = "goal_determinism"
 HOST_SCHEMA_VERSION = 1
 RUN_DIRECTORY_PREFIX = "brain-memory-p7-"
 DEFAULT_SEEDS = (1, 5, 8, 13, 21, 34, 55, 89)
@@ -228,6 +229,68 @@ def _bounded_file_digest(path: Path | str, *, max_bytes: int = 256 * 1024) -> st
 
 def _canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+@dataclass(frozen=True, slots=True)
+class IterationTarget:
+    """One host-owned, low-risk target admitted to the P7 pipeline."""
+
+    target_id: str
+    scope: str
+    protected: bool
+    probe_kind: str
+    candidate_kind: str
+
+    def contract(self) -> dict[str, Any]:
+        return {
+            "target_id": self.target_id,
+            "scope": self.scope,
+            "protected": self.protected,
+            "probe_kind": self.probe_kind,
+            "candidate_kind": self.candidate_kind,
+        }
+
+    def public_summary(self) -> dict[str, Any]:
+        return {
+            "target_id": self.target_id,
+            "scope": self.scope,
+            "contract_digest": target_contract_digest(self),
+        }
+
+
+def target_contract_digest(target: IterationTarget) -> str:
+    if not isinstance(target, IterationTarget):
+        raise TypeError("target must be an IterationTarget")
+    return _digest(_canonical(target.contract()))
+
+
+ITERATION_TARGETS = MappingProxyType(
+    {
+        DEFAULT_TARGET_ID: IterationTarget(
+            target_id=DEFAULT_TARGET_ID,
+            scope="brain/drive_engine.py",
+            protected=False,
+            probe_kind="goal_generator_replay",
+            candidate_kind="deterministic_hash_repair",
+        )
+    }
+)
+
+
+def resolve_iteration_target(target_id: str = DEFAULT_TARGET_ID) -> IterationTarget:
+    """Resolve only a host-owned target id; paths are never caller-defined."""
+
+    if not isinstance(target_id, str) or target_id not in ITERATION_TARGETS:
+        raise ValueError("unknown iteration target")
+    target = ITERATION_TARGETS[target_id]
+    if target.protected or target.scope.startswith(("/", "\\")) or ":" in target.scope:
+        raise ValueError("iteration target is not eligible")
+    if ".." in Path(target.scope).parts:
+        raise ValueError("iteration target escapes the repository")
+    return target
+
+
+TARGET_SCOPE = resolve_iteration_target().scope
 
 
 def _is_link_like(path: Path) -> bool:
@@ -2252,6 +2315,23 @@ def public_report(value: Any) -> Any:
     from brain.public_projection import sanitize_public_projection
 
     result = sanitize_public_projection(value)
+    # The generic projection redacts file-shaped strings.  This one field is
+    # different: it is reconstructed from the immutable host allowlist, never
+    # copied from an arbitrary caller path, so the public receipt can identify
+    # the approved target without exposing a capability-bearing path.
+    if isinstance(result, dict) and isinstance(value, Mapping):
+        raw_target = value.get("target")
+        if isinstance(raw_target, Mapping):
+            try:
+                target = resolve_iteration_target(raw_target.get("target_id"))
+            except (TypeError, ValueError):
+                target = None
+            if (
+                target is not None
+                and raw_target.get("scope") == target.scope
+                and raw_target.get("contract_digest") == target_contract_digest(target)
+            ):
+                result["target"] = target.public_summary()
     return result if isinstance(result, dict) else {"value": result}
 
 
@@ -4947,10 +5027,12 @@ class P7ControlledHost:
         run_root: Path | str | None = None,
         llm_client: Any = None,
         manifest_key: bytes | bytearray | str | None = None,
+        target_id: str = DEFAULT_TARGET_ID,
     ) -> None:
         self.repo_root = Path(repo_root or Path(__file__).resolve().parents[1]).expanduser().resolve(strict=True)
         self.run_root = Path(run_root or tempfile.gettempdir()).expanduser().resolve(strict=True)
         self.llm_client = llm_client
+        self.target = resolve_iteration_target(target_id)
         configured_key = (
             manifest_key
             if manifest_key is not None
@@ -4964,6 +5046,18 @@ class P7ControlledHost:
             _coerce_manifest_key(configured_key)
             if configured_key is not None
             else secrets.token_bytes(32)
+        )
+
+    def _target_summary(self) -> dict[str, Any]:
+        return self.target.public_summary()
+
+    def _target_binding_matches(self, value: Any) -> bool:
+        if not isinstance(value, Mapping):
+            return False
+        return (
+            value.get("target_id") == self.target.target_id
+            and value.get("scope") == self.target.scope
+            and value.get("contract_digest") == target_contract_digest(self.target)
         )
 
     def _orphan_lease_store(self) -> OrphanLeaseStore:
@@ -6788,7 +6882,7 @@ if __name__ == '__main__':
             if source_root is not None
             else self.repo_root
         )
-        target = target_root / TARGET_SCOPE
+        target = target_root / self.target.scope
         if not target.is_file() or _is_link_like(target):
             return None, "model_source_unavailable"
         source = target.read_text(encoding="utf-8")
@@ -6827,7 +6921,7 @@ if __name__ == '__main__':
         )
         user = _canonical(
             {
-                "scope": TARGET_SCOPE,
+                "scope": self.target.scope,
                 "required_old_expression": "entities_pool[hash(str(current_tick) + drive_name)",
                 "required_import_context": "import logging",
                 "target_line_number": target_line_number,
@@ -7108,6 +7202,7 @@ if __name__ == '__main__':
         candidate_fingerprint: str,
         baseline_fingerprint: str,
         nonce: str | None = None,
+        target_scope: str = TARGET_SCOPE,
     ) -> dict[str, Any]:
         """Build the non-secret envelope sent to the fixture Docker wrapper."""
 
@@ -7120,7 +7215,7 @@ if __name__ == '__main__':
             "protocol": _SANDBOX_PROTOCOL,
             "nonce": nonce or secrets.token_hex(16),
             "candidate_target_sha256": _bounded_file_digest(
-                layout.candidate / TARGET_SCOPE
+                layout.candidate / target_scope
             ),
             "candidate_fingerprint": _safe_text(candidate_fingerprint, 128).lower(),
             "baseline_fingerprint": _safe_text(baseline_fingerprint, 128).lower(),
@@ -7658,6 +7753,7 @@ if __name__ == '__main__':
                     "need_binding": need_binding,
                     "continuity": runtime.stem.continuity_readiness_snapshot(),
                     "sandbox": sandbox,
+                    "target": self._target_summary(),
                 }
                 self._save_report(layout, report)
                 return public_report(report)
@@ -7705,6 +7801,7 @@ if __name__ == '__main__':
                 sandbox,
                 candidate_fingerprint=candidate.fingerprint,
                 baseline_fingerprint=baseline.fingerprint,
+                target_scope=self.target.scope,
             )
             receipt = self._evaluate_iteration_with_lease(
                 runtime,
@@ -7721,6 +7818,7 @@ if __name__ == '__main__':
             continuity_ready = bool(lifecycle.get("ready"))
             report = {
                 "schema_version": HOST_SCHEMA_VERSION,
+                "target": self._target_summary(),
                 "run_id": layout.run_id,
                 "phase": "awaiting_authorization"
                 if receipt.accepted and continuity_ready
@@ -7776,6 +7874,7 @@ if __name__ == '__main__':
             failed = True
             report = {
                 "schema_version": HOST_SCHEMA_VERSION,
+                "target": self._target_summary(),
                 "run_id": layout.run_id,
                 "phase": "blocked",
                 "authorization_required": True,
@@ -8113,6 +8212,31 @@ if __name__ == '__main__':
                     "authorization_used": False,
                 }
             )
+        if not self._target_binding_matches(metadata.get("target")):
+            mismatch = {
+                "schema_version": HOST_SCHEMA_VERSION,
+                "run_id": layout.run_id,
+                "phase": "blocked",
+                "reason": "target_contract_mismatch",
+                "authorization_required": True,
+                "authorization_used": True,
+                "target": self._target_summary(),
+                "authorization_claim_id": claim_id,
+            }
+            try:
+                self._finish_authorization(layout, mismatch)
+            except Exception:
+                return public_report(
+                    {
+                        "schema_version": HOST_SCHEMA_VERSION,
+                        "run_id": layout.run_id,
+                        "phase": "blocked",
+                        "reason": "authorization_commit_failed",
+                        "authorization_required": True,
+                        "authorization_used": False,
+                    }
+                )
+            return public_report(mismatch)
         try:
             image_ref, context_name, docker_cli = _executor_config_from_fixtures(
                 layout.fixtures
@@ -8199,7 +8323,7 @@ if __name__ == '__main__':
             ):
                 raise RuntimeError("candidate changed after prepare")
             expected_scope = _safe_text(proposal_info.get("scope"), 160).replace("\\", "/")
-            if expected_scope != TARGET_SCOPE:
+            if expected_scope != self.target.scope:
                 raise RuntimeError("proposal scope changed after prepare")
             model_info = metadata.get("model", {})
             if (
@@ -8342,7 +8466,7 @@ if __name__ == '__main__':
                 need,
                 host=HostBinding(False),
                 title=proposal_title,
-                scope=TARGET_SCOPE,
+                scope=self.target.scope,
                 hypothesis=proposal_hypothesis,
                 evidence=tuple(_safe_text(item, 400) for item in proposal_evidence),
                 expected_benefits=tuple(_safe_text(item, 300) for item in proposal_benefits),
@@ -8377,6 +8501,7 @@ if __name__ == '__main__':
                 sandbox,
                 candidate_fingerprint=candidate.fingerprint,
                 baseline_fingerprint=baseline.fingerprint,
+                target_scope=self.target.scope,
             )
             receipt = self._evaluate_iteration_with_lease(
                 runtime,
@@ -8825,7 +8950,10 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "DEFAULT_TARGET_ID",
     "HOST_SCHEMA_VERSION",
+    "ITERATION_TARGETS",
+    "IterationTarget",
     "TARGET_SCOPE",
     "ModelPatch",
     "OrphanLeaseHandle",
@@ -8835,6 +8963,8 @@ __all__ = [
     "coerce_model_patch",
     "public_report",
     "replay_probe",
+    "resolve_iteration_target",
+    "target_contract_digest",
     "static_gap_probe",
     "validate_model_patch",
 ]
